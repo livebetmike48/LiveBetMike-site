@@ -39,6 +39,14 @@ PA_VS_PEN = 1.6
 # league; a 600 PA sample barely moves.
 SHRINK_PA = 150
 
+# Personal playing time: scale expected PAs by the batter's OWN PA/game
+# from his real logs (captures lineup slot, pinch-hit risk, rest patterns
+# automatically). 1 = on, 0 = off (flat league PAs). The knob anchors
+# (PA_VS_STARTER + PA_VS_PEN) define the league-average total that a
+# personal rate scales against.
+PERSONAL_PA = 1
+LEAGUE_PA_PER_GAME = 3.9  # only used to normalize the scaling factor
+
 _league_cache = {"ts": 0, "p": None}
 
 
@@ -94,6 +102,25 @@ def per_pa_hit_rate(rows: list[dict], split_col: str, split_val: str) -> dict | 
     return {"pa": pa, "hits": hits, "rate": hits / pa}
 
 
+def pa_per_game(rows: list[dict]) -> tuple[float, int]:
+    """The batter's real plate appearances per game from his logs.
+    Returns (pa_per_game, games)."""
+    games = set()
+    pa = 0
+    for r in rows:
+        gpk, date = r.get("game_pk"), r.get("game_date")
+        ev = r.get("events")
+        if gpk is None or not date:
+            continue
+        games.add((date, gpk))
+        if ev and ev not in statcast_api.NON_PA_EVENTS:
+            pa += 1
+    n = len(games)
+    if n == 0:
+        return 0.0, 0
+    return pa / n, n
+
+
 def shrunk_rate(hits: int, pa: int, p_league: float) -> float:
     """Empirical-Bayes shrinkage toward the league rate."""
     return (hits + SHRINK_PA * p_league) / (pa + SHRINK_PA)
@@ -130,7 +157,17 @@ def hit_probability(batter_rows: list[dict], starter_rows: list[dict],
     # Vs the pen (unknown arms): the batter's own shrunk rate vs the hand
     p_vs_pen = b_rate
 
-    p_no_hit = ((1 - p_vs_starter) ** PA_VS_STARTER) * ((1 - p_vs_pen) ** PA_VS_PEN)
+    pa_s, pa_p = PA_VS_STARTER, PA_VS_PEN
+    personal = None
+    if PERSONAL_PA:
+        pg, n_games = pa_per_game(b_rows)
+        if n_games >= 15 and pg > 0:
+            factor = max(0.7, min(1.25, pg / LEAGUE_PA_PER_GAME))
+            pa_s, pa_p = PA_VS_STARTER * factor, PA_VS_PEN * factor
+            personal = {"pa_per_game": round(pg, 2), "games": n_games,
+                        "scale": round(factor, 3)}
+
+    p_no_hit = ((1 - p_vs_starter) ** pa_s) * ((1 - p_vs_pen) ** pa_p)
     return {
         "p_hit": round(1 - p_no_hit, 4),
         "inputs": {
@@ -139,6 +176,7 @@ def hit_probability(batter_rows: list[dict], starter_rows: list[dict],
             "shrink_pa": SHRINK_PA,
             "league_rate": round(p_league, 4),
             "p_pa_vs_starter": round(p_vs_starter, 4),
-            "pa_vs_starter": PA_VS_STARTER, "pa_vs_pen": PA_VS_PEN,
+            "pa_vs_starter": round(pa_s, 2), "pa_vs_pen": round(pa_p, 2),
+            "personal_pa": personal,
         },
     }
