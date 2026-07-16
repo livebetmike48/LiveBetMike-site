@@ -103,13 +103,17 @@ def run_backtest(days: int, progress=None) -> dict:
         except Exception as e:
             log.warning("schedule failed for %s: %s", date_str, e)
             continue
-        for g in games:
+        log.info("backtest day %d/%d (%s): %d final games", i, days, date_str, len(games))
+        for gi, g in enumerate(games, 1):
             try:
                 preds.extend(_game_predictions(g["gamePk"], date_str, p_league, hand_cache))
             except Exception as e:
                 log.warning("game %s failed: %s", g.get("gamePk"), e)
+            if progress:
+                progress(i, days, len(preds), f"game {gi}/{len(games)} on {date_str}")
+        log.info("backtest day %d/%d done: %d total predictions", i, days, len(preds))
         if progress:
-            progress(i, days, len(preds))
+            progress(i, days, len(preds), "day complete")
 
     if not preds:
         return {"n": 0}
