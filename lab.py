@@ -32,6 +32,8 @@ CONFIG_DEFAULTS = {
                        "note": "Below this the model refuses to predict"},
     "shrink_pa": {"value": 150, "label": "Shrinkage (phantom league PAs)",
                   "note": "Regression to the mean — higher = more skeptical of hot/cold splits. 0 = raw rates (the overconfident v1)"},
+    "personal_pa": {"value": 1, "label": "Personal playing time (1=on, 0=off)",
+                    "note": "Scale PAs by the batter's own PA/game — captures lineup slot + pinch-hit risk from real logs"},
 }
 
 PROP_ROADMAP = [
@@ -88,6 +90,7 @@ def _apply_config():
     model.PA_VS_STARTER = cfg["pa_vs_starter"]["value"]
     model.PA_VS_PEN = cfg["pa_vs_pen"]["value"]
     model.SHRINK_PA = cfg["shrink_pa"]["value"]
+    model.PERSONAL_PA = int(cfg["personal_pa"]["value"])
     return cfg
 
 
