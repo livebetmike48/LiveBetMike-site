@@ -33,6 +33,12 @@ MLB_BASE = "https://statsapi.mlb.com/api/v1"
 PA_VS_STARTER = 2.6
 PA_VS_PEN = 1.6
 
+# Regression to the mean: observed rates are shrunk toward league average
+# by SHRINK_PA "phantom PAs" of league performance. The published cure for
+# small-sample overconfidence -- a 60 PA hot split gets pulled hard toward
+# league; a 600 PA sample barely moves.
+SHRINK_PA = 150
+
 _league_cache = {"ts": 0, "p": None}
 
 
@@ -88,6 +94,11 @@ def per_pa_hit_rate(rows: list[dict], split_col: str, split_val: str) -> dict | 
     return {"pa": pa, "hits": hits, "rate": hits / pa}
 
 
+def shrunk_rate(hits: int, pa: int, p_league: float) -> float:
+    """Empirical-Bayes shrinkage toward the league rate."""
+    return (hits + SHRINK_PA * p_league) / (pa + SHRINK_PA)
+
+
 def _odds(p: float) -> float:
     p = min(max(p, 1e-6), 1 - 1e-6)
     return p / (1 - p)
@@ -113,17 +124,19 @@ def hit_probability(batter_rows: list[dict], starter_rows: list[dict],
     if not b or b["pa"] < min_batter_pa or not s or s["pa"] < min_starter_pa:
         return None
 
-    p_vs_starter = log5_rate(b["rate"], s["rate"], p_league)
-    # Vs the pen (unknown arms): the batter's own overall rate vs the hand
-    # -- no pitcher adjustment because we don't know the pitchers.
-    p_vs_pen = b["rate"]
+    b_rate = shrunk_rate(b["hits"], b["pa"], p_league)
+    s_rate = shrunk_rate(s["hits"], s["pa"], p_league)
+    p_vs_starter = log5_rate(b_rate, s_rate, p_league)
+    # Vs the pen (unknown arms): the batter's own shrunk rate vs the hand
+    p_vs_pen = b_rate
 
     p_no_hit = ((1 - p_vs_starter) ** PA_VS_STARTER) * ((1 - p_vs_pen) ** PA_VS_PEN)
     return {
         "p_hit": round(1 - p_no_hit, 4),
         "inputs": {
-            "batter_rate_vs_hand": round(b["rate"], 4), "batter_pa": b["pa"],
-            "starter_rate_allowed_vs_side": round(s["rate"], 4), "starter_pa": s["pa"],
+            "batter_rate_vs_hand": round(b["rate"], 4), "batter_rate_shrunk": round(b_rate, 4), "batter_pa": b["pa"],
+            "starter_rate_allowed_vs_side": round(s["rate"], 4), "starter_rate_shrunk": round(s_rate, 4), "starter_pa": s["pa"],
+            "shrink_pa": SHRINK_PA,
             "league_rate": round(p_league, 4),
             "p_pa_vs_starter": round(p_vs_starter, 4),
             "pa_vs_starter": PA_VS_STARTER, "pa_vs_pen": PA_VS_PEN,
