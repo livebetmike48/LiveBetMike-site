@@ -5,16 +5,70 @@ background thread and cached; the API serves instantly after warmup.
 """
 import threading
 import logging
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
 
 import statcast_api
 import parlay
+import odds_api
+import odds_log
 
 log = logging.getLogger("matchups")
 
 _cache = {"date": None, "status": "cold", "data": None}
 _lock = threading.Lock()
+_lineup_cache = {"ts": 0, "date": None, "data": {}}
 
 HITTERS_PER_TEAM = 6
+MLB_BASE = "https://statsapi.mlb.com/api/v1"
+
+
+def _rows_last_days(rows: list[dict], days: int) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=4) - timedelta(days=days)).strftime("%Y-%m-%d")
+    return [r for r in rows if (r.get("game_date") or "") >= cutoff]
+
+
+def _window_stats(rows: list[dict], hand: str) -> dict | None:
+    vs = statcast_api.vs_handedness_stats(rows, "p_throws", hand)
+    if not vs:
+        return None
+    rate, games = parlay.hit_game_rate(rows)
+    return {
+        "pa": vs["pa"], "avg": vs.get("avg"), "xba": vs.get("xba"),
+        "xwoba": vs.get("xwoba"), "k_pct": vs.get("k_pct"), "bb_pct": vs.get("bb_pct"),
+        "whiff_pct": vs.get("whiff_pct"), "hit_game_pct": round(rate * 100, 1), "games": games,
+    }
+
+
+def _orders_from_boxscore(box: dict) -> dict:
+    """Pure parser: boxscore -> {player_id: batting order 1-9} once the
+    lineup is posted (empty dict before that)."""
+    orders = {}
+    for side in ("home", "away"):
+        side_data = (box.get("teams") or {}).get(side) or {}
+        for i, pid in enumerate(side_data.get("battingOrder") or [], start=1):
+            orders[pid] = i
+    return orders
+
+
+def _get_lineups(game_pks: list[int]) -> dict:
+    """{game_pk: {player_id: order}} -- cached 10 min, refreshed all day so
+    orders appear as teams post lineups."""
+    today = parlay.et_date_str(0)
+    now = time.time()
+    if (_lineup_cache["date"] == today and now - _lineup_cache["ts"] < 600):
+        return _lineup_cache["data"]
+    data = {}
+    for pk in game_pks:
+        try:
+            box = requests.get(f"{MLB_BASE}/game/{pk}/boxscore", timeout=15).json()
+            data[pk] = _orders_from_boxscore(box)
+        except Exception:
+            data[pk] = {}
+    _lineup_cache.update({"ts": now, "date": today, "data": data})
+    return data
 
 
 def last10_strip(rows: list[dict]) -> list[bool]:
@@ -35,6 +89,18 @@ def last10_strip(rows: list[dict]) -> list[bool]:
 
 def _build_matchups() -> dict:
     slate = parlay.get_today_slate()
+
+    # Odds: display today's moneylines AND archive them for future
+    # backtesting (our own history, accumulating daily)
+    odds_events = []
+    try:
+        odds_events = odds_api.get_mlb_odds("h2h")
+        if odds_events:
+            odds_log.init_db()
+            odds_log.log_snapshot(parlay.et_date_str(0), odds_events, "h2h")
+    except Exception as e:
+        log.warning("Odds fetch/log skipped: %s", e)
+
     games_out = []
     for g in slate:
         game_entry = {
@@ -43,6 +109,18 @@ def _build_matchups() -> dict:
             "home": g["teams"]["home"]["abbrev"],
             "hitters": [],
         }
+        ev = odds_api.find_event(
+            odds_events, g["teams"]["home"]["name"], g["teams"]["away"]["name"]
+        ) if odds_events else None
+        if ev:
+            ml = {}
+            for side in ("home", "away"):
+                prices = odds_api.all_prices(ev, "h2h", g["teams"][side]["name"])
+                bp = odds_api.best_price(prices)
+                if bp:
+                    ml[side] = {"price": bp[1], "book": bp[0]}
+            if ml:
+                game_entry["moneyline"] = ml
         for side, opp_side in (("home", "away"), ("away", "home")):
             team = g["teams"][side]
             opp = g["teams"][opp_side]
@@ -61,10 +139,10 @@ def _build_matchups() -> dict:
                     continue
                 if not rows:
                     continue
-                vs = statcast_api.vs_handedness_stats(rows, "p_throws", hand)
-                if not vs or vs.get("pa", 0) < 40:
+                season = _window_stats(rows, hand)
+                if not season or season["pa"] < 40:
                     continue
-                rate, games_played = parlay.hit_game_rate(rows)
+                l30 = _window_stats(_rows_last_days(rows, 30), hand)
                 game_entry["hitters"].append({
                     "player_id": batter["player_id"],
                     "name": batter["name"],
@@ -72,19 +150,11 @@ def _build_matchups() -> dict:
                     "starter": opp["starter_name"],
                     "starter_id": opp["starter_id"],
                     "hand": hand,
-                    "pa": vs["pa"],
-                    "avg": vs.get("avg"),
-                    "xba": vs.get("xba"),
-                    "xwoba": vs.get("xwoba"),
-                    "k_pct": vs.get("k_pct"),
-                    "bb_pct": vs.get("bb_pct"),
-                    "whiff_pct": vs.get("whiff_pct"),
-                    "hit_game_pct": round(rate * 100, 1),
-                    "games": games_played,
+                    "windows": {"season": season, "l30": l30},
                     "streak": parlay.hitting_streak(rows),
                     "last10": last10_strip(rows),
                 })
-        game_entry["hitters"].sort(key=lambda h: -(h["xba"] or 0))
+        game_entry["hitters"].sort(key=lambda h: -((h["windows"]["season"] or {}).get("xba") or 0))
         games_out.append(game_entry)
     return {"date": parlay.et_date_str(0), "games": games_out}
 
@@ -95,7 +165,20 @@ def get_matchups() -> dict:
     today = parlay.et_date_str(0)
     with _lock:
         if _cache["date"] == today and _cache["status"] == "ready":
-            return {"status": "ready", **_cache["data"]}
+            data = _cache["data"]
+            try:
+                lineups = _get_lineups([g["game_pk"] for g in data["games"]])
+                posted = 0
+                for g in data["games"]:
+                    orders = lineups.get(g["game_pk"], {})
+                    g["lineup_posted"] = bool(orders)
+                    posted += 1 if orders else 0
+                    for h in g["hitters"]:
+                        h["order"] = orders.get(h["player_id"])
+                data["lineups_posted"] = posted
+            except Exception as e:
+                log.warning("lineup enrich skipped: %s", e)
+            return {"status": "ready", **data}
         if _cache["status"] == "warming":
             return {"status": "warming"}
         _cache["status"] = "warming"
