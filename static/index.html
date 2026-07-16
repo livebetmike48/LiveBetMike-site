@@ -104,22 +104,24 @@ footer b{color:var(--gray)}
   <img src="/static/logo.jpg" alt="LiveBetMike logo">
   <div>
     <div class="brand">Live Bet Mike — <em>Matchup Board</em></div>
-    <p class="sub">Today's hitters vs today's starters — <b>real splits only</b>, no invented edge scores.
-    Every number computed the way Baseball Savant computes it. The ten squares are the last ten games: blue = got a hit.</p>
+    <p class="sub">Your board for tonight's hit props — every bat vs every arm on the slate.
+    <b>All real stats, no invented edge scores</b>: Savant-exact splits, live batting orders, streaks and last-10 form.
+    Blue squares = games he cashed a hit.</p>
   </div>
 </header>
 </div>
 <div class="tabs">
   <button class="tab active" id="tab-board" onclick="showView('board')">Matchup Board</button>
   <button class="tab" id="tab-bullpen" onclick="showView('bullpen')">Bullpen Usage</button>
+  <button class="tab" id="tab-lab" onclick="showView('lab')">Model Lab</button>
 </div>
 <main id="main">
   <div class="state" id="state">Loading today's board…<div class="bar"><i></i></div></div>
 </main>
 <footer>
-  <b>How to read this:</b> stats are the hitter's full-season numbers against the starter's throwing hand (minimum 40 PA).
-  Hitters shown are each team's qualified regulars — confirm lineups before betting.
-  🔥 = active hit streak from real game logs. Research, not advice. Data: Baseball Savant / MLB.
+  <b>Reading the board:</b> numbers are each hitter's season line against tonight's starter's hand (min 40 PA) —
+  flip to Last 30 for current form. Ord fills in as lineups drop. 🔥 = active hit streak.
+  Check the Bullpen tab before betting late-inning spots. Bet responsibly. Data: Baseball Savant / MLB.
 </footer>
 <script>
 const fmt = (v, pct) => v == null ? "–" : (pct ? v.toFixed(1) + "%" : v.toFixed(3).replace(/^0/, ""));
@@ -133,9 +135,11 @@ const sortState = {};
 
 function showView(v) {
   VIEW = v;
-  document.getElementById("tab-board").classList.toggle("active", v === "board");
-  document.getElementById("tab-bullpen").classList.toggle("active", v === "bullpen");
-  if (v === "board") render(); else renderBullpen();
+  for (const t of ["board", "bullpen", "lab"])
+    document.getElementById("tab-" + t).classList.toggle("active", v === t);
+  if (v === "board") render();
+  else if (v === "bullpen") renderBullpen();
+  else renderLab();
 }
 
 async function load() {
@@ -339,6 +343,127 @@ function buildBullpenTable(j) {
   table.innerHTML = head + body;
   wrap.appendChild(table);
   return wrap;
+}
+
+// ---------- Model Lab ----------
+let LAB_TOKEN_MEM = "";
+
+async function renderLab() {
+  const main = document.getElementById("main");
+  main.innerHTML = "<div class='state'>Loading lab…</div>";
+  const r = await fetch("/api/lab");
+  const j = await r.json();
+  if (j.error) { main.innerHTML = "<div class='state'>Lab error: " + j.error + "</div>"; return; }
+  main.innerHTML = "";
+
+  if (!j.persistent) {
+    const warn = document.createElement("div");
+    warn.className = "meta";
+    warn.style.cssText = "color:#e0a12f;margin:16px 0 0";
+    warn.textContent = "⚠️ No volume mounted — runs will be lost on redeploy. Add a /data volume + DB_PATH to keep history.";
+    main.appendChild(warn);
+  }
+
+  // Run controls + status
+  const ctl = document.createElement("div");
+  ctl.className = "winrow";
+  ctl.innerHTML = `
+    <select id="lab-days"><option>3</option><option>5</option><option selected>7</option><option>10</option><option>14</option></select>
+    <button class="winbtn" onclick="labRun()">Run backtest</button>
+    <input id="lab-token" type="password" placeholder="lab token" style="background:var(--panel-2);color:var(--white);border:1.5px solid var(--line);border-radius:6px;padding:6px 10px;font-family:'IBM Plex Mono',monospace;font-size:12px;width:130px">
+    <span class="meta" id="lab-status">${j.run.status === "running" ? "⏳ " + j.run.progress : (j.run.progress || "idle")}</span>
+    <a class="winbtn" href="/api/lab/export.csv" style="text-decoration:none">Export CSV → Sheets</a>`;
+  main.appendChild(ctl);
+  if (j.run.status === "running") setTimeout(renderLab, 6000);
+
+  // Knobs
+  const cfgHdr = document.createElement("div");
+  cfgHdr.className = "gamehdr";
+  cfgHdr.textContent = "Model knobs (recorded with every run)";
+  main.appendChild(cfgHdr);
+  const cfgBox = document.createElement("div");
+  cfgBox.className = "board";
+  let cfgHtml = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Knob</th><th>Value</th><th style='text-align:left'>Note</th></tr></thead><tbody>";
+  for (const [key, k] of Object.entries(j.config)) {
+    cfgHtml += `<tr><td class="name" style="cursor:default">${k.label}</td>
+      <td><input data-key="${key}" value="${k.value}" style="width:70px;background:transparent;color:var(--blue);border:1px solid var(--line);border-radius:4px;text-align:right;font-family:'IBM Plex Mono',monospace"></td>
+      <td style="text-align:left;color:#7a8694;font-family:Inter">${k.note}</td></tr>`;
+  }
+  cfgHtml += "</tbody></table>";
+  cfgBox.innerHTML = cfgHtml;
+  main.appendChild(cfgBox);
+  const saveRow = document.createElement("div");
+  saveRow.className = "winrow";
+  saveRow.innerHTML = `<button class="winbtn" onclick="labSaveConfig()">Save knobs</button><span class="meta">changes apply to the NEXT run — compare Brier across runs to judge them</span>`;
+  main.appendChild(saveRow);
+
+  // Latest run + history
+  const hist = j.history || [];
+  const runHdr = document.createElement("div");
+  runHdr.className = "gamehdr";
+  runHdr.textContent = hist.length ? "Backtest history" : "No runs yet — fire the first one";
+  main.appendChild(runHdr);
+  for (const run of hist) {
+    const rep = run.report;
+    const box = document.createElement("div");
+    box.className = "board";
+    box.style.marginBottom = "14px";
+    const when = new Date(run.ts * 1000).toLocaleString();
+    let h = `<div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">`;
+    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.n} predictions</div>`;
+    h += `<div style="margin:6px 0">Brier: model <b style="color:var(--white)">${rep.brier_model}</b> vs constant ${rep.brier_constant}${rep.brier_naive != null ? " vs naive " + rep.brier_naive : ""} (lower wins)`;
+    const beats = rep.brier_model < rep.brier_constant && (rep.brier_naive == null || rep.brier_model < rep.brier_naive);
+    h += beats ? ` <span style="color:#4caf7d">✅ beats baselines</span>` : ` <span style="color:#e0a12f">⚠️ not clearly better — don't ship</span>`;
+    h += `</div><div style="color:#7a8694">knobs: ${Object.entries(run.config).map(([k,v]) => k+"="+v).join(", ")}</div>`;
+    h += `<table style="margin-top:8px"><thead><tr><th style='text-align:left'>Bucket</th><th>n</th><th>Predicted</th><th>Actual</th><th style='text-align:left'>Gap</th></tr></thead><tbody>`;
+    for (const c of (rep.calibration || [])) {
+      const gap = (c.actual - c.predicted).toFixed(1);
+      const col = Math.abs(gap) < 3 ? "#4caf7d" : (Math.abs(gap) < 6 ? "#e0a12f" : "#d7483a");
+      h += `<tr><td style="text-align:left">${c.bucket}</td><td>${c.n}</td><td>${c.predicted}%</td><td>${c.actual}%</td><td style="text-align:left;color:${col}">${gap > 0 ? "+" : ""}${gap}</td></tr>`;
+    }
+    h += "</tbody></table></div>";
+    box.innerHTML = h;
+    main.appendChild(box);
+  }
+
+  // Prop roadmap
+  const rmHdr = document.createElement("div");
+  rmHdr.className = "gamehdr";
+  rmHdr.textContent = "Prop model roadmap";
+  main.appendChild(rmHdr);
+  const rm = document.createElement("div");
+  rm.className = "board";
+  let rh = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Prop</th><th style='text-align:left'>Status</th><th style='text-align:left'>Note</th></tr></thead><tbody>";
+  for (const p of j.roadmap) {
+    const col = p.status === "backtesting" ? "var(--blue)" : (p.status === "planned" ? "#e0a12f" : "#7a8694");
+    rh += `<tr><td class="name" style="cursor:default">${p.prop}</td><td style="text-align:left;color:${col}">${p.status}</td><td style="text-align:left;color:#7a8694;font-family:Inter">${p.note}</td></tr>`;
+  }
+  rh += "</tbody></table>";
+  rm.innerHTML = rh;
+  main.appendChild(rm);
+}
+
+function labToken() {
+  const el = document.getElementById("lab-token");
+  if (el && el.value) LAB_TOKEN_MEM = el.value;
+  return LAB_TOKEN_MEM;
+}
+
+async function labRun() {
+  const days = document.getElementById("lab-days").value;
+  const r = await fetch(`/api/lab/run?days=${days}&token=${encodeURIComponent(labToken())}`, {method: "POST"});
+  const j = await r.json();
+  document.getElementById("lab-status").textContent =
+    j.error ? "✖ " + j.error : (j.started ? "⏳ started…" : "already running");
+  if (j.started) setTimeout(renderLab, 4000);
+}
+
+async function labSaveConfig() {
+  const payload = {token: labToken()};
+  for (const inp of document.querySelectorAll("input[data-key]")) payload[inp.dataset.key] = parseFloat(inp.value);
+  const r = await fetch("/api/lab/config", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+  const j = await r.json();
+  document.getElementById("lab-status").textContent = j.error ? "✖ " + j.error : "✓ knobs saved — next run uses them";
 }
 
 load();
