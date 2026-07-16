@@ -5,6 +5,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import matchups
+import bullpen
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -22,6 +23,22 @@ def api_detail(batter_id: int, starter_id: int, hand: str):
         return {"error": "hand must be L or R"}
     try:
         return matchups.get_detail(batter_id, starter_id, hand)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/teams")
+def api_teams():
+    try:
+        return {"teams": bullpen.all_teams()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/bullpen")
+def api_bullpen(team_id: int):
+    try:
+        return bullpen.get_usage(team_id)
     except Exception as e:
         return {"error": str(e)}
 
