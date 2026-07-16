@@ -30,6 +30,8 @@ CONFIG_DEFAULTS = {
                       "note": "Below this the model refuses to predict"},
     "min_starter_pa": {"value": 60, "label": "Min starter PA vs side",
                        "note": "Below this the model refuses to predict"},
+    "shrink_pa": {"value": 150, "label": "Shrinkage (phantom league PAs)",
+                  "note": "Regression to the mean — higher = more skeptical of hot/cold splits. 0 = raw rates (the overconfident v1)"},
 }
 
 PROP_ROADMAP = [
@@ -85,6 +87,7 @@ def _apply_config():
     cfg = get_config()
     model.PA_VS_STARTER = cfg["pa_vs_starter"]["value"]
     model.PA_VS_PEN = cfg["pa_vs_pen"]["value"]
+    model.SHRINK_PA = cfg["shrink_pa"]["value"]
     return cfg
 
 
@@ -96,8 +99,8 @@ def run_backtest_async(days: int) -> bool:
         _run_state.update({"status": "running", "progress": "starting…",
                            "started": time.time()})
 
-    def _progress(done, total, n):
-        _run_state["progress"] = f"day {done}/{total} — {n} predictions graded"
+    def _progress(done, total, n, detail=""):
+        _run_state["progress"] = f"day {done}/{total} ({detail}) — {n} predictions graded"
 
     def _work():
         try:
