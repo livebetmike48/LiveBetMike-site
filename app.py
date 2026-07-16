@@ -4,8 +4,13 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import os
+
 import matchups
 import bullpen
+import lab
+
+LAB_TOKEN = os.getenv("LAB_TOKEN", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -41,6 +46,42 @@ def api_bullpen(team_id: int):
         return bullpen.get_usage(team_id)
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/api/lab")
+def api_lab():
+    try:
+        return lab.lab_state()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/lab/run")
+def api_lab_run(days: int = 7, token: str = ""):
+    if not LAB_TOKEN or token != LAB_TOKEN:
+        return {"error": "bad token"}
+    if days not in (3, 5, 7, 10, 14):
+        return {"error": "days must be 3/5/7/10/14"}
+    started = lab.run_backtest_async(days)
+    return {"started": started}
+
+
+@app.post("/api/lab/config")
+def api_lab_config(payload: dict):
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    updates = {k: v for k, v in payload.items() if k != "token"}
+    try:
+        return {"config": lab.set_config(updates)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/lab/export.csv")
+def api_lab_export():
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(lab.export_csv(), media_type="text/csv",
+                             headers={"Content-Disposition": "attachment; filename=model_backtests.csv"})
 
 
 @app.get("/")
