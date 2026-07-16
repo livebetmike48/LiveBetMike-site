@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Bet Mike — Matchup Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0b0d11;          /* LB black */
+  --panel:#14171d;
+  --panel-2:#191d24;
+  --line:#262c36;
+  --blue:#2fa8e0;        /* LB electric blue */
+  --blue-deep:#1b7fb4;
+  --white:#f4f7fa;
+  --gray:#8b96a3;
+  --miss:#2a303a;
+}
+*{box-sizing:border-box;margin:0}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}*{transition:none!important;animation:none!important}}
+body{background:var(--bg);color:var(--white);font-family:Inter,system-ui,sans-serif;min-height:100vh}
+/* racing-slash banner, straight from the LB logo language */
+.banner{position:relative;overflow:hidden;border-bottom:3px solid var(--blue);
+  background:
+    linear-gradient(115deg, transparent 42%, rgba(47,168,224,.16) 42%, rgba(47,168,224,.16) 48%, transparent 48%),
+    linear-gradient(115deg, transparent 55%, rgba(139,150,163,.10) 55%, rgba(139,150,163,.10) 59%, transparent 59%),
+    linear-gradient(115deg, transparent 66%, rgba(47,168,224,.08) 66%, rgba(47,168,224,.08) 74%, transparent 74%),
+    #0b0d11}
+header{padding:30px 22px 22px;max-width:1080px;margin:0 auto;display:flex;align-items:center;gap:18px}
+header img{width:74px;height:74px;border-radius:12px;border:2px solid var(--blue)}
+.brand{font-family:"Barlow Condensed",sans-serif;font-weight:700;font-size:clamp(34px,5.5vw,54px);
+  letter-spacing:1px;line-height:.95;text-transform:uppercase;font-style:italic}
+.brand em{font-style:italic;color:var(--blue)}
+.sub{margin-top:6px;color:var(--gray);font-size:13.5px;max-width:62ch}
+.sub b{color:var(--white);font-weight:600}
+main{max-width:1080px;margin:0 auto;padding:0 22px 80px}
+.state{padding:60px 0;color:var(--gray);font-size:15px}
+.state .bar{width:220px;height:4px;background:#1c222b;border-radius:2px;overflow:hidden;margin-top:14px}
+.state .bar i{display:block;height:100%;width:40%;background:var(--blue);border-radius:2px;animation:slide 1.2s ease-in-out infinite}
+@keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(560%)}}
+.gamehdr{font-family:"Barlow Condensed",sans-serif;font-weight:700;font-style:italic;font-size:23px;
+  letter-spacing:2px;text-transform:uppercase;color:var(--blue);margin:38px 0 10px;display:flex;align-items:center;gap:12px}
+.gamehdr::after{content:"";flex:1;height:2px;
+  background:linear-gradient(115deg, var(--blue) 0 30%, #2a303a 30% 100%)}
+.board{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;
+  box-shadow:0 10px 30px rgba(0,0,0,.45)}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+thead th{font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:600;letter-spacing:.6px;
+  text-transform:uppercase;color:var(--gray);padding:11px 8px;border-bottom:2px solid var(--blue);
+  text-align:right;cursor:pointer;user-select:none;white-space:nowrap;background:var(--panel-2)}
+thead th:first-child{text-align:left;padding-left:14px}
+thead th.sorted{color:var(--blue)}
+tbody td{padding:9px 8px;border-bottom:1px solid var(--line);text-align:right;color:var(--white);
+  font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+tbody td.name{font-family:Inter,sans-serif;text-align:left;padding-left:14px;font-weight:600;cursor:pointer}
+tbody td.name .vs{display:block;font-weight:400;font-size:11.5px;color:var(--gray)}
+tbody tr.row:hover td{background:#1a2029}
+tbody tr.row:focus-within td{outline:2px solid var(--blue);outline-offset:-2px}
+.strip{display:inline-flex;gap:2px}
+.strip i{width:9px;height:9px;border-radius:2px;background:var(--miss)}
+.strip i.h{background:var(--blue)}
+.streak{color:var(--blue);font-weight:600}
+.detail td{background:#0e1116;color:var(--white);padding:16px 14px;border-bottom:3px solid var(--blue-deep)}
+.detail h4{font-family:"Barlow Condensed",sans-serif;letter-spacing:1.5px;text-transform:uppercase;
+  font-style:italic;font-size:16px;color:var(--blue);margin:10px 0 6px}
+.detail table{font-size:12.5px}
+.detail thead th{color:var(--gray);border-bottom:1px solid var(--line);cursor:default;background:transparent}
+.detail tbody td{border-bottom:1px solid #161b22;color:var(--white)}
+.detail .loading{color:var(--gray)}
+footer{max-width:1080px;margin:0 auto;padding:0 22px 40px;color:#5d6873;font-size:12px;line-height:1.7}
+footer b{color:var(--gray)}
+@media(max-width:760px){
+  .board{overflow-x:auto}
+  table{min-width:820px}
+  header{gap:12px}
+  header img{width:54px;height:54px}
+}
+</style>
+</head>
+<body>
+<div class="banner">
+<header>
+  <img src="/static/logo.jpg" alt="LiveBetMike logo">
+  <div>
+    <div class="brand">Live Bet Mike — <em>Matchup Board</em></div>
+    <p class="sub">Today's hitters vs today's starters — <b>real splits only</b>, no invented edge scores.
+    Every number computed the way Baseball Savant computes it. The ten squares are the last ten games: blue = got a hit.</p>
+  </div>
+</header>
+</div>
+<main id="main">
+  <div class="state" id="state">Loading today's board…<div class="bar"><i></i></div></div>
+</main>
+<footer>
+  <b>How to read this:</b> stats are the hitter's full-season numbers against the starter's throwing hand (minimum 40 PA).
+  Hitters shown are each team's qualified regulars — confirm lineups before betting.
+  🔥 = active hit streak from real game logs. Research, not advice. Data: Baseball Savant / MLB.
+</footer>
+<script>
+const fmt = (v, pct) => v == null ? "–" : (pct ? v.toFixed(1) + "%" : v.toFixed(3).replace(/^0/, ""));
+const COLS = [
+  ["name","Hitter",false],["pa","PA",false],["avg","AVG",false],["xba","xBA",false],
+  ["xwoba","xwOBA",false],["k_pct","K%",true],["bb_pct","BB%",true],["whiff_pct","Whiff%",true],
+  ["hit_game_pct","Hit-Gm%",true],["streak","🔥",false],["last10","Last 10",false],
+];
+
+let DATA = null;
+const sortState = {};
+
+async function load() {
+  const r = await fetch("/api/matchups");
+  const j = await r.json();
+  if (j.status === "warming") {
+    document.getElementById("state").innerHTML =
+      "Building today's board from season data — first load of the day takes a couple of minutes.<div class='bar'><i></i></div>";
+    setTimeout(load, 8000);
+    return;
+  }
+  DATA = j;
+  render();
+}
+
+function render() {
+  const main = document.getElementById("main");
+  main.innerHTML = "";
+  if (!DATA.games.length) {
+    main.innerHTML = "<div class='state'>No games on today's slate yet.</div>";
+    return;
+  }
+  for (const g of DATA.games) {
+    if (!g.hitters.length) continue;
+    const hdr = document.createElement("div");
+    hdr.className = "gamehdr";
+    hdr.textContent = `${g.away} @ ${g.home}`;
+    main.appendChild(hdr);
+    main.appendChild(buildTable(g));
+  }
+}
+
+function buildTable(g) {
+  const wrap = document.createElement("div");
+  wrap.className = "board";
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  for (const [key, label] of COLS) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    if (key !== "name" && key !== "last10") {
+      th.onclick = () => { sortState[g.game_pk] = key; sortRows(g, key); render(); };
+      if (sortState[g.game_pk] === key) th.classList.add("sorted");
+    }
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const h of g.hitters) {
+    const tr = document.createElement("tr");
+    tr.className = "row";
+    for (const [key,, pct] of COLS) {
+      const td = document.createElement("td");
+      if (key === "name") {
+        td.className = "name";
+        td.tabIndex = 0;
+        td.innerHTML = `${h.name} <span class="vs">vs ${h.starter} (${h.hand}HP)</span>`;
+        td.onclick = () => toggleDetail(tr, h);
+        td.onkeydown = e => { if (e.key === "Enter") toggleDetail(tr, h); };
+      } else if (key === "last10") {
+        td.innerHTML = `<span class="strip">${h.last10.map(x => `<i class="${x ? "h" : ""}"></i>`).join("")}</span>`;
+      } else if (key === "streak") {
+        td.innerHTML = h.streak >= 3 ? `<span class="streak">🔥${h.streak}</span>` : (h.streak || "–");
+      } else if (key === "pa") {
+        td.textContent = h.pa;
+      } else {
+        td.textContent = fmt(h[key], pct);
+      }
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  return wrap;
+}
+
+function sortRows(g, key) {
+  g.hitters.sort((a, b) => (b[key] ?? -1) - (a[key] ?? -1));
+}
+
+async function toggleDetail(tr, h) {
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains("detail")) { next.remove(); return; }
+  const dr = document.createElement("tr");
+  dr.className = "detail";
+  const td = document.createElement("td");
+  td.colSpan = COLS.length;
+  td.innerHTML = `<span class="loading">Loading ${h.name}'s per-pitch card…</span>`;
+  dr.appendChild(td);
+  tr.after(dr);
+
+  const r = await fetch(`/api/detail?batter_id=${h.player_id}&starter_id=${h.starter_id}&hand=${h.hand}`);
+  const j = await r.json();
+  if (j.error) { td.textContent = "Couldn't load detail: " + j.error; return; }
+
+  let html = `<h4>${h.name} — vs each pitch (vs ${h.hand}HP)</h4>`;
+  html += "<table><thead><tr><th style='text-align:left'>Pitch</th><th>Seen</th><th>PA</th><th>AVG</th><th>xBA</th><th>xwOBA</th><th>Whiff%</th><th>K%</th></tr></thead><tbody>";
+  for (const [pt, s] of Object.entries(j.per_pitch)) {
+    html += `<tr><td style="text-align:left">${pt}</td><td>${s.pitches_seen}</td><td>${s.pa_ending_on_this_pitch}</td>
+      <td>${fmt(s.avg)}</td><td>${fmt(s.xba)}</td><td>${fmt(s.xwoba)}</td>
+      <td>${fmt(s.whiff_pct, true)}</td><td>${fmt(s.k_pct, true)}</td></tr>`;
+  }
+  html += "</tbody></table>";
+  html += `<h4>${h.starter} — mix vs ${j.batter_side}HB</h4>`;
+  html += "<table><thead><tr><th style='text-align:left'>Pitch</th><th>Usage</th><th>Thrown</th><th>Velo</th><th>Whiff%</th></tr></thead><tbody>";
+  for (const [pt, m] of Object.entries(j.starter_mix)) {
+    html += `<tr><td style="text-align:left">${pt}</td><td>${m.usage_pct}%</td><td>${m.count}</td>
+      <td>${m.avg_velo ?? "–"}</td><td>${m.whiff_pct != null ? m.whiff_pct + "%" : "–"}</td></tr>`;
+  }
+  html += "</tbody></table>";
+  td.innerHTML = html;
+}
+
+load();
+</script>
+</body>
+</html>
