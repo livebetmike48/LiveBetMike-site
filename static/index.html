@@ -70,6 +70,24 @@ tbody tr.row:focus-within td{outline:2px solid var(--blue);outline-offset:-2px}
 .detail thead th{color:var(--gray);border-bottom:1px solid var(--line);cursor:default;background:transparent}
 .detail tbody td{border-bottom:1px solid #161b22;color:var(--white)}
 .detail .loading{color:var(--gray)}
+.tabs{max-width:1080px;margin:0 auto;padding:14px 22px 0;display:flex;gap:10px;flex-wrap:wrap}
+.tab{font-family:"Barlow Condensed",sans-serif;font-style:italic;font-weight:700;letter-spacing:1.5px;
+  text-transform:uppercase;font-size:16px;padding:8px 18px;border:1.5px solid var(--line);border-radius:8px;
+  background:var(--panel);color:var(--gray);cursor:pointer}
+.tab.active{border-color:var(--blue);color:var(--blue)}
+.tab:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.winrow{display:flex;gap:8px;align-items:center;margin:18px 0 0}
+.winbtn{font-family:"IBM Plex Mono",monospace;font-size:11.5px;letter-spacing:.6px;padding:5px 12px;
+  border:1.5px solid var(--line);border-radius:6px;background:transparent;color:var(--gray);cursor:pointer;text-transform:uppercase}
+.winbtn.active{border-color:var(--blue);color:var(--blue)}
+.meta{color:var(--gray);font-size:12.5px;margin-left:8px}
+td.ord{color:var(--blue)}
+.heat{display:grid;gap:0}
+.bp-wrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow-x:auto;margin-top:14px}
+.bp-wrap table{min-width:600px}
+.bp-cell{text-align:center!important;font-weight:600}
+select{background:var(--panel-2);color:var(--white);border:1.5px solid var(--line);border-radius:6px;
+  padding:6px 10px;font-family:"IBM Plex Mono",monospace;font-size:12px}
 footer{max-width:1080px;margin:0 auto;padding:0 22px 40px;color:#5d6873;font-size:12px;line-height:1.7}
 footer b{color:var(--gray)}
 @media(max-width:760px){
@@ -91,6 +109,10 @@ footer b{color:var(--gray)}
   </div>
 </header>
 </div>
+<div class="tabs">
+  <button class="tab active" id="tab-board" onclick="showView('board')">Matchup Board</button>
+  <button class="tab" id="tab-bullpen" onclick="showView('bullpen')">Bullpen Usage</button>
+</div>
 <main id="main">
   <div class="state" id="state">Loading today's board…<div class="bar"><i></i></div></div>
 </main>
@@ -102,13 +124,19 @@ footer b{color:var(--gray)}
 <script>
 const fmt = (v, pct) => v == null ? "–" : (pct ? v.toFixed(1) + "%" : v.toFixed(3).replace(/^0/, ""));
 const COLS = [
-  ["name","Hitter",false],["pa","PA",false],["avg","AVG",false],["xba","xBA",false],
+  ["name","Hitter",false],["order","Ord",false],["pa","PA",false],["avg","AVG",false],["xba","xBA",false],
   ["xwoba","xwOBA",false],["k_pct","K%",true],["bb_pct","BB%",true],["whiff_pct","Whiff%",true],
   ["hit_game_pct","Hit-Gm%",true],["streak","🔥",false],["last10","Last 10",false],
 ];
-
-let DATA = null;
+let DATA = null, VIEW = "board", WINDOW = "season";
 const sortState = {};
+
+function showView(v) {
+  VIEW = v;
+  document.getElementById("tab-board").classList.toggle("active", v === "board");
+  document.getElementById("tab-bullpen").classList.toggle("active", v === "bullpen");
+  if (v === "board") render(); else renderBullpen();
+}
 
 async function load() {
   const r = await fetch("/api/matchups");
@@ -123,18 +151,36 @@ async function load() {
   render();
 }
 
+function stats(h) { return (h.windows && (h.windows[WINDOW] || h.windows.season)) || h; }
+
 function render() {
+  if (VIEW !== "board") return;
   const main = document.getElementById("main");
   main.innerHTML = "";
+  if (!DATA) { main.innerHTML = "<div class='state'>Loading…</div>"; return; }
   if (!DATA.games.length) {
     main.innerHTML = "<div class='state'>No games on today's slate yet.</div>";
     return;
   }
+  const winrow = document.createElement("div");
+  winrow.className = "winrow";
+  winrow.innerHTML = `
+    <button class="winbtn ${WINDOW === "season" ? "active" : ""}" onclick="WINDOW='season';render()">Season</button>
+    <button class="winbtn ${WINDOW === "l30" ? "active" : ""}" onclick="WINDOW='l30';render()">Last 30</button>
+    <span class="meta">${DATA.lineups_posted ?? 0} of ${DATA.games.length} lineups posted</span>`;
+  main.appendChild(winrow);
   for (const g of DATA.games) {
     if (!g.hitters.length) continue;
     const hdr = document.createElement("div");
     hdr.className = "gamehdr";
-    hdr.textContent = `${g.away} @ ${g.home}`;
+    let title = `${g.away} @ ${g.home}`;
+    if (g.moneyline) {
+      const bits = [];
+      if (g.moneyline.away) bits.push(`${g.away} ${g.moneyline.away.price > 0 ? "+" : ""}${g.moneyline.away.price}`);
+      if (g.moneyline.home) bits.push(`${g.home} ${g.moneyline.home.price > 0 ? "+" : ""}${g.moneyline.home.price}`);
+      if (bits.length) title += `  ·  ${bits.join(" / ")} (best)`;
+    }
+    hdr.textContent = title;
     main.appendChild(hdr);
     main.appendChild(buildTable(g));
   }
@@ -149,7 +195,7 @@ function buildTable(g) {
   for (const [key, label] of COLS) {
     const th = document.createElement("th");
     th.textContent = label;
-    if (key !== "name" && key !== "last10") {
+    if (!["name","last10","order"].includes(key)) {
       th.onclick = () => { sortState[g.game_pk] = key; sortRows(g, key); render(); };
       if (sortState[g.game_pk] === key) th.classList.add("sorted");
     }
@@ -160,6 +206,7 @@ function buildTable(g) {
 
   const tbody = document.createElement("tbody");
   for (const h of g.hitters) {
+    const s = stats(h);
     const tr = document.createElement("tr");
     tr.className = "row";
     for (const [key,, pct] of COLS) {
@@ -167,17 +214,21 @@ function buildTable(g) {
       if (key === "name") {
         td.className = "name";
         td.tabIndex = 0;
-        td.innerHTML = `${h.name} <span class="vs">vs ${h.starter} (${h.hand}HP)</span>`;
+        const bench = g.lineup_posted && h.order == null;
+        td.innerHTML = `${h.name}${bench ? " <span class='vs'>(not in lineup)</span>" : ""} <span class="vs">vs ${h.starter} (${h.hand}HP)</span>`;
         td.onclick = () => toggleDetail(tr, h);
         td.onkeydown = e => { if (e.key === "Enter") toggleDetail(tr, h); };
+      } else if (key === "order") {
+        td.className = "ord";
+        td.textContent = h.order ?? "–";
       } else if (key === "last10") {
         td.innerHTML = `<span class="strip">${h.last10.map(x => `<i class="${x ? "h" : ""}"></i>`).join("")}</span>`;
       } else if (key === "streak") {
         td.innerHTML = h.streak >= 3 ? `<span class="streak">🔥${h.streak}</span>` : (h.streak || "–");
       } else if (key === "pa") {
-        td.textContent = h.pa;
+        td.textContent = s ? s.pa : "–";
       } else {
-        td.textContent = fmt(h[key], pct);
+        td.textContent = s ? fmt(s[key], pct) : "–";
       }
       tr.appendChild(td);
     }
@@ -189,7 +240,7 @@ function buildTable(g) {
 }
 
 function sortRows(g, key) {
-  g.hitters.sort((a, b) => (b[key] ?? -1) - (a[key] ?? -1));
+  g.hitters.sort((a, b) => ((stats(b) || {})[key] ?? -1) - ((stats(a) || {})[key] ?? -1));
 }
 
 async function toggleDetail(tr, h) {
@@ -223,6 +274,71 @@ async function toggleDetail(tr, h) {
   }
   html += "</tbody></table>";
   td.innerHTML = html;
+}
+
+// ---------- Bullpen view ----------
+let TEAMS = null;
+
+async function renderBullpen() {
+  const main = document.getElementById("main");
+  main.innerHTML = "<div class='state'>Loading teams…</div>";
+  if (!TEAMS) {
+    const r = await fetch("/api/teams");
+    const j = await r.json();
+    if (j.error) { main.innerHTML = "<div class='state'>Couldn't load teams: " + j.error + "</div>"; return; }
+    TEAMS = j.teams;
+  }
+  main.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = "winrow";
+  const sel = document.createElement("select");
+  sel.innerHTML = TEAMS.map(t => `<option value="${t.id}">${t.abbrev} — ${t.name}</option>`).join("");
+  const note = document.createElement("span");
+  note.className = "meta";
+  note.textContent = "pitches thrown per arm, last 7 days — starters excluded, redder = heavier workload";
+  row.appendChild(sel);
+  row.appendChild(note);
+  main.appendChild(row);
+  const holder = document.createElement("div");
+  main.appendChild(holder);
+  const draw = async () => {
+    holder.innerHTML = "<div class='state'>Loading usage…<div class='bar'><i></i></div></div>";
+    const r = await fetch(`/api/bullpen?team_id=${sel.value}`);
+    const j = await r.json();
+    if (j.error) { holder.innerHTML = "<div class='state'>Couldn't load: " + j.error + "</div>"; return; }
+    holder.innerHTML = "";
+    holder.appendChild(buildBullpenTable(j));
+  };
+  sel.onchange = draw;
+  draw();
+}
+
+function buildBullpenTable(j) {
+  const wrap = document.createElement("div");
+  wrap.className = "bp-wrap";
+  if (!j.arms.length) {
+    wrap.innerHTML = "<div class='state' style='padding:20px'>No relief appearances in the window.</div>";
+    return wrap;
+  }
+  const table = document.createElement("table");
+  let head = "<thead><tr><th style='text-align:left;padding-left:14px'>Reliever</th>";
+  for (const d of j.dates) head += `<th>${d.slice(5)}</th>`;
+  head += "<th>Total</th></tr></thead>";
+  let body = "<tbody>";
+  for (const arm of j.arms) {
+    body += `<tr><td class="name" style="cursor:default">${arm.name}</td>`;
+    for (const d of j.dates) {
+      const n = arm.counts[d];
+      if (n == null) { body += "<td></td>"; continue; }
+      const alpha = Math.min(1, n / 30) * 0.75 + 0.15;
+      body += `<td class="bp-cell" style="background:rgba(215,72,58,${alpha.toFixed(2)})">${n}</td>`;
+    }
+    body += `<td class="bp-cell">${arm.total}</td></tr>`;
+  }
+  body += "</tbody>";
+  table.innerHTML = head + body;
+  wrap.appendChild(table);
+  return wrap;
 }
 
 load();
