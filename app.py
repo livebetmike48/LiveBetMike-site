@@ -57,9 +57,11 @@ def api_lab():
 
 
 @app.post("/api/lab/run")
-def api_lab_run(days: int = 7, token: str = ""):
-    if not LAB_TOKEN or token != LAB_TOKEN:
+def api_lab_run(payload: dict):
+    # token in the BODY, never the URL -- URLs get written to logs
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
         return {"error": "bad token"}
+    days = int(payload.get("days", 7))
     if days not in (3, 5, 7, 10, 14):
         return {"error": "days must be 3/5/7/10/14"}
     started = lab.run_backtest_async(days)
