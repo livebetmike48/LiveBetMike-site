@@ -450,8 +450,9 @@ function labToken() {
 }
 
 async function labRun() {
-  const days = document.getElementById("lab-days").value;
-  const r = await fetch(`/api/lab/run?days=${days}&token=${encodeURIComponent(labToken())}`, {method: "POST"});
+  const days = parseInt(document.getElementById("lab-days").value);
+  const r = await fetch("/api/lab/run", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({days: days, token: labToken()})});
   const j = await r.json();
   document.getElementById("lab-status").textContent =
     j.error ? "✖ " + j.error : (j.started ? "⏳ started…" : "already running");
