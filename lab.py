@@ -34,6 +34,8 @@ CONFIG_DEFAULTS = {
                   "note": "Regression to the mean — higher = more skeptical of hot/cold splits. 0 = raw rates (the overconfident v1)"},
     "personal_pa": {"value": 1, "label": "Personal playing time (1=on, 0=off)",
                     "note": "Scale PAs by the batter's own PA/game — captures lineup slot + pinch-hit risk from real logs"},
+    "xba_weight": {"value": 0, "label": "xBA blend weight (0-1)",
+                   "note": "0 = actual hit rates (v4 champion), 1 = fully luck-stripped expected rates, 0.5 = half and half"},
 }
 
 PROP_ROADMAP = [
@@ -91,6 +93,7 @@ def _apply_config():
     model.PA_VS_PEN = cfg["pa_vs_pen"]["value"]
     model.SHRINK_PA = cfg["shrink_pa"]["value"]
     model.PERSONAL_PA = int(cfg["personal_pa"]["value"])
+    model.XBA_WEIGHT = max(0.0, min(1.0, cfg["xba_weight"]["value"]))
     return cfg
 
 
