@@ -364,6 +364,9 @@ async function renderLab() {
     main.appendChild(warn);
   }
 
+  // Today's model board (beta) + permanent result log
+  loadProjections(main);
+
   // Run controls + status
   const ctl = document.createElement("div");
   ctl.className = "winrow";
@@ -396,6 +399,19 @@ async function renderLab() {
   saveRow.className = "winrow";
   saveRow.innerHTML = `<button class="winbtn" onclick="labSaveConfig()">Save knobs</button><span class="meta">changes apply to the NEXT run — compare Brier across runs to judge them</span>`;
   main.appendChild(saveRow);
+
+  // Player priors upload (e.g. preseason Steamer export from FanGraphs)
+  const priHdr = document.createElement("div");
+  priHdr.className = "gamehdr";
+  priHdr.textContent = `Player priors (${j.priors_loaded || 0} loaded)`;
+  main.appendChild(priHdr);
+  const pri = document.createElement("div");
+  pri.className = "winrow";
+  pri.innerHTML = `
+    <input type="file" id="priors-file" accept=".csv" style="color:var(--gray);font-family:'IBM Plex Mono',monospace;font-size:11px;max-width:230px">
+    <button class="winbtn" onclick="labUploadPriors()">Upload priors CSV</button>
+    <span class="meta">projections export with Name/PA/H (use PRE-SEASON projections for backtests — rest-of-season leaks future data). Set the prior weight knob above to use them.</span>`;
+  main.appendChild(pri);
 
   // Latest run + history
   const hist = j.history || [];
@@ -443,6 +459,54 @@ async function renderLab() {
   main.appendChild(rm);
 }
 
+async function loadProjections(main) {
+  const holder = document.createElement("div");
+  main.appendChild(holder);
+  const r = await fetch("/api/projections");
+  const j = await r.json();
+  if (j.error) return;
+
+  const rl = j.result_log || {};
+  const logHdr = document.createElement("div");
+  logHdr.className = "gamehdr";
+  logHdr.textContent = "Permanent result log (live, self-graded)";
+  holder.appendChild(logHdr);
+  const logBox = document.createElement("div");
+  logBox.className = "meta";
+  logBox.style.cssText = "margin:4px 0 0";
+  if (!rl.n) {
+    logBox.textContent = "No graded predictions yet — the log starts filling the morning after the first slate.";
+  } else {
+    const beats = rl.brier_model < rl.brier_constant;
+    logBox.innerHTML = `<b style="color:var(--white)">${rl.n}</b> graded predictions over ${rl.days} day(s) — Brier <b style="color:var(--white)">${rl.brier_model}</b> vs constant ${rl.brier_constant} ${beats ? "<span style='color:#4caf7d'>✅</span>" : "<span style='color:#e0a12f'>⚠️</span>"} · every prediction logged before games, graded after — no cherry-picking`;
+  }
+  holder.appendChild(logBox);
+
+  const projHdr = document.createElement("div");
+  projHdr.className = "gamehdr";
+  projHdr.textContent = `Today's model board — BETA (validation in progress)`;
+  holder.appendChild(projHdr);
+  const projs = (j.projections || []).slice(0, 40);
+  if (!projs.length) {
+    const none = document.createElement("div");
+    none.className = "meta";
+    none.textContent = "No projections yet — starters may not be posted.";
+    holder.appendChild(none);
+    return;
+  }
+  const box = document.createElement("div");
+  box.className = "board";
+  let h = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Hitter</th><th style='text-align:left'>vs</th><th>P(hit)</th></tr></thead><tbody>";
+  for (const p of projs) {
+    h += `<tr><td class="name" style="cursor:default">${p.name} <span class="vs">${p.team}</span></td>
+      <td style="text-align:left;color:#7a8694;font-family:Inter">${p.starter}</td>
+      <td style="color:var(--blue);font-weight:600">${(p.p * 100).toFixed(1)}%</td></tr>`;
+  }
+  h += "</tbody></table>";
+  box.innerHTML = h;
+  holder.appendChild(box);
+}
+
 function labToken() {
   const el = document.getElementById("lab-token");
   if (el && el.value) LAB_TOKEN_MEM = el.value;
@@ -457,6 +521,18 @@ async function labRun() {
   document.getElementById("lab-status").textContent =
     j.error ? "✖ " + j.error : (j.started ? "⏳ started…" : "already running");
   if (j.started) setTimeout(renderLab, 4000);
+}
+
+async function labUploadPriors() {
+  const f = document.getElementById("priors-file").files[0];
+  if (!f) { document.getElementById("lab-status").textContent = "✖ pick a CSV file first"; return; }
+  const text = await f.text();
+  const r = await fetch("/api/lab/priors", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({token: labToken(), csv: text})});
+  const j = await r.json();
+  document.getElementById("lab-status").textContent =
+    j.error ? "✖ " + j.error : `✓ ${j.loaded} player priors loaded (${j.dropped_duplicates} duplicate names dropped)`;
+  if (!j.error) setTimeout(renderLab, 1200);
 }
 
 async function labSaveConfig() {
