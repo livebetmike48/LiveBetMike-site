@@ -137,6 +137,13 @@ def _core_stats(rows: list[dict]) -> dict:
     ]
     xba_numerator = sum(xba_tracked)
 
+    xslg_tracked = [
+        v for v in (
+            _safe_float(r.get("estimated_slg_using_speedangle"))
+            for r in rows if r.get("description") == "hit_into_play"
+        ) if v is not None
+    ]
+
     xwoba_values = [_safe_float(r.get("estimated_woba_using_speedangle")) for r in rows]
     xwoba_values = [v for v in xwoba_values if v is not None]
 
@@ -148,6 +155,9 @@ def _core_stats(rows: list[dict]) -> dict:
     xba_at_bats = len(xba_tracked) + strikeouts
     if xba_at_bats > 0:
         result["xba"] = round(xba_numerator / xba_at_bats, 3)
+    xslg_at_bats = len(xslg_tracked) + strikeouts
+    if xslg_at_bats > 0:
+        result["xslg"] = round(sum(xslg_tracked) / xslg_at_bats, 3)
     if pa_rows:
         result["k_pct"] = round(strikeouts / len(pa_rows) * 100, 1)
         result["bb_pct"] = round(walks / len(pa_rows) * 100, 1)
