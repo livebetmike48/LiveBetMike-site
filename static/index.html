@@ -113,6 +113,7 @@ footer b{color:var(--gray)}
 <div class="tabs">
   <button class="tab active" id="tab-board" onclick="showView('board')">Matchup Board</button>
   <button class="tab" id="tab-bullpen" onclick="showView('bullpen')">Bullpen Usage</button>
+  <button class="tab" id="tab-model" onclick="showView('model')">Model Board</button>
   <button class="tab" id="tab-lab" onclick="showView('lab')">Model Lab</button>
 </div>
 <main id="main">
@@ -135,11 +136,24 @@ const sortState = {};
 
 function showView(v) {
   VIEW = v;
-  for (const t of ["board", "bullpen", "lab"])
+  for (const t of ["board", "bullpen", "model", "lab"])
     document.getElementById("tab-" + t).classList.toggle("active", v === t);
   if (v === "board") render();
   else if (v === "bullpen") renderBullpen();
+  else if (v === "model") renderModelBoard();
   else renderLab();
+}
+
+function renderModelBoard() {
+  const main = document.getElementById("main");
+  main.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = "winrow";
+  row.innerHTML = `
+    <select id="prop-select"><option value="hits">Hits O/U 0.5</option></select>
+    <span class="meta">more props join this dropdown as they pass calibration in the Lab — walks, strikeouts, HR, total bases queued</span>`;
+  main.appendChild(row);
+  loadProjections(main);
 }
 
 async function load() {
@@ -364,9 +378,6 @@ async function renderLab() {
     main.appendChild(warn);
   }
 
-  // Today's model board (beta) + permanent result log
-  loadProjections(main);
-
   // Run controls + status
   const ctl = document.createElement("div");
   ctl.className = "winrow";
@@ -462,9 +473,18 @@ async function renderLab() {
 async function loadProjections(main) {
   const holder = document.createElement("div");
   main.appendChild(holder);
-  const r = await fetch("/api/projections");
-  const j = await r.json();
-  if (j.error) return;
+  let j;
+  try {
+    const r = await fetch("/api/projections");
+    j = await r.json();
+  } catch (e) {
+    holder.innerHTML = "<div class='meta' style='margin-top:16px'>✖ projections request failed — refresh in a minute</div>";
+    return;
+  }
+  if (j.error) {
+    holder.innerHTML = `<div class='meta' style='margin-top:16px'>✖ projections error: ${j.error}</div>`;
+    return;
+  }
 
   const rl = j.result_log || {};
   const logHdr = document.createElement("div");
@@ -486,6 +506,14 @@ async function loadProjections(main) {
   projHdr.className = "gamehdr";
   projHdr.textContent = `Today's model board — BETA (validation in progress)`;
   holder.appendChild(projHdr);
+  if (j.status === "building") {
+    const b = document.createElement("div");
+    b.className = "state";
+    b.innerHTML = "Computing today's slate — first build of the day takes a few minutes…<div class='bar'><i></i></div>";
+    holder.appendChild(b);
+    setTimeout(() => { holder.remove(); loadProjections(main); }, 10000);
+    return;
+  }
   const projs = (j.projections || []).slice(0, 40);
   if (!projs.length) {
     const none = document.createElement("div");
