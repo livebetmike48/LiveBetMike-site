@@ -192,17 +192,16 @@ def attach_odds(data: dict) -> dict:
             props = odds_api.get_event_props(ev.get("id"), "batter_hits") if ev else None
             ev_cache[gpk] = props
         props = ev_cache[gpk]
-        priced = odds_api.player_prop_prices(props, "batter_hits", r["name"]) if props else None
-        if not priced:
-            continue
-        bp = odds_api.best_price(priced["prices"])
-        if not bp:
-            continue
-        dec = odds_api.american_to_decimal(bp[1])
-        implied = 1 / dec
-        r["price"] = bp[1]
-        r["book"] = bp[0]
-        r["book_implied"] = round(implied * 100, 1)
         r["fair"] = fair_american(r["p"])
-        r["ev_pct"] = round((r["p"] * dec - 1) * 100, 1)
+        for side, prob in (("over", r["p"]), ("under", 1 - r["p"])):
+            priced = odds_api.player_prop_prices(props, "batter_hits", r["name"], side=side) if props else None
+            if not priced or priced.get("point") != 0.5:
+                continue
+            bp = odds_api.best_price(priced["prices"])
+            if not bp:
+                continue
+            dec = odds_api.american_to_decimal(bp[1])
+            r[f"price_{side}"] = bp[1]
+            r[f"book_{side}"] = bp[0]
+            r[f"ev_{side}"] = round((prob * dec - 1) * 100, 1)
     return data
