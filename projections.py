@@ -22,7 +22,9 @@ log = logging.getLogger("projections")
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 
 _today_cache = {"date": None, "ts": 0, "data": None}
+_build_state = {"running": False}
 _grade_ts = {"ts": 0}
+import threading as _threading
 
 
 @contextmanager
@@ -42,6 +44,30 @@ def init_db():
             team TEXT, starter TEXT, p REAL, created INTEGER,
             graded INTEGER DEFAULT 0, hit INTEGER,
             PRIMARY KEY (date, game_pk, player_id))""")
+
+
+def get_today() -> dict:
+    """Instant answer: cached projections if fresh, else kick a BACKGROUND
+    build and report status -- never blocks the web request (first build
+    of a day takes minutes; that must not live inside an HTTP timeout)."""
+    today = parlay.et_date_str(0)
+    now = time.time()
+    if _today_cache["date"] == today and _today_cache["data"] and now - _today_cache["ts"] < 1800:
+        return {"status": "ready", **_today_cache["data"]}
+    if _build_state["running"]:
+        return {"status": "building"}
+    _build_state["running"] = True
+
+    def _work():
+        try:
+            build_today()
+        except Exception as e:
+            log.error("projections build failed: %s", e)
+        finally:
+            _build_state["running"] = False
+
+    _threading.Thread(target=_work, daemon=True).start()
+    return {"status": "building"}
 
 
 def build_today() -> dict:
