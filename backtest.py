@@ -13,6 +13,7 @@ import requests
 
 import parlay
 import model
+import parks
 
 log = logging.getLogger("backtest")
 
@@ -33,7 +34,7 @@ def _final_games(date_str: str) -> list[dict]:
 
 
 def _game_predictions(game_pk: int, date_str: str, p_league: float,
-                      hand_cache: dict) -> list[dict]:
+                      hand_cache: dict, venue: str | None = None) -> list[dict]:
     """For one final game: each lineup batter's point-in-time prediction
     plus the actual outcome from the boxscore."""
     box = requests.get(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=20).json()
@@ -78,7 +79,8 @@ def _game_predictions(game_pk: int, date_str: str, p_league: float,
             batter_name = ((player.get("person") or {}).get("fullName"))
             pred = model.hit_probability(batter_rows, starter_rows, hand,
                                           batter_side, p_league, before=date_str,
-                                          batter_name=batter_name)
+                                          batter_name=batter_name,
+                                          park_factor=parks.factor_for(venue) if venue else None)
             if pred is None:
                 continue
             # Baseline 2: batter's raw hit-game rate before D (no starter adj)
@@ -112,7 +114,8 @@ def run_backtest(days: int, progress=None) -> dict:
         log.info("backtest day %d/%d (%s): %d final games", i, days, date_str, len(games))
         for gi, g in enumerate(games, 1):
             try:
-                preds.extend(_game_predictions(g["gamePk"], date_str, p_league, hand_cache))
+                preds.extend(_game_predictions(g["gamePk"], date_str, p_league, hand_cache,
+                                                venue=(g.get("venue") or {}).get("name")))
             except Exception as e:
                 log.warning("game %s failed: %s", g.get("gamePk"), e)
             if progress:
@@ -203,6 +206,7 @@ def run_market_backtest(days: int, progress=None) -> dict:
     hand_cache: dict = {}
     candidates = []
     games_priced = 0
+    suspect = 0
     for i in range(1, days + 1):
         date_str = (end - timedelta(days=i)).strftime("%Y-%m-%d")
         try:
@@ -217,7 +221,8 @@ def run_market_backtest(days: int, progress=None) -> dict:
                  i, days, date_str, len(games), len(hist_events))
         for g in games:
             try:
-                preds = _game_predictions(g["gamePk"], date_str, p_league, hand_cache)
+                preds = _game_predictions(g["gamePk"], date_str, p_league, hand_cache,
+                                          venue=(g.get("venue") or {}).get("name"))
             except Exception as e:
                 log.warning("market game %s failed: %s", g.get("gamePk"), e)
                 continue
@@ -240,6 +245,9 @@ def run_market_backtest(days: int, progress=None) -> dict:
                     if not bp:
                         continue
                     ev = (prob * odds_api.american_to_decimal(bp[1]) - 1) * 100
+                    if ev > 20:
+                        suspect += 1
+                        continue  # >20% "edges" vs closing lines = model error, not value
                     if ev >= min(THRESHOLDS):
                         candidates.append({"date": date_str, "name": p["name"], "side": side,
                                            "price": bp[1], "ev": round(ev, 1), "hit": p["hit"]})
@@ -247,6 +255,7 @@ def run_market_backtest(days: int, progress=None) -> dict:
                 progress(i, days, games_priced, len(candidates))
 
     report = {"days": days, "games_priced": games_priced,
+              "suspect_excluded": suspect,
               "credits_estimate": games_priced * 10 + days,
               "candidates": len(candidates),
               "by_threshold": _simulate_bets(candidates)}
