@@ -173,16 +173,33 @@ def _apply_config():
 
 
 def _fit_calibration() -> list:
-    """Correction curve from the LARGEST stored calibration run: bucket
-    (predicted, actual) pairs, n>=100 buckets only. The model corrected by
-    its own receipts -- nothing invented."""
+    """Correction curve from the largest stored RAW run (calib_weight 0)
+    whose other knobs MATCH the current config -- correcting a model with
+    a curve fitted to a different model is a double-correction bug this
+    replaces. Falls back to any raw run; never fits from corrected output."""
     init_db()
+    current = {k: v["value"] for k, v in get_config().items()
+               if k not in ("calib_weight",)}
     best = None
+    fallback = None
     with _conn() as c:
-        for _, _, _, report in c.execute("SELECT ts, days, config, report FROM backtest_runs"):
+        for _, _, config, report in c.execute("SELECT ts, days, config, report FROM backtest_runs"):
             rep = json.loads(report)
-            if rep.get("n") and (best is None or rep["n"] > best.get("n", 0)):
+            knobs = json.loads(config) if config else {}
+            if not rep.get("n") or knobs.get("calib_weight", 0):
+                continue  # skip corrected runs -- only fit from raw output
+            matches = all(abs(knobs.get(k, CONFIG_DEFAULTS[k]["value"]) - v) < 1e-9
+                          for k, v in current.items())
+            if matches and (best is None or rep["n"] > best.get("n", 0)):
                 best = rep
+            if fallback is None or rep["n"] > fallback.get("n", 0):
+                fallback = rep
+    if best is None:
+        best = fallback
+        if best:
+            log.warning("calibration: no raw run matches current knobs -- "
+                        "using largest raw run as fallback (run a calib_weight=0 "
+                        "backtest under these knobs to fit properly)")
     if not best:
         return []
     pts = [(c["predicted"] / 100.0, c["actual"] / 100.0)
