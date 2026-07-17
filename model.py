@@ -47,6 +47,11 @@ SHRINK_PA = 150
 PERSONAL_PA = 1
 LEAGUE_PA_PER_GAME = 3.9  # only used to normalize the scaling factor
 
+# xBA blend: 0 = actual hit rates (v4 champion), 1 = fully expected
+# (luck-stripped) rates from Savant's per-ball estimates, using the same
+# accounting we validated against Savant pages.
+XBA_WEIGHT = 0.0
+
 _league_cache = {"ts": 0, "p": None}
 
 
@@ -83,11 +88,22 @@ def rows_before(rows: list[dict], before: str | None) -> list[dict]:
     return [r for r in rows if (r.get("game_date") or "9999") < before]
 
 
+def _sf(v):
+    try:
+        f = float(v)
+        return f if f == f else None
+    except (TypeError, ValueError):
+        return None
+
+
 def per_pa_hit_rate(rows: list[dict], split_col: str, split_val: str) -> dict | None:
-    """Hits per plate appearance within a split (batter vs hand, or
-    pitcher-allowed vs side), from raw rows. Same PA accounting as the
-    validated engine (via parlay's event sets)."""
+    """Hits per PA within a split -- both ACTUAL and EXPECTED (xBA-based).
+    Expected uses the Savant-validated accounting: per-ball estimates for
+    tracked batted balls, 0 for strikeouts/walks, untracked batted balls
+    excluded from both numerator and denominator."""
     pa = hits = 0
+    x_num = 0.0
+    untracked = 0
     for r in rows:
         if r.get(split_col) != split_val:
             continue
@@ -97,9 +113,17 @@ def per_pa_hit_rate(rows: list[dict], split_col: str, split_val: str) -> dict | 
         pa += 1
         if ev in parlay.HIT_EVENTS:
             hits += 1
+        est = _sf(r.get("estimated_ba_using_speedangle"))
+        if est is not None:
+            x_num += est
+        elif r.get("type") == "X" or ev in parlay.HIT_EVENTS:
+            # a batted ball Savant didn't track -- unusable for expected
+            untracked += 1
     if pa == 0:
         return None
-    return {"pa": pa, "hits": hits, "rate": hits / pa}
+    x_pa = pa - untracked
+    x_rate = (x_num / x_pa) if x_pa > 0 else None
+    return {"pa": pa, "hits": hits, "rate": hits / pa, "x_rate": x_rate}
 
 
 def pa_per_game(rows: list[dict]) -> tuple[float, int]:
@@ -151,8 +175,17 @@ def hit_probability(batter_rows: list[dict], starter_rows: list[dict],
     if not b or b["pa"] < min_batter_pa or not s or s["pa"] < min_starter_pa:
         return None
 
-    b_rate = shrunk_rate(b["hits"], b["pa"], p_league)
-    s_rate = shrunk_rate(s["hits"], s["pa"], p_league)
+    def blended(stats):
+        actual = stats["hits"] / stats["pa"]
+        if XBA_WEIGHT > 0 and stats.get("x_rate") is not None:
+            raw = XBA_WEIGHT * stats["x_rate"] + (1 - XBA_WEIGHT) * actual
+        else:
+            raw = actual
+        # shrink the blended rate exactly as before
+        return (raw * stats["pa"] + SHRINK_PA * p_league) / (stats["pa"] + SHRINK_PA)
+
+    b_rate = blended(b)
+    s_rate = blended(s)
     p_vs_starter = log5_rate(b_rate, s_rate, p_league)
     # Vs the pen (unknown arms): the batter's own shrunk rate vs the hand
     p_vs_pen = b_rate
