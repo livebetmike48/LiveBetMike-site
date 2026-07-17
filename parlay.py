@@ -51,7 +51,8 @@ def get_today_slate() -> list[dict]:
         for g in date_entry.get("games", []):
             if g.get("status", {}).get("abstractGameState") == "Final":
                 continue  # game already over -- no bets to make
-            entry = {"game_pk": g["gamePk"], "teams": {}}
+            entry = {"game_pk": g["gamePk"], "teams": {},
+                     "venue": (g.get("venue") or {}).get("name")}
             for side in ("home", "away"):
                 team = g["teams"][side]
                 probable = team.get("probablePitcher") or {}
