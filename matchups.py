@@ -12,6 +12,8 @@ import requests
 
 import statcast_api
 import parlay
+import odds_api
+import odds_log
 
 log = logging.getLogger("matchups")
 
@@ -87,6 +89,18 @@ def last10_strip(rows: list[dict]) -> list[bool]:
 
 def _build_matchups() -> dict:
     slate = parlay.get_today_slate()
+
+    # Odds: display today's moneylines AND archive them for future
+    # backtesting (our own history, accumulating daily)
+    odds_events = []
+    try:
+        odds_events = odds_api.get_mlb_odds("h2h")
+        if odds_events:
+            odds_log.init_db()
+            odds_log.log_snapshot(parlay.et_date_str(0), odds_events, "h2h")
+    except Exception as e:
+        log.warning("Odds fetch/log skipped: %s", e)
+
     games_out = []
     for g in slate:
         game_entry = {
@@ -95,6 +109,18 @@ def _build_matchups() -> dict:
             "home": g["teams"]["home"]["abbrev"],
             "hitters": [],
         }
+        ev = odds_api.find_event(
+            odds_events, g["teams"]["home"]["name"], g["teams"]["away"]["name"]
+        ) if odds_events else None
+        if ev:
+            ml = {}
+            for side in ("home", "away"):
+                prices = odds_api.all_prices(ev, "h2h", g["teams"][side]["name"])
+                bp = odds_api.best_price(prices)
+                if bp:
+                    ml[side] = {"price": bp[1], "book": bp[0]}
+            if ml:
+                game_entry["moneyline"] = ml
         for side, opp_side in (("home", "away"), ("away", "home")):
             team = g["teams"][side]
             opp = g["teams"][opp_side]
@@ -193,4 +219,6 @@ def get_detail(batter_id: int, starter_id: int, hand: str) -> dict:
         "per_pitch": per_pitch,
         "starter_mix": mix,
         "batter_side": batter_side,
+        "batter_line": statcast_api.vs_handedness_stats(batter_rows, "p_throws", hand),
+        "starter_line": statcast_api.vs_handedness_stats(starter_rows, "stand", batter_side),
     }
