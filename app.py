@@ -98,6 +98,7 @@ def api_projections():
     try:
         projections.grade_pending()
         data = projections.build_today()
+        data = projections.attach_odds(dict(data))
         data["result_log"] = projections.result_log()
         return data
     except Exception as e:
