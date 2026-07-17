@@ -15,6 +15,7 @@ import parlay
 import statcast_api
 import model
 import lab
+import odds_api
 
 log = logging.getLogger("projections")
 
@@ -88,6 +89,8 @@ def build_today() -> dict:
                     "date": today, "game_pk": g["game_pk"],
                     "player_id": batter["player_id"], "name": batter["name"],
                     "team": team["abbrev"], "starter": opp["starter_name"],
+                    "home_name": g["teams"]["home"]["name"],
+                    "away_name": g["teams"]["away"]["name"],
                     "p": pred["p_hit"],
                 })
     rows_out.sort(key=lambda r: -r["p"])
@@ -162,3 +165,44 @@ def result_log() -> dict:
     ]
     return {"n": n, "days": days, "brier_model": brier, "brier_constant": brier_const,
             "overall_hit_rate": round(base * 100, 1), "calibration": calibration}
+
+
+def fair_american(p: float) -> int:
+    """The model's fair price for a probability."""
+    p = min(max(p, 0.01), 0.99)
+    if p >= 0.5:
+        return round(-100 * p / (1 - p))
+    return round(100 * (1 - p) / p)
+
+
+def attach_odds(data: dict) -> dict:
+    """Join live 'to record a hit' prices onto today's projections and
+    compute EV at the best available price. EV needs no de-vig: it is
+    the actual profit expectation at the bettable price -- the vig is
+    already the hurdle inside it. Degrades to blanks without an odds key."""
+    events = odds_api.get_events()
+    if not events:
+        data["odds_note"] = "no odds key on this service -- add ODDS_API_KEY to light up prices"
+        return data
+    ev_cache: dict = {}
+    for r in data.get("projections", []):
+        gpk = r["game_pk"]
+        if gpk not in ev_cache:
+            ev = odds_api.find_event(events, r.get("home_name", ""), r.get("away_name", ""))
+            props = odds_api.get_event_props(ev.get("id"), "batter_hits") if ev else None
+            ev_cache[gpk] = props
+        props = ev_cache[gpk]
+        priced = odds_api.player_prop_prices(props, "batter_hits", r["name"]) if props else None
+        if not priced:
+            continue
+        bp = odds_api.best_price(priced["prices"])
+        if not bp:
+            continue
+        dec = odds_api.american_to_decimal(bp[1])
+        implied = 1 / dec
+        r["price"] = bp[1]
+        r["book"] = bp[0]
+        r["book_implied"] = round(implied * 100, 1)
+        r["fair"] = fair_american(r["p"])
+        r["ev_pct"] = round((r["p"] * dec - 1) * 100, 1)
+    return data
