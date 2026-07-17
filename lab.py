@@ -36,12 +36,16 @@ CONFIG_DEFAULTS = {
                     "note": "Scale PAs by the batter's own PA/game — captures lineup slot + pinch-hit risk from real logs"},
     "xba_weight": {"value": 0, "label": "xBA blend weight (0-1)",
                    "note": "0 = actual hit rates (v4 champion), 1 = fully luck-stripped expected rates, 0.5 = half and half"},
+    "arsenal_weight": {"value": 0, "label": "Arsenal matchup weight (0-1)",
+                       "note": "Tilt batter rates by the starter's real pitch usage vs his per-pitch results (heavily shrunk). 0 = off (champion)"},
+    "prior_weight": {"value": 0, "label": "Player prior weight (0-1)",
+                     "note": "Shrink toward each player's own projected talent (uploaded priors, e.g. preseason Steamer) instead of league avg. 0 = league (champion)"},
 }
 
 PROP_ROADMAP = [
     {"prop": "Hits (1+)", "status": "backtesting", "note": "log5 model live in lab"},
     {"prop": "Home runs", "status": "planned", "note": "needs HR-rate model + park factors to be honest"},
-    {"prop": "Pitcher strikeouts", "status": "planned", "note": "K-rate log5 vs lineup, needs PA-distribution work"},
+    {"prop": "Pitcher strikeouts", "status": "planned", "note": "per-hitter K probs → sum-of-Bernoullis distribution; batters-faced as leash profiles (~23 normal / ~17 short); price the over/under against the full shape"},
     {"prop": "Total bases", "status": "idea", "note": "only after hits model proves calibrated"},
 ]
 
@@ -65,6 +69,61 @@ def init_db():
             ts INTEGER, days INTEGER, config TEXT, report TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS model_config (
             key TEXT PRIMARY KEY, value REAL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS player_priors (
+            name_folded TEXT PRIMARY KEY, display_name TEXT, rate REAL, pa INTEGER)""")
+
+
+def load_priors_csv(csv_text: str) -> dict:
+    """Parse a projections CSV (FanGraphs export format: Name, PA, H
+    columns among others) into per-PA hit-rate priors. Duplicate names are
+    DROPPED (can't disambiguate two Will Smiths honestly)."""
+    import csv as csv_mod
+    import io
+    reader = csv_mod.DictReader(io.StringIO(csv_text.strip()))
+    if not reader.fieldnames:
+        return {"error": "no header row found"}
+    cols = {c.strip().strip('"').lower(): c for c in reader.fieldnames}
+    name_c, pa_c, h_c = cols.get("name"), cols.get("pa"), cols.get("h")
+    if not (name_c and pa_c and h_c):
+        return {"error": f"need Name, PA, H columns — found {list(cols)[:12]}"}
+    parsed, dupes = {}, set()
+    for row in reader:
+        try:
+            name = (row[name_c] or "").strip()
+            pa = float(row[pa_c]); h = float(row[h_c])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not name or pa < 50:
+            continue
+        key = model.fold_name(name)
+        if key in parsed:
+            dupes.add(key)
+            continue
+        parsed[key] = {"display_name": name, "rate": h / pa, "pa": int(pa)}
+    for key in dupes:
+        parsed.pop(key, None)
+    if not parsed:
+        return {"error": "no usable rows parsed"}
+    init_db()
+    with _conn() as c:
+        c.execute("DELETE FROM player_priors")
+        for key, p in parsed.items():
+            c.execute("INSERT INTO player_priors VALUES (?, ?, ?, ?)",
+                      (key, p["display_name"], p["rate"], p["pa"]))
+    return {"loaded": len(parsed), "dropped_duplicates": len(dupes)}
+
+
+def get_priors() -> dict:
+    init_db()
+    with _conn() as c:
+        return {name: rate for name, _, rate, _ in
+                c.execute("SELECT name_folded, display_name, rate, pa FROM player_priors")}
+
+
+def priors_count() -> int:
+    init_db()
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM player_priors").fetchone()[0]
 
 
 def get_config() -> dict:
@@ -94,6 +153,9 @@ def _apply_config():
     model.SHRINK_PA = cfg["shrink_pa"]["value"]
     model.PERSONAL_PA = int(cfg["personal_pa"]["value"])
     model.XBA_WEIGHT = max(0.0, min(1.0, cfg["xba_weight"]["value"]))
+    model.ARSENAL_WEIGHT = max(0.0, min(1.0, cfg["arsenal_weight"]["value"]))
+    model.PRIOR_WEIGHT = max(0.0, min(1.0, cfg["prior_weight"]["value"]))
+    model.PRIORS = get_priors() if model.PRIOR_WEIGHT > 0 else {}
     return cfg
 
 
@@ -140,6 +202,7 @@ def lab_state() -> dict:
         "roadmap": PROP_ROADMAP,
         "history": runs,
         "persistent": PERSISTENT,
+        "priors_loaded": priors_count(),
     }
 
 
