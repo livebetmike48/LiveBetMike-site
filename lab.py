@@ -36,6 +36,10 @@ CONFIG_DEFAULTS = {
                     "note": "Scale PAs by the batter's own PA/game — captures lineup slot + pinch-hit risk from real logs"},
     "xba_weight": {"value": 0, "label": "xBA blend weight (0-1)",
                    "note": "0 = actual hit rates (v4 champion), 1 = fully luck-stripped expected rates, 0.5 = half and half"},
+    "calib_weight": {"value": 1, "label": "Calibration layer (0-1)",
+                     "note": "Correct the model's own documented bias, fit from its largest stored backtest. The market test's #1 fix"},
+    "park_weight": {"value": 1, "label": "Park factor weight (0-1)",
+                    "note": "Savant official hits factors per venue — the Coors fix. Neutral when data unavailable"},
     "arsenal_weight": {"value": 0, "label": "Arsenal matchup weight (0-1)",
                        "note": "Tilt batter rates by the starter's real pitch usage vs his per-pitch results (heavily shrunk). 0 = off (champion)"},
     "prior_weight": {"value": 0, "label": "Player prior weight (0-1)",
@@ -159,10 +163,34 @@ def _apply_config():
     model.SHRINK_PA = cfg["shrink_pa"]["value"]
     model.PERSONAL_PA = int(cfg["personal_pa"]["value"])
     model.XBA_WEIGHT = max(0.0, min(1.0, cfg["xba_weight"]["value"]))
+    model.CALIB_WEIGHT = max(0.0, min(1.0, cfg["calib_weight"]["value"]))
+    model.PARK_WEIGHT = max(0.0, min(1.0, cfg["park_weight"]["value"]))
+    model.CALIB_POINTS = _fit_calibration() if model.CALIB_WEIGHT > 0 else []
     model.ARSENAL_WEIGHT = max(0.0, min(1.0, cfg["arsenal_weight"]["value"]))
     model.PRIOR_WEIGHT = max(0.0, min(1.0, cfg["prior_weight"]["value"]))
     model.PRIORS = get_priors() if model.PRIOR_WEIGHT > 0 else {}
     return cfg
+
+
+def _fit_calibration() -> list:
+    """Correction curve from the LARGEST stored calibration run: bucket
+    (predicted, actual) pairs, n>=100 buckets only. The model corrected by
+    its own receipts -- nothing invented."""
+    init_db()
+    best = None
+    with _conn() as c:
+        for _, _, _, report in c.execute("SELECT ts, days, config, report FROM backtest_runs"):
+            rep = json.loads(report)
+            if rep.get("n") and (best is None or rep["n"] > best.get("n", 0)):
+                best = rep
+    if not best:
+        return []
+    pts = [(c["predicted"] / 100.0, c["actual"] / 100.0)
+           for c in best.get("calibration", []) if c.get("n", 0) >= 100]
+    pts.sort()
+    if pts:
+        log.info("calibration fitted from %d-prediction run: %s", best["n"], pts)
+    return pts
 
 
 def run_backtest_async(days: int) -> bool:
