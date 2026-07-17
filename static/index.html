@@ -151,14 +151,28 @@ function renderModelBoard() {
   row.className = "winrow";
   row.innerHTML = `
     <select id="prop-select"><option value="hits">Hits O/U 0.5</option></select>
+    <select id="proj-sort" onchange="resortProjections()">
+      <option value="p">Sort: Model %</option>
+      <option value="ev_over">Sort: Over EV</option>
+      <option value="ev_under">Sort: Under EV</option>
+      <option value="ev_best">Sort: Best EV either side</option>
+    </select>
     <span class="meta">more props join this dropdown as they pass calibration in the Lab — walks, strikeouts, HR, total bases queued</span>`;
   main.appendChild(row);
   loadProjections(main);
 }
 
 async function load() {
-  const r = await fetch("/api/matchups");
-  const j = await r.json();
+  let j;
+  try {
+    const r = await fetch("/api/matchups");
+    j = await r.json();
+  } catch (e) {
+    document.getElementById("state") && (document.getElementById("state").innerHTML =
+      "Server busy (daily builds running) — retrying…<div class='bar'><i></i></div>");
+    setTimeout(load, 8000);
+    return;
+  }
   if (j.status === "warming") {
     document.getElementById("state").innerHTML =
       "Building today's board from season data — first load of the day takes a couple of minutes.<div class='bar'><i></i></div>";
@@ -276,19 +290,30 @@ async function toggleDetail(tr, h) {
   const j = await r.json();
   if (j.error) { td.textContent = "Couldn't load detail: " + j.error; return; }
 
-  let html = `<h4>${h.name} — vs each pitch (vs ${h.hand}HP)</h4>`;
-  html += "<table><thead><tr><th style='text-align:left'>Pitch</th><th>Seen</th><th>PA</th><th>AVG</th><th>xBA</th><th>xwOBA</th><th>Whiff%</th><th>K%</th></tr></thead><tbody>";
-  for (const [pt, s] of Object.entries(j.per_pitch)) {
-    html += `<tr><td style="text-align:left">${pt}</td><td>${s.pitches_seen}</td><td>${s.pa_ending_on_this_pitch}</td>
-      <td>${fmt(s.avg)}</td><td>${fmt(s.xba)}</td><td>${fmt(s.xwoba)}</td>
-      <td>${fmt(s.whiff_pct, true)}</td><td>${fmt(s.k_pct, true)}</td></tr>`;
-  }
-  html += "</tbody></table>";
-  html += `<h4>${h.starter} — mix vs ${j.batter_side}HB</h4>`;
+  const line = (s) => s ? `<td>${s.pa}</td><td>${fmt(s.xba)}</td><td>${fmt(s.xslg)}</td><td>${fmt(s.xwoba)}</td>
+      <td>${fmt(s.k_pct, true)}</td><td>${fmt(s.bb_pct, true)}</td><td>${fmt(s.whiff_pct, true)}</td>` : "<td colspan='7'>–</td>";
+  let html = `<h4>The matchup</h4><table><thead><tr><th style='text-align:left'></th><th>PA</th><th>xBA</th><th>xSLG</th><th>xwOBA</th><th>K%</th><th>BB%</th><th>Whiff%</th></tr></thead><tbody>
+    <tr><td style="text-align:left">${h.name} vs ${h.hand}HP</td>${line(j.batter_line)}</tr>
+    <tr><td style="text-align:left">${h.starter} vs ${j.batter_side}HB</td>${line(j.starter_line)}</tr>
+  </tbody></table>`;
+  html += `<h4>${h.starter} — pitch mix vs ${j.batter_side}HB</h4>`;
   html += "<table><thead><tr><th style='text-align:left'>Pitch</th><th>Usage</th><th>Thrown</th><th>Velo</th><th>Whiff%</th></tr></thead><tbody>";
   for (const [pt, m] of Object.entries(j.starter_mix)) {
     html += `<tr><td style="text-align:left">${pt}</td><td>${m.usage_pct}%</td><td>${m.count}</td>
       <td>${m.avg_velo ?? "–"}</td><td>${m.whiff_pct != null ? m.whiff_pct + "%" : "–"}</td></tr>`;
+  }
+  html += "</tbody></table>";
+  html += `<h4>${h.name} — vs each pitch (vs ${h.hand}HP)</h4>`;
+  html += "<table><thead><tr><th style='text-align:left'>Pitch</th><th>Seen</th><th>PA</th><th>xBA</th><th>xSLG</th><th>xwOBA</th><th>Whiff%</th><th>K%</th></tr></thead><tbody>";
+  if (j.batter_line) {
+    html += `<tr style="opacity:.75"><td style="text-align:left"><i>Overall</i></td><td>–</td><td>${j.batter_line.pa}</td>
+      <td>${fmt(j.batter_line.xba)}</td><td>${fmt(j.batter_line.xslg)}</td><td>${fmt(j.batter_line.xwoba)}</td>
+      <td>${fmt(j.batter_line.whiff_pct, true)}</td><td>${fmt(j.batter_line.k_pct, true)}</td></tr>`;
+  }
+  for (const [pt, s] of Object.entries(j.per_pitch)) {
+    html += `<tr><td style="text-align:left">${pt}</td><td>${s.pitches_seen}</td><td>${s.pa_ending_on_this_pitch}</td>
+      <td>${fmt(s.xba)}</td><td>${fmt(s.xslg)}</td><td>${fmt(s.xwoba)}</td>
+      <td>${fmt(s.whiff_pct, true)}</td><td>${fmt(s.k_pct, true)}</td></tr>`;
   }
   html += "</tbody></table>";
   td.innerHTML = html;
@@ -470,6 +495,50 @@ async function renderLab() {
   main.appendChild(rm);
 }
 
+let PROJ_DATA = null;
+
+function sortedProjections() {
+  const projs = [...((PROJ_DATA && PROJ_DATA.projections) || [])];
+  const mode = (document.getElementById("proj-sort") || {}).value || "p";
+  const val = (p) => {
+    if (mode === "p") return p.p;
+    if (mode === "ev_over") return p.ev_over ?? -999;
+    if (mode === "ev_under") return p.ev_under ?? -999;
+    return Math.max(p.ev_over ?? -999, p.ev_under ?? -999);
+  };
+  projs.sort((a, b) => val(b) - val(a));
+  return projs;
+}
+
+function resortProjections() {
+  const main = document.getElementById("main");
+  const table = main.querySelector(".board");
+  if (table && PROJ_DATA) table.replaceWith(buildProjTable(sortedProjections().slice(0, 40)));
+}
+
+function buildProjTable(projs) {
+  const box = document.createElement("div");
+  box.className = "board";
+  const sideCell = (p, side) => {
+    const price = p["price_" + side], ev = p["ev_" + side], book = p["book_" + side];
+    if (price == null) return "<td>–</td>";
+    const col = ev >= 2 ? "#4caf7d" : (ev <= -2 ? "#d7483a" : "#7a8694");
+    return `<td>${price > 0 ? "+" : ""}${price} <span class="vs" style="display:inline">${book}</span><br>
+      <span style="color:${col};font-weight:600">${ev > 0 ? "+" : ""}${ev}%</span></td>`;
+  };
+  let h = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Hitter</th><th style='text-align:left'>vs</th><th>Model</th><th>Fair</th><th>Over · EV</th><th>Under · EV</th></tr></thead><tbody>";
+  for (const p of projs) {
+    const fair = p.fair != null ? (p.fair > 0 ? "+" + p.fair : p.fair) : "–";
+    h += `<tr><td class="name" style="cursor:default">${p.name} <span class="vs">${p.team}</span></td>
+      <td style="text-align:left;color:#7a8694;font-family:Inter">${p.starter}</td>
+      <td style="color:var(--blue);font-weight:600">${(p.p * 100).toFixed(1)}%</td>
+      <td>${fair}</td>${sideCell(p, "over")}${sideCell(p, "under")}</tr>`;
+  }
+  h += "</tbody></table>";
+  box.innerHTML = h;
+  return box;
+}
+
 async function loadProjections(main) {
   const holder = document.createElement("div");
   main.appendChild(holder);
@@ -514,7 +583,8 @@ async function loadProjections(main) {
     setTimeout(() => { holder.remove(); loadProjections(main); }, 10000);
     return;
   }
-  const projs = (j.projections || []).slice(0, 40);
+  PROJ_DATA = j;
+  const projs = sortedProjections().slice(0, 40);
   if (!projs.length) {
     const none = document.createElement("div");
     none.className = "meta";
@@ -528,26 +598,7 @@ async function loadProjections(main) {
     on.textContent = "ℹ️ " + j.odds_note;
     holder.appendChild(on);
   }
-  const box = document.createElement("div");
-  box.className = "board";
-  const sideCell = (p, side) => {
-    const price = p["price_" + side], ev = p["ev_" + side], book = p["book_" + side];
-    if (price == null) return "<td>–</td>";
-    const col = ev >= 2 ? "#4caf7d" : (ev <= -2 ? "#d7483a" : "#7a8694");
-    return `<td>${price > 0 ? "+" : ""}${price} <span class="vs" style="display:inline">${book}</span><br>
-      <span style="color:${col};font-weight:600">${ev > 0 ? "+" : ""}${ev}%</span></td>`;
-  };
-  let h = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Hitter</th><th style='text-align:left'>vs</th><th>Model</th><th>Fair</th><th>Over · EV</th><th>Under · EV</th></tr></thead><tbody>";
-  for (const p of projs) {
-    const fair = p.fair != null ? (p.fair > 0 ? "+" + p.fair : p.fair) : "–";
-    h += `<tr><td class="name" style="cursor:default">${p.name} <span class="vs">${p.team}</span></td>
-      <td style="text-align:left;color:#7a8694;font-family:Inter">${p.starter}</td>
-      <td style="color:var(--blue);font-weight:600">${(p.p * 100).toFixed(1)}%</td>
-      <td>${fair}</td>${sideCell(p, "over")}${sideCell(p, "under")}</tr>`;
-  }
-  h += "</tbody></table>";
-  box.innerHTML = h;
-  holder.appendChild(box);
+  holder.appendChild(buildProjTable(projs));
   const evNote = document.createElement("div");
   evNote.className = "meta";
   evNote.style.cssText = "margin-top:6px";
