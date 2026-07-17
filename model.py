@@ -67,6 +67,36 @@ PRIOR_WEIGHT = 0.0
 ARSENAL_WEIGHT = 0.0
 ARSENAL_SHRINK = 100
 
+# Calibration layer: piecewise-linear correction fit from the model's OWN
+# largest backtest receipt (predicted->actual per bucket). Fixes the
+# documented cold-bias the market test punished. CALIB_POINTS is loaded by
+# the lab from stored runs; weight 0 = raw model.
+CALIB_POINTS: list = []   # [(predicted, actual), ...] both 0-1, sorted
+CALIB_WEIGHT = 1.0
+
+# Park factor: multiplicative hits-factor (1.0 neutral, Coors ~1.1).
+PARK_WEIGHT = 1.0
+
+
+def calibrate(p: float) -> float:
+    """Map a raw probability through the fitted correction curve."""
+    if not CALIB_POINTS or CALIB_WEIGHT <= 0:
+        return p
+    pts = CALIB_POINTS
+    if p <= pts[0][0]:
+        corrected = p + (pts[0][1] - pts[0][0])
+    elif p >= pts[-1][0]:
+        corrected = p + (pts[-1][1] - pts[-1][0])
+    else:
+        corrected = p
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            if x1 <= p <= x2:
+                t = (p - x1) / (x2 - x1) if x2 > x1 else 0
+                corrected = y1 + t * (y2 - y1)
+                break
+    corrected = min(max(corrected, 0.02), 0.98)
+    return CALIB_WEIGHT * corrected + (1 - CALIB_WEIGHT) * p
+
 import unicodedata as _ud
 
 def fold_name(text: str) -> str:
@@ -145,6 +175,34 @@ def per_pa_hit_rate(rows: list[dict], split_col: str, split_val: str) -> dict | 
     x_pa = pa - untracked
     x_rate = (x_num / x_pa) if x_pa > 0 else None
     return {"pa": pa, "hits": hits, "rate": hits / pa, "x_rate": x_rate}
+
+
+def pa_per_game_vs_hand(rows: list[dict], hand: str) -> tuple[float, int]:
+    """PA/game restricted to games the batter's FIRST plate appearance came
+    against this hand -- i.e., games started by that hand. This is the
+    platoon reality: a lefty-shy bat's PA/game vs LHP starters is a
+    different, smaller number than his overall."""
+    games: dict = {}
+    for r in rows:
+        gpk, date = r.get("game_pk"), r.get("game_date")
+        if gpk is None or not date:
+            continue
+        key = (date, gpk)
+        g = games.setdefault(key, {"pa": 0, "first_ab": None, "first_hand": None})
+        ev = r.get("events")
+        if ev and ev not in statcast_api.NON_PA_EVENTS:
+            g["pa"] += 1
+        try:
+            ab = int(float(r.get("at_bat_number") or 9999))
+        except (TypeError, ValueError):
+            ab = 9999
+        if g["first_ab"] is None or ab < g["first_ab"]:
+            g["first_ab"] = ab
+            g["first_hand"] = r.get("p_throws")
+    matched = [g["pa"] for g in games.values() if g["first_hand"] == hand]
+    if not matched:
+        return 0.0, 0
+    return sum(matched) / len(matched), len(matched)
 
 
 def pa_per_game(rows: list[dict]) -> tuple[float, int]:
@@ -228,7 +286,8 @@ def hit_probability(batter_rows: list[dict], starter_rows: list[dict],
                     starter_hand: str, batter_side: str, p_league: float,
                     before: str | None = None,
                     min_batter_pa: int = 40, min_starter_pa: int = 60,
-                    batter_name: str | None = None) -> dict | None:
+                    batter_name: str | None = None,
+                    park_factor: float | None = None) -> dict | None:
     """P(batter records 1+ hit today) with full input transparency.
     Returns None when samples are too thin to say anything honest."""
     b_rows = rows_before(batter_rows, before)
@@ -277,22 +336,43 @@ def hit_probability(batter_rows: list[dict], starter_rows: list[dict],
     pa_s, pa_p = PA_VS_STARTER, PA_VS_PEN
     personal = None
     if PERSONAL_PA:
-        pg, n_games = pa_per_game(b_rows)
-        if n_games >= 15 and pg > 0:
-            factor = max(0.7, min(1.25, pg / LEAGUE_PA_PER_GAME))
+        # HAND-CONDITIONAL playing time: PA/game in games started by
+        # today's hand (the platoon/pinch-hit reality). Falls back to
+        # overall when the conditional sample is thin.
+        pg_h, n_h = pa_per_game_vs_hand(b_rows, starter_hand)
+        pg_all, n_all = pa_per_game(b_rows)
+        if n_h >= 8 and pg_h > 0:
+            pg, n_games, basis = pg_h, n_h, f"vs {starter_hand}HP starters"
+        elif n_all >= 15 and pg_all > 0:
+            pg, n_games, basis = pg_all, n_all, "overall"
+        else:
+            pg, n_games, basis = 0, 0, None
+        if n_games:
+            factor = max(0.55, min(1.25, pg / LEAGUE_PA_PER_GAME))
             pa_s, pa_p = PA_VS_STARTER * factor, PA_VS_PEN * factor
             personal = {"pa_per_game": round(pg, 2), "games": n_games,
-                        "scale": round(factor, 3)}
+                        "basis": basis, "scale": round(factor, 3)}
+
+    # Park: scale per-PA hit rates by the venue's hits factor
+    park = None
+    if park_factor and PARK_WEIGHT > 0:
+        pf = max(0.85, min(1.15, park_factor)) ** PARK_WEIGHT
+        p_vs_starter = min(p_vs_starter * pf, 0.95)
+        p_vs_pen = min(p_vs_pen * pf, 0.95)
+        park = round(park_factor, 3)
 
     p_no_hit = ((1 - p_vs_starter) ** pa_s) * ((1 - p_vs_pen) ** pa_p)
+    p_raw = 1 - p_no_hit
     return {
-        "p_hit": round(1 - p_no_hit, 4),
+        "p_hit": round(calibrate(p_raw), 4),
+        "p_raw": round(p_raw, 4),
         "inputs": {
             "batter_rate_vs_hand": round(b["rate"], 4), "batter_rate_shrunk": round(b_rate, 4), "batter_pa": b["pa"],
             "starter_rate_allowed_vs_side": round(s["rate"], 4), "starter_rate_shrunk": round(s_rate, 4), "starter_pa": s["pa"],
             "shrink_pa": SHRINK_PA,
             "prior_rate": round(prior_rate, 4) if prior_rate is not None else None,
             "arsenal": (ars or {}).get("detail") if ARSENAL_WEIGHT > 0 else None,
+            "park_factor": park,
             "league_rate": round(p_league, 4),
             "p_pa_vs_starter": round(p_vs_starter, 4),
             "pa_vs_starter": round(pa_s, 2), "pa_vs_pen": round(pa_p, 2),
