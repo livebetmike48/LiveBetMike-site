@@ -19,6 +19,11 @@ log = logging.getLogger("odds_api")
 API_KEY = os.getenv("ODDS_API_KEY")
 BASE = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
 
+# Book universe: us = the majors (DK/FD/MGM/Caesars/BetRivers/Fanatics...),
+# us2 = the second tier (Hard Rock, Bally, ESPN Bet...). Wider ladder =
+# better market-best price. Cost scales per region.
+REGIONS = "us,us2"
+
 _cache: dict = {}
 CACHE_SECONDS = 300  # 5 min -- "best book in the moment": prices at
 # command time are at most a few minutes old; repeat runs inside the
@@ -37,7 +42,7 @@ def get_mlb_odds(markets: str = "h2h") -> list[dict]:
     try:
         resp = requests.get(
             BASE,
-            params={"apiKey": API_KEY, "regions": "us", "markets": markets, "oddsFormat": "american", "includeLinks": "true", "includeSids": "true"},
+            params={"apiKey": API_KEY, "regions": REGIONS, "markets": markets, "oddsFormat": "american", "includeLinks": "true", "includeSids": "true"},
             timeout=20,
         )
         if resp.status_code != 200:
@@ -250,7 +255,7 @@ def get_event_props(event_id: str, market_key: str) -> dict | None:
     try:
         resp = requests.get(
             f"{EVENTS_BASE}/{event_id}/odds",
-            params={"apiKey": API_KEY, "regions": "us", "markets": market_key, "oddsFormat": "american", "includeLinks": "true", "includeSids": "true"},
+            params={"apiKey": API_KEY, "regions": REGIONS, "markets": market_key, "oddsFormat": "american", "includeLinks": "true", "includeSids": "true"},
             timeout=20,
         )
         if resp.status_code != 200:
@@ -423,7 +428,7 @@ def get_historical_event_odds(event_id: str, date_iso: str,
     try:
         resp = requests.get(
             f"{HIST_BASE}/events/{event_id}/odds",
-            params={"apiKey": API_KEY, "regions": "us", "markets": market,
+            params={"apiKey": API_KEY, "regions": REGIONS, "markets": market,
                     "oddsFormat": "american", "date": date_iso},
             timeout=25,
         )
