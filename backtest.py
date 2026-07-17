@@ -265,7 +265,7 @@ def run_market_backtest(days: int, progress=None) -> dict:
 
     report = {"days": days, "games_priced": games_priced,
               "suspect_excluded": suspect,
-              "credits_estimate": games_priced * 10 + days,
+              "credits_estimate": games_priced * 20 + days,  # 10 x 2 regions
               "candidates": len(candidates),
               "by_threshold": _simulate_bets(candidates)}
     top = sorted(candidates, key=lambda c: -c["ev"])[:12]
