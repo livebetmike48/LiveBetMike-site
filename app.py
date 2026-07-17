@@ -62,8 +62,8 @@ def api_lab_run(payload: dict):
     if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
         return {"error": "bad token"}
     days = int(payload.get("days", 7))
-    if days not in (3, 5, 7, 10, 14, 21, 30, 45, 60):
-        return {"error": "days must be one of 3/5/7/10/14/21/30/45/60"}
+    if days not in (3, 5, 7, 10, 14, 21, 30, 45, 60, 90, 120):
+        return {"error": "days must be one of 3/5/7/10/14/21/30/45/60/90/120"}
     started = lab.run_backtest_async(days)
     return {"started": started}
 
