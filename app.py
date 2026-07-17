@@ -9,6 +9,7 @@ import os
 import matchups
 import bullpen
 import lab
+import projections
 
 LAB_TOKEN = os.getenv("LAB_TOKEN", "")
 
@@ -75,6 +76,30 @@ def api_lab_config(payload: dict):
     updates = {k: v for k, v in payload.items() if k != "token"}
     try:
         return {"config": lab.set_config(updates)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/lab/priors")
+def api_lab_priors(payload: dict):
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    csv_text = payload.get("csv", "")
+    if not csv_text or len(csv_text) > 3_000_000:
+        return {"error": "missing or oversized csv"}
+    try:
+        return lab.load_priors_csv(csv_text)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/projections")
+def api_projections():
+    try:
+        projections.grade_pending()
+        data = projections.build_today()
+        data["result_log"] = projections.result_log()
+        return data
     except Exception as e:
         return {"error": str(e)}
 
