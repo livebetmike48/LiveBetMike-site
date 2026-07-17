@@ -43,10 +43,13 @@ CONFIG_DEFAULTS = {
 }
 
 PROP_ROADMAP = [
-    {"prop": "Hits (1+)", "status": "backtesting", "note": "log5 model live in lab"},
-    {"prop": "Home runs", "status": "planned", "note": "needs HR-rate model + park factors to be honest"},
-    {"prop": "Pitcher strikeouts", "status": "planned", "note": "per-hitter K probs → sum-of-Bernoullis distribution; batters-faced as leash profiles (~23 normal / ~17 short); price the over/under against the full shape"},
-    {"prop": "Total bases", "status": "idea", "note": "only after hits model proves calibrated"},
+    {"prop": "Hits O/U 0.5 (both sides)", "status": "live-beta", "note": "log5 model on the board with EV vs live prices; result log grading daily"},
+    {"prop": "Batter walks 0.5", "status": "planned", "note": "log5 on BB rates — same machinery as hits, likely the easiest next binary"},
+    {"prop": "Home runs 0.5", "status": "planned", "note": "HR-rate model + park factors required to be honest"},
+    {"prop": "Pitcher strikeouts", "status": "planned", "note": "per-hitter K probs → sum-of-Bernoullis distribution; batters-faced leash profiles (~23 / ~17); price the line vs the shape — this engine then unlocks the whole count-prop tier"},
+    {"prop": "Total bases / H+R+RBI", "status": "idea", "note": "count props — need the distribution engine from the K model"},
+    {"prop": "Pitcher outs / ER / hits / walks allowed", "status": "idea", "note": "distribution + leash modeling; after the K template"},
+    {"prop": "Stolen bases 0.5", "status": "idea", "note": "attempt rates are player/manager-specific but loggable"},
 ]
 
 _run_state = {"status": "idle", "progress": "", "started": None}
