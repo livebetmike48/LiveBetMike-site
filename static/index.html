@@ -174,8 +174,9 @@ async function load() {
     return;
   }
   if (j.status === "warming") {
-    document.getElementById("state").innerHTML =
-      "Building today's board from season data — first load of the day takes a couple of minutes.<div class='bar'><i></i></div>";
+    const prog = j.progress ? ` (${j.progress})` : "";
+    document.getElementById("state") && (document.getElementById("state").innerHTML =
+      `Building today's board${prog} — full slates take a few minutes, then it's instant all day.<div class='bar'><i></i></div>`);
     setTimeout(load, 8000);
     return;
   }
