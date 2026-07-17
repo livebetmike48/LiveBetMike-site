@@ -450,6 +450,48 @@ async function renderLab() {
     <span class="meta">projections export with Name/PA/H (use PRE-SEASON projections for backtests — rest-of-season leaks future data). Set the prior weight knob above to use them.</span>`;
   main.appendChild(pri);
 
+  // Market test: model vs real closing lines
+  const mHdr = document.createElement("div");
+  mHdr.className = "gamehdr";
+  mHdr.textContent = "Market test — model vs closing lines (units won/lost)";
+  main.appendChild(mHdr);
+  const mCtl = document.createElement("div");
+  mCtl.className = "winrow";
+  mCtl.innerHTML = `
+    <select id="market-days"><option>7</option><option selected>14</option><option>30</option><option>60</option><option>120</option></select>
+    <button class="winbtn" onclick="marketRun()">Run market test</button>
+    <span class="meta" id="market-status">${j.market && j.market.status === "running" ? "⏳ " + j.market.progress : (j.market && j.market.progress || "uses historical odds (~10 credits/game): 14d ≈ 1.5K, season ≈ 14K")}</span>`;
+  main.appendChild(mCtl);
+  if (j.market && j.market.status === "running") setTimeout(renderLab, 8000);
+  for (const run of (j.market_history || [])) {
+    const rep = run.report;
+    const box = document.createElement("div");
+    box.className = "board";
+    box.style.marginBottom = "14px";
+    const when = new Date(run.ts * 1000).toLocaleString();
+    let h = `<div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">`;
+    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.games_priced} games priced (~${rep.credits_estimate} credits)</div>`;
+    h += `<table style="margin-top:8px"><thead><tr><th style='text-align:left'>EV ≥</th><th>Bets</th><th>W</th><th>Units</th><th>ROI</th><th>Overs u</th><th>Unders u</th></tr></thead><tbody>`;
+    for (const thr of ["2", "5", "10"]) {
+      const t = (rep.by_threshold || {})[thr];
+      if (!t) continue;
+      const col = t.units > 0 ? "#4caf7d" : (t.units < 0 ? "#d7483a" : "#7a8694");
+      h += `<tr><td style="text-align:left">+${thr}%</td><td>${t.bets}</td><td>${t.wins}</td>
+        <td style="color:${col};font-weight:600">${t.units > 0 ? "+" : ""}${t.units}u</td>
+        <td>${t.roi_pct != null ? t.roi_pct + "%" : "–"}</td>
+        <td>${t.over_units > 0 ? "+" : ""}${t.over_units}u (${t.over_bets})</td>
+        <td>${t.under_units > 0 ? "+" : ""}${t.under_units}u (${t.under_bets})</td></tr>`;
+    }
+    h += "</tbody></table>";
+    if (rep.sample_bets && rep.sample_bets.length) {
+      h += `<div style="margin-top:8px;color:#7a8694">Biggest edges: ` +
+        rep.sample_bets.slice(0, 6).map(b => `${b.name} ${b.side} ${b.price > 0 ? "+" : ""}${b.price} (EV +${b.ev}%) ${b.side === "over" ? (b.hit ? "✅" : "❌") : (b.hit ? "❌" : "✅")}`).join(" · ") + `</div>`;
+    }
+    h += "</div>";
+    box.innerHTML = h;
+    main.appendChild(box);
+  }
+
   // Latest run + history
   const hist = j.history || [];
   const runHdr = document.createElement("div");
@@ -633,6 +675,16 @@ async function labUploadPriors() {
   document.getElementById("lab-status").textContent =
     j.error ? "✖ " + j.error : `✓ ${j.loaded} player priors loaded (${j.dropped_duplicates} duplicate names dropped)`;
   if (!j.error) setTimeout(renderLab, 1200);
+}
+
+async function marketRun() {
+  const days = parseInt(document.getElementById("market-days").value);
+  const r = await fetch("/api/lab/market", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({days: days, token: labToken()})});
+  const j = await r.json();
+  document.getElementById("market-status").textContent =
+    j.error ? "✖ " + j.error : (j.started ? "⏳ started…" : "already running");
+  if (j.started) setTimeout(renderLab, 5000);
 }
 
 async function labSaveConfig() {
