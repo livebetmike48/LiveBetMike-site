@@ -3,10 +3,14 @@ Builds the day's hitter-vs-starter matchup board from the validated engine.
 Heavy (one season fetch per hitter), so it's computed once per day in a
 background thread and cached; the API serves instantly after warmup.
 """
+import os
+import json
+import sqlite3
 import threading
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -18,7 +22,32 @@ import odds_log
 log = logging.getLogger("matchups")
 
 _cache = {"date": None, "status": "cold", "data": None}
+_progress = {"done": 0, "total": 0}
 _lock = threading.Lock()
+DB_PATH = os.getenv("DB_PATH", "odds_history.db")
+
+
+def _db_save_board(data: dict):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("CREATE TABLE IF NOT EXISTS daily_board (date TEXT PRIMARY KEY, payload TEXT)")
+        conn.execute("INSERT OR REPLACE INTO daily_board VALUES (?, ?)",
+                     (data["date"], json.dumps(data)))
+        conn.commit(); conn.close()
+    except Exception as e:
+        log.warning("board persist failed: %s", e)
+
+
+def _db_load_board(date: str) -> dict | None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("CREATE TABLE IF NOT EXISTS daily_board (date TEXT PRIMARY KEY, payload TEXT)")
+        row = conn.execute("SELECT payload FROM daily_board WHERE date=?", (date,)).fetchone()
+        conn.close()
+        return json.loads(row[0]) if row else None
+    except Exception as e:
+        log.warning("board load failed: %s", e)
+        return None
 _lineup_cache = {"ts": 0, "date": None, "data": {}}
 
 HITTERS_PER_TEAM = 6
@@ -132,18 +161,23 @@ def _build_matchups() -> dict:
                 continue
             if hand not in ("L", "R"):
                 continue
-            for batter in parlay.shortlist_hitters([team["abbrev"]], "xba", HITTERS_PER_TEAM):
+            batters = parlay.shortlist_hitters([team["abbrev"]], "xba", HITTERS_PER_TEAM)
+            _progress["total"] += len(batters)
+
+            def _eval(batter):
                 try:
                     rows = parlay.get_player_season_rows(batter["player_id"], False)
                 except Exception:
-                    continue
+                    return None
+                finally:
+                    _progress["done"] += 1
                 if not rows:
-                    continue
+                    return None
                 season = _window_stats(rows, hand)
                 if not season or season["pa"] < 40:
-                    continue
+                    return None
                 l30 = _window_stats(_rows_last_days(rows, 30), hand)
-                game_entry["hitters"].append({
+                return {
                     "player_id": batter["player_id"],
                     "name": batter["name"],
                     "team": team["abbrev"],
@@ -153,7 +187,12 @@ def _build_matchups() -> dict:
                     "windows": {"season": season, "l30": l30},
                     "streak": parlay.hitting_streak(rows),
                     "last10": last10_strip(rows),
-                })
+                }
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                for result in pool.map(_eval, batters):
+                    if result:
+                        game_entry["hitters"].append(result)
         game_entry["hitters"].sort(key=lambda h: -((h["windows"]["season"] or {}).get("xba") or 0))
         games_out.append(game_entry)
     return {"date": parlay.et_date_str(0), "games": games_out}
@@ -164,6 +203,11 @@ def get_matchups() -> dict:
     day rolls over. Never blocks the request."""
     today = parlay.et_date_str(0)
     with _lock:
+        if _cache["status"] == "cold" or _cache["date"] != today:
+            persisted = _db_load_board(today)
+            if persisted:
+                _cache.update({"date": today, "status": "ready", "data": persisted})
+                log.info("Matchup board restored from DB for %s", today)
         if _cache["date"] == today and _cache["status"] == "ready":
             data = _cache["data"]
             try:
@@ -180,9 +224,11 @@ def get_matchups() -> dict:
                 log.warning("lineup enrich skipped: %s", e)
             return {"status": "ready", **data}
         if _cache["status"] == "warming":
-            return {"status": "warming"}
+            return {"status": "warming",
+                    "progress": f"{_progress['done']}/{_progress['total']} hitters" if _progress["total"] else "starting"}
         _cache["status"] = "warming"
         _cache["date"] = today
+        _progress.update({"done": 0, "total": 0})
 
     def _warm():
         try:
@@ -190,7 +236,9 @@ def get_matchups() -> dict:
             with _lock:
                 _cache["data"] = data
                 _cache["status"] = "ready"
-            log.info("Matchup board ready: %d games", len(data["games"]))
+            _db_save_board(data)
+            log.info("Matchup board ready: %d games (%d hitters evaluated)",
+                     len(data["games"]), _progress["done"])
         except Exception as e:
             log.error("Matchup build failed: %s", e)
             with _lock:
