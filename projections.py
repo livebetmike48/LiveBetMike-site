@@ -16,6 +16,7 @@ import statcast_api
 import model
 import lab
 import odds_api
+import parks
 
 log = logging.getLogger("projections")
 
@@ -108,7 +109,8 @@ def build_today() -> dict:
                     continue
                 b_side = max(set(sides), key=sides.count)
                 pred = model.hit_probability(b_rows, starter_rows, hand, b_side,
-                                              p_league, batter_name=batter["name"])
+                                              p_league, batter_name=batter["name"],
+                                              park_factor=parks.factor_for(g.get("venue")))
                 if not pred:
                     continue
                 rows_out.append({
