@@ -53,6 +53,7 @@ PROP_ROADMAP = [
 ]
 
 _run_state = {"status": "idle", "progress": "", "started": None}
+_market_state = {"status": "idle", "progress": ""}
 _lock = threading.Lock()
 
 
@@ -72,6 +73,8 @@ def init_db():
             ts INTEGER, days INTEGER, config TEXT, report TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS model_config (
             key TEXT PRIMARY KEY, value REAL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS market_runs (
+            ts INTEGER, days INTEGER, report TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS player_priors (
             name_folded TEXT PRIMARY KEY, display_name TEXT, rate REAL, pa INTEGER)""")
 
@@ -206,6 +209,8 @@ def lab_state() -> dict:
         "history": runs,
         "persistent": PERSISTENT,
         "priors_loaded": priors_count(),
+        "market": dict(_market_state),
+        "market_history": market_history(),
     }
 
 
@@ -220,3 +225,39 @@ def export_csv() -> str:
             lines.append(f"{when},{run['days']},{c['bucket']},{c['n']},{c['predicted']},"
                          f"{c['actual']},{rep.get('brier_model')},{rep.get('brier_constant')},{rep.get('brier_naive')}")
     return "\n".join(lines)
+
+
+def run_market_async(days: int) -> bool:
+    with _lock:
+        if _market_state["status"] == "running":
+            return False
+        _market_state.update({"status": "running", "progress": "starting…"})
+
+    def _progress(day, total, games, cands):
+        _market_state["progress"] = f"day {day}/{total} — {games} games priced, {cands} edge candidates"
+
+    def _work():
+        try:
+            _apply_config()
+            report = backtest.run_market_backtest(days, progress=_progress)
+            init_db()
+            with _conn() as c:
+                c.execute("INSERT INTO market_runs VALUES (?, ?, ?)",
+                          (int(time.time()), days, json.dumps(report)))
+            _market_state.update({"status": "idle", "progress": "done"})
+        except Exception as e:
+            log.error("market backtest failed: %s", e)
+            _market_state.update({"status": "idle", "progress": f"failed: {e}"})
+
+    threading.Thread(target=_work, daemon=True).start()
+    return True
+
+
+def market_history() -> list[dict]:
+    init_db()
+    out = []
+    with _conn() as c:
+        for ts, days, report in c.execute(
+                "SELECT ts, days, report FROM market_runs ORDER BY ts DESC LIMIT 10"):
+            out.append({"ts": ts, "days": days, "report": json.loads(report)})
+    return out
