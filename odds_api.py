@@ -391,3 +391,49 @@ def parlay_slips(priced_legs: list[dict], by_book: dict) -> dict:
         if slip:
             out[book] = _clean_link(slip)
     return {k: v for k, v in out.items() if v}
+
+
+# ---------- historical odds (paid tier) ----------
+
+HIST_BASE = "https://api.the-odds-api.com/v4/historical/sports/baseball_mlb"
+
+
+def get_historical_events(date_iso: str) -> list[dict]:
+    """Event list as it stood at a past moment. ~1 credit."""
+    if not API_KEY:
+        return []
+    try:
+        resp = requests.get(f"{HIST_BASE}/events",
+                            params={"apiKey": API_KEY, "date": date_iso}, timeout=25)
+        if resp.status_code != 200:
+            log.warning("hist events %s: %s", resp.status_code, resp.text[:150])
+            return []
+        return resp.json().get("data", []) or []
+    except Exception as e:
+        log.warning("hist events failed: %s", e)
+        return []
+
+
+def get_historical_event_odds(event_id: str, date_iso: str,
+                              market: str = "batter_hits") -> dict | None:
+    """One event's prop odds snapshot at/just before date_iso (use the
+    commence time -> effectively the closing line). ~10 credits per call."""
+    if not API_KEY or not event_id:
+        return None
+    try:
+        resp = requests.get(
+            f"{HIST_BASE}/events/{event_id}/odds",
+            params={"apiKey": API_KEY, "regions": "us", "markets": market,
+                    "oddsFormat": "american", "date": date_iso},
+            timeout=25,
+        )
+        if resp.status_code != 200:
+            log.warning("hist odds %s (%s): %s", resp.status_code, event_id, resp.text[:150])
+            return None
+        remaining = resp.headers.get("x-requests-remaining")
+        if remaining is not None:
+            log.info("hist odds ok, credits remaining: %s", remaining)
+        return resp.json().get("data")
+    except Exception as e:
+        log.warning("hist odds failed: %s", e)
+        return None
