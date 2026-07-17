@@ -502,20 +502,20 @@ async function loadProjections(main) {
   }
   const box = document.createElement("div");
   box.className = "board";
-  let h = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Hitter</th><th style='text-align:left'>vs</th><th>Model</th><th>Fair</th><th>Best price</th><th>Book %</th><th>EV</th></tr></thead><tbody>";
+  const sideCell = (p, side) => {
+    const price = p["price_" + side], ev = p["ev_" + side], book = p["book_" + side];
+    if (price == null) return "<td>–</td>";
+    const col = ev >= 2 ? "#4caf7d" : (ev <= -2 ? "#d7483a" : "#7a8694");
+    return `<td>${price > 0 ? "+" : ""}${price} <span class="vs" style="display:inline">${book}</span><br>
+      <span style="color:${col};font-weight:600">${ev > 0 ? "+" : ""}${ev}%</span></td>`;
+  };
+  let h = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Hitter</th><th style='text-align:left'>vs</th><th>Model</th><th>Fair</th><th>Over · EV</th><th>Under · EV</th></tr></thead><tbody>";
   for (const p of projs) {
     const fair = p.fair != null ? (p.fair > 0 ? "+" + p.fair : p.fair) : "–";
-    const price = p.price != null ? `${p.price > 0 ? "+" : ""}${p.price} <span class="vs" style="display:inline">${p.book}</span>` : "–";
-    const bookPct = p.book_implied != null ? p.book_implied + "%" : "–";
-    let evCell = "–";
-    if (p.ev_pct != null) {
-      const col = p.ev_pct >= 2 ? "#4caf7d" : (p.ev_pct <= -2 ? "#d7483a" : "#7a8694");
-      evCell = `<span style="color:${col};font-weight:600">${p.ev_pct > 0 ? "+" : ""}${p.ev_pct}%</span>`;
-    }
     h += `<tr><td class="name" style="cursor:default">${p.name} <span class="vs">${p.team}</span></td>
       <td style="text-align:left;color:#7a8694;font-family:Inter">${p.starter}</td>
       <td style="color:var(--blue);font-weight:600">${(p.p * 100).toFixed(1)}%</td>
-      <td>${fair}</td><td>${price}</td><td>${bookPct}</td><td>${evCell}</td></tr>`;
+      <td>${fair}</td>${sideCell(p, "over")}${sideCell(p, "under")}</tr>`;
   }
   h += "</tbody></table>";
   box.innerHTML = h;
