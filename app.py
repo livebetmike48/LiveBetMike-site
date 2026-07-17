@@ -80,6 +80,16 @@ def api_lab_config(payload: dict):
         return {"error": str(e)}
 
 
+@app.post("/api/lab/market")
+def api_lab_market(payload: dict):
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    days = int(payload.get("days", 14))
+    if days not in (7, 14, 30, 60, 120):
+        return {"error": "days must be 7/14/30/60/120"}
+    return {"started": lab.run_market_async(days)}
+
+
 @app.post("/api/lab/priors")
 def api_lab_priors(payload: dict):
     if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
