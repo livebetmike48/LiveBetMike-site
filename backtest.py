@@ -13,7 +13,16 @@ import requests
 
 import parlay
 import model
-import parks
+try:
+    import parks
+except ImportError:  # missing optional module must never kill the site
+    class _NeutralParks:
+        @staticmethod
+        def factor_for(venue):
+            return None
+    parks = _NeutralParks()
+    import logging
+    logging.getLogger(__name__).warning("parks.py missing -- running park-neutral")
 
 log = logging.getLogger("backtest")
 
