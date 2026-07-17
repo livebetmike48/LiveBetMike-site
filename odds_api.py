@@ -268,7 +268,8 @@ def get_event_props(event_id: str, market_key: str) -> dict | None:
         return None
 
 
-def player_prop_prices(event_data: dict, market_key: str, player_name: str) -> dict | None:
+def player_prop_prices(event_data: dict, market_key: str, player_name: str,
+                       side: str = "over") -> dict | None:
     """{book: price} for a player's OVER, plus the line. For hits/HR that's
     'Over 0.5' = to record one; for Ks it's the posted strikeout line.
     Returns {'point': x, 'prices': {book: price}} or None if unpriced."""
@@ -282,7 +283,7 @@ def player_prop_prices(event_data: dict, market_key: str, player_name: str) -> d
             if market.get("key") != market_key:
                 continue
             for outcome in market.get("outcomes", []) or []:
-                if (outcome.get("name") or "").lower() != "over":
+                if (outcome.get("name") or "").lower() != side:
                     continue
                 desc = _fold(outcome.get("description"))
                 if not desc or (target not in desc and target_last not in desc):
