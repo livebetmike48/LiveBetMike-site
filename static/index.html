@@ -368,7 +368,7 @@ async function renderLab() {
   const ctl = document.createElement("div");
   ctl.className = "winrow";
   ctl.innerHTML = `
-    <select id="lab-days"><option>3</option><option>5</option><option selected>7</option><option>10</option><option>14</option><option>21</option><option>30</option><option>45</option><option>60</option></select>
+    <select id="lab-days"><option>3</option><option>5</option><option selected>7</option><option>10</option><option>14</option><option>21</option><option>30</option><option>45</option><option>60</option><option>90</option><option>120</option></select>
     <button class="winbtn" onclick="labRun()">Run backtest</button>
     <input id="lab-token" type="password" placeholder="lab token" style="background:var(--panel-2);color:var(--white);border:1.5px solid var(--line);border-radius:6px;padding:6px 10px;font-family:'IBM Plex Mono',monospace;font-size:12px;width:130px">
     <span class="meta" id="lab-status">${j.run.status === "running" ? "⏳ " + j.run.progress : (j.run.progress || "idle")}</span>
