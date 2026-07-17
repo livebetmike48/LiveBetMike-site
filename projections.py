@@ -16,7 +16,16 @@ import statcast_api
 import model
 import lab
 import odds_api
-import parks
+try:
+    import parks
+except ImportError:  # missing optional module must never kill the site
+    class _NeutralParks:
+        @staticmethod
+        def factor_for(venue):
+            return None
+    parks = _NeutralParks()
+    import logging
+    logging.getLogger(__name__).warning("parks.py missing -- running park-neutral")
 
 log = logging.getLogger("projections")
 
