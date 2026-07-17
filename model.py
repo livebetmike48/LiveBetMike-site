@@ -52,6 +52,27 @@ LEAGUE_PA_PER_GAME = 3.9  # only used to normalize the scaling factor
 # accounting we validated against Savant pages.
 XBA_WEIGHT = 0.0
 
+# Player-specific priors (e.g. preseason Steamer): shrink toward the
+# player's own projected talent instead of league average. PRIORS maps
+# folded player name -> projected per-PA hit rate. PRIOR_WEIGHT blends
+# the shrink target: 0 = pure league (v4 champion), 1 = pure player prior.
+PRIORS: dict = {}
+PRIOR_WEIGHT = 0.0
+
+# Arsenal layer (the KSplit-style matchup weighting, Mike's per-pitch idea):
+# reweight the batter's rate by the STARTER'S actual pitch usage vs his
+# side -- "his slider problem counts in proportion to the sliders he'll
+# see." Per-pitch rates are heavily shrunk (ARSENAL_SHRINK pseudo-PAs
+# toward the batter's own overall rate) because per-pitch samples are tiny.
+ARSENAL_WEIGHT = 0.0
+ARSENAL_SHRINK = 100
+
+import unicodedata as _ud
+
+def fold_name(text: str) -> str:
+    text = _ud.normalize("NFKD", text or "")
+    return "".join(ch for ch in text if not _ud.combining(ch)).lower().strip()
+
 _league_cache = {"ts": 0, "p": None}
 
 
@@ -150,6 +171,48 @@ def shrunk_rate(hits: int, pa: int, p_league: float) -> float:
     return (hits + SHRINK_PA * p_league) / (pa + SHRINK_PA)
 
 
+def arsenal_rate(batter_rows: list[dict], starter_rows: list[dict],
+                 batter_overall: float) -> dict | None:
+    """Usage-weighted expected hit rate: for each pitch the starter throws
+    to this side, the batter's (shrunk) per-PA hit rate against that pitch
+    type, weighted by the starter's real usage. Returns None if either
+    side lacks pitch data."""
+    usage: dict = {}
+    for r in starter_rows:
+        pt = r.get("pitch_type")
+        if pt:
+            usage[pt] = usage.get(pt, 0) + 1
+    total = sum(usage.values())
+    if total < 100:
+        return None
+
+    per_pitch: dict = {}
+    for r in batter_rows:
+        ev = r.get("events")
+        if not ev or ev in statcast_api.NON_PA_EVENTS:
+            continue
+        pt = r.get("pitch_type")
+        if not pt:
+            continue
+        d = per_pitch.setdefault(pt, {"pa": 0, "hits": 0})
+        d["pa"] += 1
+        if ev in parlay.HIT_EVENTS:
+            d["hits"] += 1
+    if not per_pitch:
+        return None
+
+    rate = 0.0
+    detail = {}
+    for pt, count in usage.items():
+        w = count / total
+        d = per_pitch.get(pt, {"pa": 0, "hits": 0})
+        shrunk = (d["hits"] + ARSENAL_SHRINK * batter_overall) / (d["pa"] + ARSENAL_SHRINK)
+        rate += w * shrunk
+        if w >= 0.05:
+            detail[pt] = {"usage": round(w, 3), "batter_pa": d["pa"], "rate": round(shrunk, 4)}
+    return {"rate": rate, "detail": detail}
+
+
 def _odds(p: float) -> float:
     p = min(max(p, 1e-6), 1 - 1e-6)
     return p / (1 - p)
@@ -164,7 +227,8 @@ def log5_rate(p_batter: float, p_pitcher_allowed: float, p_league: float) -> flo
 def hit_probability(batter_rows: list[dict], starter_rows: list[dict],
                     starter_hand: str, batter_side: str, p_league: float,
                     before: str | None = None,
-                    min_batter_pa: int = 40, min_starter_pa: int = 60) -> dict | None:
+                    min_batter_pa: int = 40, min_starter_pa: int = 60,
+                    batter_name: str | None = None) -> dict | None:
     """P(batter records 1+ hit today) with full input transparency.
     Returns None when samples are too thin to say anything honest."""
     b_rows = rows_before(batter_rows, before)
@@ -175,17 +239,37 @@ def hit_probability(batter_rows: list[dict], starter_rows: list[dict],
     if not b or b["pa"] < min_batter_pa or not s or s["pa"] < min_starter_pa:
         return None
 
-    def blended(stats):
+    # Shrink target: league rate, optionally blended toward the player's
+    # own projected talent (preseason prior) when one is on file
+    b_target = p_league
+    prior_rate = None
+    if PRIOR_WEIGHT > 0 and batter_name:
+        prior_rate = PRIORS.get(fold_name(batter_name))
+        if prior_rate is not None:
+            b_target = PRIOR_WEIGHT * prior_rate + (1 - PRIOR_WEIGHT) * p_league
+
+    def blended(stats, target):
         actual = stats["hits"] / stats["pa"]
         if XBA_WEIGHT > 0 and stats.get("x_rate") is not None:
             raw = XBA_WEIGHT * stats["x_rate"] + (1 - XBA_WEIGHT) * actual
         else:
             raw = actual
-        # shrink the blended rate exactly as before
-        return (raw * stats["pa"] + SHRINK_PA * p_league) / (stats["pa"] + SHRINK_PA)
+        return (raw * stats["pa"] + SHRINK_PA * target) / (stats["pa"] + SHRINK_PA)
 
-    b_rate = blended(b)
-    s_rate = blended(s)
+    b_rate = blended(b, b_target)
+    s_rate = blended(s, p_league)
+
+    # Arsenal fit: tilt the batter's rate toward what he does against the
+    # pitches this specific starter actually throws to his side
+    ars = None
+    if ARSENAL_WEIGHT > 0:
+        b_split = [r for r in b_rows if r.get("p_throws") == starter_hand]
+        s_split = [r for r in s_rows if r.get("stand") == batter_side]
+        ars = arsenal_rate(b_split, s_split, b["hits"] / b["pa"])
+        if ars:
+            # shrink the arsenal rate like everything else, then blend
+            a_shrunk = (ars["rate"] * b["pa"] + SHRINK_PA * b_target) / (b["pa"] + SHRINK_PA)
+            b_rate = ARSENAL_WEIGHT * a_shrunk + (1 - ARSENAL_WEIGHT) * b_rate
     p_vs_starter = log5_rate(b_rate, s_rate, p_league)
     # Vs the pen (unknown arms): the batter's own shrunk rate vs the hand
     p_vs_pen = b_rate
@@ -207,6 +291,8 @@ def hit_probability(batter_rows: list[dict], starter_rows: list[dict],
             "batter_rate_vs_hand": round(b["rate"], 4), "batter_rate_shrunk": round(b_rate, 4), "batter_pa": b["pa"],
             "starter_rate_allowed_vs_side": round(s["rate"], 4), "starter_rate_shrunk": round(s_rate, 4), "starter_pa": s["pa"],
             "shrink_pa": SHRINK_PA,
+            "prior_rate": round(prior_rate, 4) if prior_rate is not None else None,
+            "arsenal": (ars or {}).get("detail") if ARSENAL_WEIGHT > 0 else None,
             "league_rate": round(p_league, 4),
             "p_pa_vs_starter": round(p_vs_starter, 4),
             "pa_vs_starter": round(pa_s, 2), "pa_vs_pen": round(pa_p, 2),
