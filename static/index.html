@@ -114,6 +114,7 @@ footer b{color:var(--gray)}
   <button class="tab active" id="tab-board" onclick="showView('board')">Matchup Board</button>
   <button class="tab" id="tab-bullpen" onclick="showView('bullpen')">Bullpen Usage</button>
   <button class="tab" id="tab-model" onclick="showView('model')">Model Board</button>
+  <button class="tab" id="tab-pitchers" onclick="showView('pitchers')">Pitcher Projections</button>
   <button class="tab" id="tab-lab" onclick="showView('lab')">Model Lab</button>
 </div>
 <main id="main">
@@ -136,12 +137,102 @@ const sortState = {};
 
 function showView(v) {
   VIEW = v;
-  for (const t of ["board", "bullpen", "model", "lab"])
+  for (const t of ["board", "bullpen", "model", "pitchers", "lab"])
     document.getElementById("tab-" + t).classList.toggle("active", v === t);
   if (v === "board") render();
   else if (v === "bullpen") renderBullpen();
   else if (v === "model") renderModelBoard();
+  else if (v === "pitchers") renderPitchers();
   else renderLab();
+}
+
+async function renderPitchers() {
+  const main = document.getElementById("main");
+  main.innerHTML = "<div class='state'>Loading starters…</div>";
+  let j;
+  try {
+    const r = await fetch("/api/pitchers");
+    j = await r.json();
+  } catch (e) {
+    main.innerHTML = "<div class='state'>Server busy — retrying…</div>";
+    setTimeout(renderPitchers, 8000);
+    return;
+  }
+  if (j.status === "warming") {
+    main.innerHTML = `<div class='state'>Computing today's starters${j.progress ? " (" + j.progress + ")" : ""}…<div class='bar'><i></i></div></div>`;
+    setTimeout(renderPitchers, 6000);
+    return;
+  }
+  if (j.error || !j.pitchers) {
+    main.innerHTML = "<div class='state'>Error: " + (j.error || "no data") + "</div>";
+    return;
+  }
+  PITCHER_DATA = j.pitchers;
+  main.innerHTML = "";
+  const ctl = document.createElement("div");
+  ctl.className = "winrow";
+  ctl.innerHTML = `<span class="winlabel">WINDOW</span>
+    <button class="winbtn ${PITCHER_WIN === "season" ? "active" : ""}" onclick="PITCHER_WIN='season';renderPitchers()">Season</button>
+    <button class="winbtn ${PITCHER_WIN === "l30" ? "active" : ""}" onclick="PITCHER_WIN='l30';renderPitchers()">Last 30</button>
+    <span class="meta">Pitches and TBF prefilled from each arm's REAL workload — edit EITHER and they stay linked through his true pitches-per-batter, reprojecting live. Outs ≈ TBF − H − BB.</span>`;
+  main.appendChild(ctl);
+  const box = document.createElement("div");
+  box.className = "board";
+  const inputStyle = "width:58px;background:transparent;color:var(--blue);border:1px solid var(--line);border-radius:4px;text-align:right;font-family:'IBM Plex Mono',monospace";
+  let h = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Starter</th><th style='text-align:left'>vs</th><th>Norm</th><th>Pitches</th><th>TBF</th><th>K</th><th>H</th><th>BB</th><th>Outs</th></tr></thead><tbody>";
+  j.pitchers.forEach((p, i) => {
+    h += `<tr data-i="${i}"><td class="name" style="cursor:default">${p.name} <span class="vs">${p.hand}HP · ${p.team}</span></td>
+      <td style="text-align:left;color:#7a8694;font-family:Inter">${p.opp}</td>
+      <td><span class="vs" style="display:inline">${p.pitches_avg}p · ${p.tbf_avg} TBF (${p.starts} GS)</span></td>
+      <td><input type="number" step="1" min="10" max="140" value="${p.pitches_avg}" data-i="${i}" data-kind="pitches"
+        oninput="linkPitcherInputs(this)" style="${inputStyle}"></td>
+      <td><input type="number" step="0.5" min="3" max="35" value="${p.tbf_avg}" data-i="${i}" data-kind="tbf"
+        oninput="linkPitcherInputs(this)" style="${inputStyle}"></td>
+      <td class="pk" style="color:var(--blue);font-weight:600"></td><td class="ph"></td><td class="pbb"></td><td class="pouts"></td></tr>`;
+  });
+  h += "</tbody></table>";
+  box.innerHTML = h;
+  main.appendChild(box);
+  main.querySelectorAll("input[data-kind='tbf']").forEach(reprojectPitcher);
+  const note = document.createElement("div");
+  note.className = "meta";
+  note.style.cssText = "margin-top:6px";
+  note.textContent = "Rates are real per-batter-faced numbers from Savant rows (K, hits allowed, walks). Research, not advice.";
+  main.appendChild(note);
+}
+
+let PITCHER_DATA = null;
+let PITCHER_WIN = "season";
+
+function linkPitcherInputs(inp) {
+  // Pitches and TBF are linked through the pitcher's REAL pitches-per-
+  // batter rate: edit either, the other follows, then the row reprojects.
+  const i = parseInt(inp.dataset.i);
+  const p = PITCHER_DATA[i];
+  const row = inp.closest("tr");
+  const pitchesInp = row.querySelector("input[data-kind='pitches']");
+  const tbfInp = row.querySelector("input[data-kind='tbf']");
+  if (inp.dataset.kind === "pitches") {
+    const pitches = parseFloat(inp.value) || 0;
+    tbfInp.value = (pitches / p.ppb).toFixed(1);
+  } else {
+    const tbf = parseFloat(inp.value) || 0;
+    pitchesInp.value = Math.round(tbf * p.ppb);
+  }
+  reprojectPitcher(tbfInp);
+}
+
+function reprojectPitcher(inp) {
+  const i = parseInt(inp.dataset.i);
+  const p = PITCHER_DATA[i];
+  const r = PITCHER_WIN === "l30" ? (p.l30 || p.season) : p.season;
+  const tbf = parseFloat(inp.value) || 0;
+  const row = inp.closest("tr");
+  const k = r.k_rate * tbf, hh = r.h_rate * tbf, bb = r.bb_rate * tbf;
+  row.querySelector(".pk").textContent = k.toFixed(2);
+  row.querySelector(".ph").textContent = hh.toFixed(2);
+  row.querySelector(".pbb").textContent = bb.toFixed(2);
+  row.querySelector(".pouts").textContent = Math.max(0, tbf - hh - bb).toFixed(2);
 }
 
 function renderModelBoard() {
