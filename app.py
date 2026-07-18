@@ -10,6 +10,7 @@ import matchups
 import bullpen
 import lab
 import projections
+import pitchers as pitchers_mod
 
 LAB_TOKEN = os.getenv("LAB_TOKEN", "")
 
@@ -99,6 +100,14 @@ def api_lab_priors(payload: dict):
         return {"error": "missing or oversized csv"}
     try:
         return lab.load_priors_csv(csv_text)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/pitchers")
+def api_pitchers():
+    try:
+        return pitchers_mod.get_pitchers()
     except Exception as e:
         return {"error": str(e)}
 
