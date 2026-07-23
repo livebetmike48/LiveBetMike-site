@@ -91,6 +91,37 @@ def api_lab_market(payload: dict):
     return {"started": lab.run_market_async(days)}
 
 
+@app.post("/api/klab/run")
+def api_klab_run(payload: dict):
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    days = int(payload.get("days", 7))
+    if days not in (3, 5, 7, 10, 14, 21, 30, 45, 60, 90, 120):
+        return {"error": "days must be one of 3/5/7/10/14/21/30/45/60/90/120"}
+    return {"started": lab.run_k_backtest_async(days)}
+
+
+@app.post("/api/klab/market")
+def api_klab_market(payload: dict):
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    days = int(payload.get("days", 14))
+    if days not in (7, 14, 30, 60, 120):
+        return {"error": "days must be 7/14/30/60/120"}
+    return {"started": lab.run_k_market_async(days)}
+
+
+@app.post("/api/klab/config")
+def api_klab_config(payload: dict):
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    updates = {k: v for k, v in payload.items() if k != "token"}
+    try:
+        return {"config": lab.set_k_config(updates)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/api/lab/priors")
 def api_lab_priors(payload: dict):
     if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
