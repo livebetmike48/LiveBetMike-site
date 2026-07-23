@@ -14,6 +14,8 @@ from contextlib import contextmanager
 
 import model
 import backtest
+import kmodel
+import kbacktest
 
 log = logging.getLogger("lab")
 
@@ -46,11 +48,30 @@ CONFIG_DEFAULTS = {
                      "note": "Shrink toward each player's own projected talent (uploaded priors, e.g. preseason Steamer) instead of league avg. 0 = league (champion)"},
 }
 
+# K-model knobs -- SEPARATE registry, stored with a k_ prefix so the two
+# models can never clobber each other's config
+K_CONFIG_DEFAULTS = {
+    "k_shrink_pa": {"value": 120, "label": "K shrinkage (phantom league PAs)",
+                    "note": "Regression toward league K rate on both sides"},
+    "k_min_batter_pa": {"value": 40, "label": "Min batter PA vs hand",
+                        "note": "Below this the hitter is priced at league (flagged), not refused"},
+    "k_min_starter_tbf": {"value": 60, "label": "Min starter TBF vs side",
+                          "note": "Below this the model refuses the start"},
+    "k_min_starts": {"value": 3, "label": "Min starts for workload mixture",
+                     "note": "TBF distribution comes from his REAL start logs; too few = refuse"},
+    "k_arsenal_weight": {"value": 0, "label": "K arsenal weight (0-1)",
+                         "note": "Per-pitch K rates weighted by real usage. 0 until a backtest earns it"},
+    "k_park_weight": {"value": 1, "label": "Park K factor weight (0-1)",
+                      "note": "Savant official strikeout factors. Neutral when data unavailable"},
+    "k_calib_weight": {"value": 1, "label": "K calibration layer (0-1)",
+                       "note": "Correction fit from the K model's own stored raw runs"},
+}
+
 PROP_ROADMAP = [
     {"prop": "Hits O/U 0.5 (both sides)", "status": "live-beta", "note": "log5 model on the board with EV vs live prices; result log grading daily"},
     {"prop": "Batter walks 0.5", "status": "planned", "note": "log5 on BB rates — same machinery as hits, likely the easiest next binary"},
     {"prop": "Home runs 0.5", "status": "planned", "note": "HR-rate model + park factors required to be honest"},
-    {"prop": "Pitcher strikeouts", "status": "planned", "note": "per-hitter K probs → sum-of-Bernoullis distribution; batters-faced leash profiles (~23 / ~17); price the line vs the shape — this engine then unlocks the whole count-prop tier"},
+    {"prop": "Pitcher strikeouts", "status": "backtesting", "note": "per-hitter K probs → sum-of-Bernoullis distribution; batters-faced leash profiles (~23 / ~17); price the line vs the shape — this engine then unlocks the whole count-prop tier"},
     {"prop": "Total bases / H+R+RBI", "status": "idea", "note": "count props — need the distribution engine from the K model"},
     {"prop": "Pitcher outs / ER / hits / walks allowed", "status": "idea", "note": "distribution + leash modeling; after the K template"},
     {"prop": "Stolen bases 0.5", "status": "idea", "note": "attempt rates are player/manager-specific but loggable"},
@@ -58,6 +79,8 @@ PROP_ROADMAP = [
 
 _run_state = {"status": "idle", "progress": "", "started": None}
 _market_state = {"status": "idle", "progress": ""}
+_k_run_state = {"status": "idle", "progress": "", "started": None}
+_k_market_state = {"status": "idle", "progress": ""}
 _lock = threading.Lock()
 
 
@@ -81,6 +104,10 @@ def init_db():
             ts INTEGER, days INTEGER, report TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS player_priors (
             name_folded TEXT PRIMARY KEY, display_name TEXT, rate REAL, pa INTEGER)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS k_backtest_runs (
+            ts INTEGER, days INTEGER, config TEXT, report TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS k_market_runs (
+            ts INTEGER, days INTEGER, report TEXT)""")
 
 
 def load_priors_csv(csv_text: str) -> dict:
@@ -256,6 +283,7 @@ def lab_state() -> dict:
         "priors_loaded": priors_count(),
         "market": dict(_market_state),
         "market_history": market_history(),
+        "kmodel": k_lab_state(),
     }
 
 
@@ -306,3 +334,148 @@ def market_history() -> list[dict]:
                 "SELECT ts, days, report FROM market_runs ORDER BY ts DESC LIMIT 10"):
             out.append({"ts": ts, "days": days, "report": json.loads(report)})
     return out
+
+
+# ---------- K model lab (additive; hit-model machinery untouched) ----------
+
+def get_k_config() -> dict:
+    init_db()
+    cfg = {k: dict(v) for k, v in K_CONFIG_DEFAULTS.items()}
+    with _conn() as c:
+        for key, value in c.execute("SELECT key, value FROM model_config"):
+            if key in cfg:
+                cfg[key]["value"] = value
+    return cfg
+
+
+def set_k_config(updates: dict) -> dict:
+    init_db()
+    with _conn() as c:
+        for key, value in updates.items():
+            if key in K_CONFIG_DEFAULTS:
+                c.execute("INSERT OR REPLACE INTO model_config VALUES (?, ?)",
+                          (key, float(value)))
+    return get_k_config()
+
+
+def _apply_k_config():
+    cfg = get_k_config()
+    kmodel.K_SHRINK_PA = cfg["k_shrink_pa"]["value"]
+    kmodel.K_MIN_BATTER_PA = int(cfg["k_min_batter_pa"]["value"])
+    kmodel.K_MIN_STARTER_TBF = int(cfg["k_min_starter_tbf"]["value"])
+    kmodel.K_MIN_STARTS = int(cfg["k_min_starts"]["value"])
+    kmodel.K_ARSENAL_WEIGHT = max(0.0, min(1.0, cfg["k_arsenal_weight"]["value"]))
+    kmodel.K_PARK_WEIGHT = max(0.0, min(1.0, cfg["k_park_weight"]["value"]))
+    kmodel.K_CALIB_WEIGHT = max(0.0, min(1.0, cfg["k_calib_weight"]["value"]))
+    kmodel.K_CALIB_POINTS = _fit_k_calibration() if kmodel.K_CALIB_WEIGHT > 0 else []
+    return cfg
+
+
+def _fit_k_calibration() -> list:
+    """Correction curve from the largest stored RAW K run (k_calib_weight 0)
+    whose other knobs match -- identical honesty rules to the hit model's."""
+    init_db()
+    current = {k: v["value"] for k, v in get_k_config().items()
+               if k not in ("k_calib_weight",)}
+    best = None
+    fallback = None
+    with _conn() as c:
+        for _, _, config, report in c.execute("SELECT ts, days, config, report FROM k_backtest_runs"):
+            rep = json.loads(report)
+            knobs = json.loads(config) if config else {}
+            if not rep.get("n") or knobs.get("k_calib_weight", 0):
+                continue
+            matches = all(abs(knobs.get(k, K_CONFIG_DEFAULTS[k]["value"]) - v) < 1e-9
+                          for k, v in current.items())
+            if matches and (best is None or rep["n"] > best.get("n", 0)):
+                best = rep
+            if fallback is None or rep["n"] > fallback.get("n", 0):
+                fallback = rep
+    if best is None:
+        best = fallback
+        if best:
+            log.warning("K calibration: no raw run matches current knobs -- "
+                        "using largest raw run as fallback")
+    if not best:
+        return []
+    pts = [(c["predicted"] / 100.0, c["actual"] / 100.0)
+           for c in best.get("calibration", []) if c.get("n", 0) >= 100]
+    pts.sort()
+    if pts:
+        log.info("K calibration fitted from %d-prediction run: %s", best["n"], pts)
+    return pts
+
+
+def run_k_backtest_async(days: int) -> bool:
+    with _lock:
+        if _k_run_state["status"] == "running":
+            return False
+        _k_run_state.update({"status": "running", "progress": "starting…",
+                             "started": time.time()})
+
+    def _progress(done, total, n, detail=""):
+        _k_run_state["progress"] = f"day {done}/{total} ({detail}) — {n} starts modeled"
+
+    def _work():
+        try:
+            cfg = _apply_k_config()
+            report = kbacktest.run_k_backtest(days, progress=_progress)
+            with _conn() as c:
+                c.execute("INSERT INTO k_backtest_runs VALUES (?, ?, ?, ?)",
+                          (int(time.time()), days,
+                           json.dumps({k: v["value"] for k, v in cfg.items()}),
+                           json.dumps(report)))
+            _k_run_state.update({"status": "idle", "progress": "done"})
+        except Exception as e:
+            log.error("k backtest failed: %s", e)
+            _k_run_state.update({"status": "idle", "progress": f"failed: {e}"})
+
+    threading.Thread(target=_work, daemon=True).start()
+    return True
+
+
+def run_k_market_async(days: int) -> bool:
+    with _lock:
+        if _k_market_state["status"] == "running":
+            return False
+        _k_market_state.update({"status": "running", "progress": "starting…"})
+
+    def _progress(day, total, games, cands):
+        _k_market_state["progress"] = f"day {day}/{total} — {games} games priced, {cands} edge candidates"
+
+    def _work():
+        try:
+            _apply_k_config()
+            report = kbacktest.run_k_market_backtest(days, progress=_progress)
+            init_db()
+            with _conn() as c:
+                c.execute("INSERT INTO k_market_runs VALUES (?, ?, ?)",
+                          (int(time.time()), days, json.dumps(report)))
+            _k_market_state.update({"status": "idle", "progress": "done"})
+        except Exception as e:
+            log.error("k market backtest failed: %s", e)
+            _k_market_state.update({"status": "idle", "progress": f"failed: {e}"})
+
+    threading.Thread(target=_work, daemon=True).start()
+    return True
+
+
+def k_lab_state() -> dict:
+    init_db()
+    runs = []
+    market = []
+    with _conn() as c:
+        for ts, days, cfg, report in c.execute(
+                "SELECT ts, days, config, report FROM k_backtest_runs ORDER BY ts DESC LIMIT 20"):
+            runs.append({"ts": ts, "days": days, "config": json.loads(cfg),
+                         "report": json.loads(report)})
+        for ts, days, report in c.execute(
+                "SELECT ts, days, report FROM k_market_runs ORDER BY ts DESC LIMIT 10"):
+            market.append({"ts": ts, "days": days, "report": json.loads(report)})
+    return {
+        "run": dict(_k_run_state),
+        "config": get_k_config(),
+        "history": runs,
+        "market": dict(_k_market_state),
+        "market_history": market,
+    }
