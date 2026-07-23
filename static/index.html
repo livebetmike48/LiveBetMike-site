@@ -627,6 +627,156 @@ async function renderLab() {
   rh += "</tbody></table>";
   rm.innerHTML = rh;
   main.appendChild(rm);
+
+  // ---------- K MODEL — its own section, own knobs, own gauntlet ----------
+  renderKLab(main, j.kmodel || {});
+}
+
+function renderKLab(main, kj) {
+  const hdr = document.createElement("div");
+  hdr.className = "gamehdr";
+  hdr.textContent = "K Model — Strikeouts (separate model, own gauntlet)";
+  hdr.style.marginTop = "52px";
+  main.appendChild(hdr);
+  const intro = document.createElement("div");
+  intro.className = "meta";
+  intro.style.cssText = "margin:0 0 4px";
+  intro.innerHTML = "Per-hitter K probs (log5, shrunk, platoon) → the starter's REAL workload distribution → exact strikeout distribution per start. <b style='color:var(--white)'>Fully separate from the hit model and Pitcher Projections</b> — nothing here touches those.";
+  main.appendChild(intro);
+
+  // K run controls (reuses the lab token input above)
+  const ctl = document.createElement("div");
+  ctl.className = "winrow";
+  ctl.innerHTML = `
+    <select id="klab-days"><option>3</option><option>5</option><option selected>7</option><option>10</option><option>14</option><option>21</option><option>30</option><option>45</option><option>60</option><option>90</option><option>120</option></select>
+    <button class="winbtn" onclick="klabRun()">Run K backtest</button>
+    <span class="meta" id="klab-status">${kj.run && kj.run.status === "running" ? "⏳ " + kj.run.progress : ((kj.run && kj.run.progress) || "idle — uses the lab token above")}</span>`;
+  main.appendChild(ctl);
+  if (kj.run && kj.run.status === "running") setTimeout(renderLab, 6000);
+
+  // K knobs
+  const cfgHdr = document.createElement("div");
+  cfgHdr.className = "gamehdr";
+  cfgHdr.textContent = "K model knobs (recorded with every K run)";
+  main.appendChild(cfgHdr);
+  const cfgBox = document.createElement("div");
+  cfgBox.className = "board";
+  let cfgHtml = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Knob</th><th>Value</th><th style='text-align:left'>Note</th></tr></thead><tbody>";
+  for (const [key, k] of Object.entries(kj.config || {})) {
+    cfgHtml += `<tr><td class="name" style="cursor:default">${k.label}</td>
+      <td><input data-kkey="${key}" value="${k.value}" style="width:70px;background:transparent;color:var(--blue);border:1px solid var(--line);border-radius:4px;text-align:right;font-family:'IBM Plex Mono',monospace"></td>
+      <td style="text-align:left;color:#7a8694;font-family:Inter">${k.note}</td></tr>`;
+  }
+  cfgHtml += "</tbody></table>";
+  cfgBox.innerHTML = cfgHtml;
+  main.appendChild(cfgBox);
+  const saveRow = document.createElement("div");
+  saveRow.className = "winrow";
+  saveRow.innerHTML = `<button class="winbtn" onclick="klabSaveConfig()">Save K knobs</button><span class="meta">changes apply to the NEXT K run</span>`;
+  main.appendChild(saveRow);
+
+  // K market test
+  const mHdr = document.createElement("div");
+  mHdr.className = "gamehdr";
+  mHdr.textContent = "K market test — model vs closing strikeout lines (units)";
+  main.appendChild(mHdr);
+  const mCtl = document.createElement("div");
+  mCtl.className = "winrow";
+  mCtl.innerHTML = `
+    <select id="kmarket-days"><option>7</option><option selected>14</option><option>30</option><option>60</option><option>120</option></select>
+    <button class="winbtn" onclick="klabMarket()">Run K market test</button>
+    <span class="meta" id="kmarket-status">${kj.market && kj.market.status === "running" ? "⏳ " + kj.market.progress : ((kj.market && kj.market.progress) || "historical pitcher_strikeouts closing lines (~20 credits/game); half-point lines only (no pushes)")}</span>`;
+  main.appendChild(mCtl);
+  if (kj.market && kj.market.status === "running") setTimeout(renderLab, 8000);
+  for (const run of (kj.market_history || [])) {
+    const rep = run.report;
+    const box = document.createElement("div");
+    box.className = "board";
+    box.style.marginBottom = "14px";
+    const when = new Date(run.ts * 1000).toLocaleString();
+    let h = `<div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">`;
+    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.games_priced} games priced (~${rep.credits_estimate} credits)</div>`;
+    h += `<table style="margin-top:8px"><thead><tr><th style='text-align:left'>EV ≥</th><th>Bets</th><th>W</th><th>Units</th><th>ROI</th><th>Overs u</th><th>Unders u</th></tr></thead><tbody>`;
+    for (const thr of ["2", "5", "10"]) {
+      const t = (rep.by_threshold || {})[thr];
+      if (!t) continue;
+      const col = t.units > 0 ? "#4caf7d" : (t.units < 0 ? "#d7483a" : "#7a8694");
+      h += `<tr><td style="text-align:left">+${thr}%</td><td>${t.bets}</td><td>${t.wins}</td>
+        <td style="color:${col};font-weight:600">${t.units > 0 ? "+" : ""}${t.units}u</td>
+        <td>${t.roi_pct != null ? t.roi_pct + "%" : "–"}</td>
+        <td>${t.over_units > 0 ? "+" : ""}${t.over_units}u (${t.over_bets})</td>
+        <td>${t.under_units > 0 ? "+" : ""}${t.under_units}u (${t.under_bets})</td></tr>`;
+    }
+    h += "</tbody></table>";
+    if (rep.sample_bets && rep.sample_bets.length) {
+      h += `<div style="margin-top:8px;color:#7a8694">Biggest edges: ` +
+        rep.sample_bets.slice(0, 6).map(b => `${b.name} ${b.side} ${b.line} ${b.price > 0 ? "+" : ""}${b.price} (EV +${b.ev}%) ${(b.side === "over") === (b.hit === 1) ? "✅" : "❌"}`).join(" · ") + `</div>`;
+    }
+    h += "</div>";
+    box.innerHTML = h;
+    main.appendChild(box);
+  }
+
+  // K backtest history
+  const hist = kj.history || [];
+  const runHdr = document.createElement("div");
+  runHdr.className = "gamehdr";
+  runHdr.textContent = hist.length ? "K backtest history" : "No K runs yet — fire the first one";
+  main.appendChild(runHdr);
+  for (const run of hist) {
+    const rep = run.report;
+    const box = document.createElement("div");
+    box.className = "board";
+    box.style.marginBottom = "14px";
+    const when = new Date(run.ts * 1000).toLocaleString();
+    let h = `<div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">`;
+    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.starts ?? "?"} starts, ${rep.n} ladder predictions</div>`;
+    h += `<div style="margin:6px 0">Brier: model <b style="color:var(--white)">${rep.brier_model}</b> vs constant ${rep.brier_constant}${rep.brier_naive != null ? " vs naive " + rep.brier_naive : ""} (lower wins)`;
+    const beats = rep.brier_model < rep.brier_constant && (rep.brier_naive == null || rep.brier_model < rep.brier_naive);
+    h += beats ? ` <span style="color:#4caf7d">✅ beats baselines</span>` : ` <span style="color:#e0a12f">⚠️ not clearly better — don't ship</span>`;
+    h += `</div>`;
+    if (rep.avg_projected_k != null) {
+      h += `<div style="color:#7a8694">projected ${rep.avg_projected_k} K/start vs actual ${rep.avg_actual_k} — mean abs error ${rep.mean_abs_error_k}</div>`;
+    }
+    h += `<div style="color:#7a8694">knobs: ${Object.entries(run.config).map(([k,v]) => k+"="+v).join(", ")}</div>`;
+    h += `<table style="margin-top:8px"><thead><tr><th style='text-align:left'>Bucket</th><th>n</th><th>Predicted</th><th>Actual</th><th style='text-align:left'>Gap</th></tr></thead><tbody>`;
+    for (const c of (rep.calibration || [])) {
+      const gap = (c.actual - c.predicted).toFixed(1);
+      const col = Math.abs(gap) < 3 ? "#4caf7d" : (Math.abs(gap) < 6 ? "#e0a12f" : "#d7483a");
+      h += `<tr><td style="text-align:left">${c.bucket}</td><td>${c.n}</td><td>${c.predicted}%</td><td>${c.actual}%</td><td style="text-align:left;color:${col}">${gap > 0 ? "+" : ""}${gap}</td></tr>`;
+    }
+    h += "</tbody></table></div>";
+    box.innerHTML = h;
+    main.appendChild(box);
+  }
+}
+
+async function klabRun() {
+  const days = parseInt(document.getElementById("klab-days").value);
+  const r = await fetch("/api/klab/run", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({days: days, token: labToken()})});
+  const j = await r.json();
+  document.getElementById("klab-status").textContent =
+    j.error ? "✖ " + j.error : (j.started ? "⏳ started…" : "already running");
+  if (j.started) setTimeout(renderLab, 4000);
+}
+
+async function klabMarket() {
+  const days = parseInt(document.getElementById("kmarket-days").value);
+  const r = await fetch("/api/klab/market", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({days: days, token: labToken()})});
+  const j = await r.json();
+  document.getElementById("kmarket-status").textContent =
+    j.error ? "✖ " + j.error : (j.started ? "⏳ started…" : "already running");
+  if (j.started) setTimeout(renderLab, 5000);
+}
+
+async function klabSaveConfig() {
+  const payload = {token: labToken()};
+  for (const inp of document.querySelectorAll("input[data-kkey]")) payload[inp.dataset.kkey] = parseFloat(inp.value);
+  const r = await fetch("/api/klab/config", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+  const j = await r.json();
+  document.getElementById("klab-status").textContent = j.error ? "✖ " + j.error : "✓ K knobs saved — next K run uses them";
 }
 
 let PROJ_DATA = null;
