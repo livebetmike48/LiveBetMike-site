@@ -374,13 +374,24 @@ def _apply_k_config():
 def _fit_k_calibration() -> list:
     """Correction curve from the largest stored RAW K run (k_calib_weight 0)
     whose other knobs match -- identical honesty rules to the hit model's."""
+    pts, _ = _fit_k_calibration_detail()
+    return pts
+
+
+def _fit_k_calibration_detail():
+    """The K fit plus receipts: (points, meta). meta says which stored run
+    the curve came from (ts/days/n), whether its knobs actually matched the
+    current config, and how many buckets cleared the n>=100 floor -- so the
+    fit button can show exactly what happened instead of burying it in logs."""
     init_db()
     current = {k: v["value"] for k, v in get_k_config().items()
                if k not in ("k_calib_weight",)}
     best = None
+    best_src = None
     fallback = None
+    fallback_src = None
     with _conn() as c:
-        for _, _, config, report in c.execute("SELECT ts, days, config, report FROM k_backtest_runs"):
+        for ts, days, config, report in c.execute("SELECT ts, days, config, report FROM k_backtest_runs"):
             rep = json.loads(report)
             knobs = json.loads(config) if config else {}
             if not rep.get("n") or knobs.get("k_calib_weight", 0):
@@ -388,22 +399,46 @@ def _fit_k_calibration() -> list:
             matches = all(abs(knobs.get(k, K_CONFIG_DEFAULTS[k]["value"]) - v) < 1e-9
                           for k, v in current.items())
             if matches and (best is None or rep["n"] > best.get("n", 0)):
-                best = rep
+                best, best_src = rep, {"ts": ts, "days": days, "n": rep["n"]}
             if fallback is None or rep["n"] > fallback.get("n", 0):
-                fallback = rep
+                fallback, fallback_src = rep, {"ts": ts, "days": days, "n": rep["n"]}
+    matched = best is not None
     if best is None:
-        best = fallback
+        best, best_src = fallback, fallback_src
         if best:
             log.warning("K calibration: no raw run matches current knobs -- "
                         "using largest raw run as fallback")
     if not best:
-        return []
+        return [], {"source": None, "matched": False, "buckets_used": 0,
+                    "buckets_total": 0}
+    cal = best.get("calibration", [])
     pts = [(c["predicted"] / 100.0, c["actual"] / 100.0)
-           for c in best.get("calibration", []) if c.get("n", 0) >= 100]
+           for c in cal if c.get("n", 0) >= 100]
     pts.sort()
     if pts:
         log.info("K calibration fitted from %d-prediction run: %s", best["n"], pts)
-    return pts
+    return pts, {"source": best_src, "matched": matched,
+                 "buckets_used": len(pts), "buckets_total": len(cal)}
+
+
+def fit_k_calibration_now() -> dict:
+    """Explicit fit (the Lab's Fit button): refresh knobs from the DB, fit
+    the K correction curve from stored raw runs, apply it to the live kmodel
+    the same way a run start would, and return the receipts."""
+    cfg = get_k_config()
+    weight = max(0.0, min(1.0, cfg["k_calib_weight"]["value"]))
+    kmodel.K_CALIB_WEIGHT = weight
+    pts, meta = _fit_k_calibration_detail()
+    kmodel.K_CALIB_POINTS = pts if weight > 0 else []
+    return {
+        "points": [{"predicted": round(p * 100.0, 1), "actual": round(a * 100.0, 1)}
+                   for p, a in pts],
+        "source": meta["source"],
+        "matched": meta["matched"],
+        "buckets_used": meta["buckets_used"],
+        "buckets_total": meta["buckets_total"],
+        "calib_weight": weight,
+    }
 
 
 def run_k_backtest_async(days: int) -> bool:
