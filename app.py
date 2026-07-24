@@ -111,6 +111,16 @@ def api_klab_market(payload: dict):
     return {"started": lab.run_k_market_async(days)}
 
 
+@app.post("/api/klab/fit")
+def api_klab_fit(payload: dict):
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    try:
+        return lab.fit_k_calibration_now()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/api/klab/config")
 def api_klab_config(payload: dict):
     if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
