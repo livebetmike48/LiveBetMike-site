@@ -408,11 +408,12 @@ def _build_board(date: str, progress: dict) -> dict:
 
 
 def log_details(days: int = 1) -> dict:
-    """Graded forward-log detail for the last N days -- the recap feed.
-    Grades pending rows first (cheap, no odds credits), then returns each
-    read with its paper-bet outcomes using the same >=EV_LOG_MIN flat-1u
-    convention as the summary, so the recap and the board can't disagree."""
-    days = max(1, min(30, days))
+    """Graded forward-log detail + stats for the last N days (400 = season)
+    -- the recap/record feed. Grades pending rows first (cheap, no odds
+    credits), then returns each read with its paper-bet outcomes using the
+    same >=EV_LOG_MIN flat-1u convention as the summary, plus window-level
+    Brier / lean accuracy / ROI so every consumer shows identical numbers."""
+    days = max(1, min(400, days))
     today = parlay.et_date_str(0)
     try:
         _grade_pending(today)
@@ -446,10 +447,23 @@ def log_details(days: int = 1) -> dict:
                 wins += 1 if hit else 0
                 units += u
         out_rows.append(row)
+    graded_rows = [r for r in out_rows if r["cleared"] is not None]
+    brier = brier_constant = lean_hits = None
+    if graded_rows:
+        brier = round(sum((r["p_over"] - r["cleared"]) ** 2
+                          for r in graded_rows) / len(graded_rows), 4)
+        base = sum(r["cleared"] for r in graded_rows) / len(graded_rows)
+        brier_constant = round(sum((base - r["cleared"]) ** 2
+                                   for r in graded_rows) / len(graded_rows), 4)
+        lean_hits = sum(1 for r in graded_rows
+                        if (r["p_over"] >= 0.5) == bool(r["cleared"]))
     return {"days": days, "rows": out_rows,
-            "graded": sum(1 for r in out_rows if r["cleared"] is not None),
+            "graded": len(graded_rows),
             "pending": sum(1 for r in out_rows if r["cleared"] is None),
             "bets": bets, "wins": wins, "units": round(units, 2),
+            "roi": round(units / bets * 100, 1) if bets else None,
+            "brier": brier, "brier_constant": brier_constant,
+            "lean_hits": lean_hits,
             "overall": _result_log_summary()}
 
 
