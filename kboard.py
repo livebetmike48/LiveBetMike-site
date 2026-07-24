@@ -24,7 +24,7 @@ import sqlite3
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -44,8 +44,8 @@ DB_PATH = os.getenv("DB_PATH", "odds_history.db")
 REFRESH_SECONDS = 900   # rebuild at most every 15 min, and only when viewed
 EV_LOG_MIN = 2.0        # paper-track units simulate flat-betting edges >= this
 
-_cache = {"date": None, "status": "cold", "data": None, "built": 0}
-_progress = {"done": 0, "total": 0}
+_boards: dict = {}   # date -> {"status", "data", "built", "progress"}
+_graded_on: set = set()
 _lock = threading.Lock()
 
 
@@ -174,18 +174,66 @@ def _result_log_summary() -> dict:
 
 # ---------- live input assembly (kbacktest's, with before=None) ----------
 
-def _venues_and_status(date: str) -> dict:
-    """{game_pk: venue name} from today's real schedule."""
-    out = {}
+def _slate(date: str) -> list[dict]:
+    """The slate for ANY date straight from MLB's schedule (probables +
+    teams + venue in one call) -- so tomorrow works exactly like today."""
+    out = []
     try:
         sched = requests.get(f"{MLB_BASE}/schedule",
-                             params={"sportId": 1, "date": date}, timeout=20).json()
-        for d in sched.get("dates", []):
-            for g in d.get("games", []):
-                out[g["gamePk"]] = ((g.get("venue") or {}).get("name"))
+                             params={"sportId": 1, "date": date,
+                                     "hydrate": "probablePitcher,team"},
+                             timeout=20).json()
     except Exception as e:
-        log.warning("k board: schedule/venues failed: %s", e)
+        log.warning("k board: schedule failed for %s: %s", date, e)
+        return out
+    for d in sched.get("dates", []):
+        for g in d.get("games", []):
+            teams = {}
+            for side in ("home", "away"):
+                t = ((g.get("teams") or {}).get(side)) or {}
+                team = t.get("team") or {}
+                pp = t.get("probablePitcher") or {}
+                teams[side] = {
+                    "abbrev": team.get("abbreviation") or team.get("teamName") or "?",
+                    "name": team.get("name") or "",
+                    "starter_id": pp.get("id"),
+                    "starter_name": pp.get("fullName") or "TBD",
+                }
+            out.append({"game_pk": g.get("gamePk"),
+                        "venue": ((g.get("venue") or {}).get("name")),
+                        "teams": teams})
     return out
+
+
+def _events_on(events: list[dict], date: str) -> list[dict]:
+    """Only odds events whose first pitch falls on this ET date -- a
+    series means the same team pair exists on BOTH days, and name-matching
+    without a date filter would price the wrong game."""
+    keep = []
+    for ev in events or []:
+        ct = ev.get("commence_time") or ""
+        try:
+            dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+            et_date = (dt - timedelta(hours=4)).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        if et_date == date:
+            keep.append(ev)
+    return keep
+
+
+def _fair_line(kdist: dict) -> float | None:
+    """The model's own line: the half-point where calibrated P(over) is
+    closest to a coin flip. The number to compare openers against."""
+    best, best_gap = None, None
+    max_k = len(kdist["dist"])
+    for half in range(max_k):
+        line = half + 0.5
+        p = kmodel.calibrate(kmodel.prob_over(kdist["dist"], line))
+        gap = abs(p - 0.5)
+        if best_gap is None or gap < best_gap:
+            best, best_gap = line, gap
+    return best
 
 
 def _lineup_order(game_pk: int) -> list[int]:
@@ -279,18 +327,16 @@ def _price_starter(events, home_name, away_name, starter_name, kdist):
     return out
 
 
-def _build_board() -> dict:
+def _build_board(date: str, progress: dict) -> dict:
     p_league = kmodel.league_k_rate()
-    slate = parlay.get_today_slate()
-    date = parlay.et_date_str(0)
-    venues = _venues_and_status(date)
+    slate = _slate(date)
     events = []
     try:
-        events = odds_api.get_events()
+        events = _events_on(odds_api.get_events(), date)
     except Exception as e:
         log.warning("k board: odds events skipped: %s", e)
 
-    _progress["total"] = sum(
+    progress["total"] = sum(
         1 for g in slate for side in ("home", "away")
         if g["teams"][side]["starter_id"])
     starters = []
@@ -323,7 +369,7 @@ def _build_board() -> dict:
                 entry["lineup_known_slots"] = known
                 kdist = kmodel.k_distribution(
                     lineup, s_rows, hand, p_league,
-                    before=None, park_k_factor=_park_k(venues.get(g["game_pk"])))
+                    before=None, park_k_factor=_park_k(g.get("venue")))
                 if kdist is None:
                     entry.update({"status": "no read",
                                   "why": "starter sample too thin (house minimums)"})
@@ -332,6 +378,7 @@ def _build_board() -> dict:
                     "status": "ok",
                     "mean_k": kdist["mean_k"],
                     "tbf_mean": kdist["tbf_mean"],
+                    "fair_line": _fair_line(kdist),
                     "league_fallback_slots": kdist["inputs"]["league_fallback_slots"],
                 })
                 entry.update(_price_starter(
@@ -341,7 +388,7 @@ def _build_board() -> dict:
                 log.warning("k board: %s failed: %s", team["starter_name"], e)
                 entry.update({"status": "no read", "why": "build error (see logs)"})
             finally:
-                _progress["done"] += 1
+                progress["done"] += 1
                 starters.append(entry)
 
     def _best_ev(s):
@@ -353,51 +400,80 @@ def _build_board() -> dict:
             "built_at": int(time.time())}
 
 
-def get_board() -> dict:
-    """Serve from cache, rebuild in the background when stale (15 min) or
-    the day rolls over. Grades yesterday's log on the first build of a day.
-    Never blocks; never spends Odds API credits unless someone is looking."""
-    today = parlay.et_date_str(0)
+def refresh(offset: int = 0) -> dict:
+    """Synchronous build for background consumers (the K plays scanner):
+    builds the board, freezes new log reads, and shares the result with
+    the site's cache so a scan also refreshes the tab."""
+    offset = 1 if offset == 1 else 0
+    date = parlay.et_date_str(offset)
+    data = _build_board(date, {"done": 0, "total": 0})
+    _log_predictions(data)
     with _lock:
-        fresh = (_cache["date"] == today and _cache["status"] == "ready"
-                 and time.time() - _cache["built"] < REFRESH_SECONDS)
+        entry = _boards.setdefault(date, {"status": "cold", "data": None,
+                                          "built": 0, "progress": {"done": 0, "total": 0}})
+        entry.update({"data": data, "status": "ready", "built": time.time()})
+    return data
+
+
+def get_board(offset: int = 0) -> dict:
+    """Board for today (offset 0) or tomorrow (offset 1). Per-date cache,
+    background rebuild when stale (15 min). Grades pending log entries the
+    first time each real day is viewed. Never blocks; Odds API credits are
+    only spent while someone is looking."""
+    offset = 1 if offset == 1 else 0
+    today = parlay.et_date_str(0)
+    date = parlay.et_date_str(offset)
+    with _lock:
+        # drop cached boards for past dates
+        for d in [d for d in _boards if d < today]:
+            del _boards[d]
+        entry = _boards.setdefault(date, {"status": "cold", "data": None,
+                                          "built": 0, "progress": {"done": 0, "total": 0}})
+        fresh = (entry["status"] == "ready"
+                 and time.time() - entry["built"] < REFRESH_SECONDS)
         if fresh:
-            return {"status": "ready", "result_log": _result_log_summary(), **_cache["data"]}
-        if _cache["status"] == "warming":
-            out = {"status": "warming",
-                   "progress": f"start {_progress['done']}/{_progress['total']}"
-                   if _progress["total"] else "starting"}
-            if _cache["date"] == today and _cache["data"]:
+            return {"status": "ready", "offset": offset,
+                    "result_log": _result_log_summary(), **entry["data"]}
+        if entry["status"] == "warming":
+            pr = entry["progress"]
+            out = {"status": "warming", "offset": offset,
+                   "progress": f"start {pr['done']}/{pr['total']}"
+                   if pr["total"] else "starting"}
+            if entry["data"]:
                 out.update({"stale": True, "result_log": _result_log_summary(),
-                            **_cache["data"]})  # keep serving last board while refreshing
+                            **entry["data"]})
                 out["status"] = "ready"
             return out
-        new_day = _cache["date"] != today
-        _cache.update({"status": "warming", "date": today})
-        _progress.update({"done": 0, "total": 0})
+        entry["status"] = "warming"
+        entry["progress"] = {"done": 0, "total": 0}
+        progress = entry["progress"]
+        need_grading = today not in _graded_on
+        if need_grading:
+            _graded_on.add(today)
 
     def _warm():
         try:
-            if new_day:
+            if need_grading:
                 try:
                     _grade_pending(today)
                 except Exception as e:
                     log.warning("k board grading failed: %s", e)
-            data = _build_board()
+            data = _build_board(date, progress)
             _log_predictions(data)
             with _lock:
-                _cache.update({"data": data, "status": "ready", "built": time.time()})
-            log.info("K board ready: %d starters (%d priced)",
-                     len(data["starters"]),
+                _boards[date].update({"data": data, "status": "ready",
+                                      "built": time.time()})
+            log.info("K board ready for %s: %d starters (%d priced)",
+                     date, len(data["starters"]),
                      sum(1 for s in data["starters"] if s.get("line") is not None))
         except Exception as e:
-            log.error("K board build failed: %s", e)
+            log.error("K board build failed for %s: %s", date, e)
             with _lock:
-                _cache["status"] = "cold" if not _cache["data"] else "ready"
+                _boards[date]["status"] = "cold" if not _boards[date]["data"] else "ready"
 
     threading.Thread(target=_warm, daemon=True).start()
     with _lock:
-        if _cache["data"] and _cache["data"].get("date") == today:
-            return {"status": "ready", "stale": True,
-                    "result_log": _result_log_summary(), **_cache["data"]}
-    return {"status": "warming", "progress": "starting"}
+        if _boards[date]["data"]:
+            return {"status": "ready", "stale": True, "offset": offset,
+                    "result_log": _result_log_summary(), **_boards[date]["data"]}
+    return {"status": "warming", "offset": offset, "progress": "starting"}
