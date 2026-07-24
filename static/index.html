@@ -764,7 +764,12 @@ async function renderLab() {
     box.style.marginBottom = "14px";
     const when = new Date(run.ts * 1000).toLocaleString();
     let h = `<div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">`;
-    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.games_priced} games priced (~${rep.credits_estimate} credits)</div>`;
+    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.games_priced} games priced (~${rep.credits_estimate} credits)${rep.vs_open ? " — <span style='color:#e0a12f'>vs OPENING lines</span>" : ""}</div>`;
+    if (rep.clv) {
+      const c = rep.clv;
+      const col = c.agree_pct > 52 ? "#4caf7d" : (c.agree_pct < 48 ? "#d7483a" : "#7a8694");
+      h += `<div style="margin-top:4px">CLV: close moved <b style="color:${col}">toward the model ${c.agree_pct != null ? c.agree_pct + "%" : "–"}</b> of decided moves (${c.toward} toward / ${c.against} against / ${c.flat} flat, n=${c.n}) — the market voting on the model all season</div>`;
+    }
     h += `<table style="margin-top:8px"><thead><tr><th style='text-align:left'>EV ≥</th><th>Bets</th><th>W</th><th>Units</th><th>ROI</th><th>Overs u</th><th>Unders u</th></tr></thead><tbody>`;
     for (const thr of ["2", "5", "10"]) {
       const t = (rep.by_threshold || {})[thr];
@@ -891,6 +896,7 @@ function renderKLab(main, kj) {
   mCtl.className = "winrow";
   mCtl.innerHTML = `
     <select id="kmarket-days"><option>7</option><option selected>14</option><option>30</option><option>60</option><option>120</option></select>
+    <label class="meta" style="cursor:pointer"><input type="checkbox" id="kmarket-open" style="vertical-align:middle"> vs OPENING lines (noon-ET snapshot; ~2x credits; adds CLV — how often the close moved toward the model)</label>
     <button class="winbtn" onclick="klabMarket()">Run K market test</button>
     <span class="meta" id="kmarket-status">${kj.market && kj.market.status === "running" ? "⏳ " + kj.market.progress : ((kj.market && kj.market.progress) || "historical pitcher_strikeouts closing lines (~20 credits/game); half-point lines only (no pushes)")}</span>`;
   main.appendChild(mCtl);
@@ -902,7 +908,12 @@ function renderKLab(main, kj) {
     box.style.marginBottom = "14px";
     const when = new Date(run.ts * 1000).toLocaleString();
     let h = `<div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">`;
-    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.games_priced} games priced (~${rep.credits_estimate} credits)</div>`;
+    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.games_priced} games priced (~${rep.credits_estimate} credits)${rep.vs_open ? " — <span style='color:#e0a12f'>vs OPENING lines</span>" : ""}</div>`;
+    if (rep.clv) {
+      const c = rep.clv;
+      const col = c.agree_pct > 52 ? "#4caf7d" : (c.agree_pct < 48 ? "#d7483a" : "#7a8694");
+      h += `<div style="margin-top:4px">CLV: close moved <b style="color:${col}">toward the model ${c.agree_pct != null ? c.agree_pct + "%" : "–"}</b> of decided moves (${c.toward} toward / ${c.against} against / ${c.flat} flat, n=${c.n}) — the market voting on the model all season</div>`;
+    }
     h += `<table style="margin-top:8px"><thead><tr><th style='text-align:left'>EV ≥</th><th>Bets</th><th>W</th><th>Units</th><th>ROI</th><th>Overs u</th><th>Unders u</th></tr></thead><tbody>`;
     for (const thr of ["2", "5", "10"]) {
       const t = (rep.by_threshold || {})[thr];
@@ -971,7 +982,7 @@ async function klabRun() {
 async function klabMarket() {
   const days = parseInt(document.getElementById("kmarket-days").value);
   const r = await fetch("/api/klab/market", {method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({days: days, token: labToken()})});
+    body: JSON.stringify({days: days, token: labToken(), vs_open: document.getElementById("kmarket-open").checked})});
   const j = await r.json();
   document.getElementById("kmarket-status").textContent =
     j.error ? "✖ " + j.error : (j.started ? "⏳ started…" : "already running");
