@@ -469,7 +469,7 @@ def run_k_backtest_async(days: int) -> bool:
     return True
 
 
-def run_k_market_async(days: int) -> bool:
+def run_k_market_async(days: int, vs_open: bool = False) -> bool:
     with _lock:
         if _k_market_state["status"] == "running":
             return False
@@ -481,7 +481,8 @@ def run_k_market_async(days: int) -> bool:
     def _work():
         try:
             _apply_k_config()
-            report = kbacktest.run_k_market_backtest(days, progress=_progress)
+            report = kbacktest.run_k_market_backtest(days, progress=_progress,
+                                                     vs_open=vs_open)
             init_db()
             with _conn() as c:
                 c.execute("INSERT INTO k_market_runs VALUES (?, ?, ?)",
