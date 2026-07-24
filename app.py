@@ -9,6 +9,7 @@ import os
 import matchups
 import bullpen
 import lab
+import kboard
 import projections
 import pitchers as pitchers_mod
 
@@ -54,6 +55,14 @@ def api_bullpen(team_id: int):
 def api_lab():
     try:
         return lab.lab_state()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/kboard")
+def api_kboard():
+    try:
+        return kboard.get_board()
     except Exception as e:
         return {"error": str(e)}
 
