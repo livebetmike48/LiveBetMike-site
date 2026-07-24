@@ -237,12 +237,13 @@ function reprojectPitcher(inp) {
   row.querySelector(".pouts").textContent = Math.max(0, tbf - hh - bb).toFixed(2);
 }
 
+let KDAY = 0;
 async function renderKBoard() {
   const main = document.getElementById("main");
   main.innerHTML = "<div class='state'>Loading K board…</div>";
   let j;
   try {
-    const r = await fetch("/api/kboard");
+    const r = await fetch("/api/kboard?d=" + KDAY);
     j = await r.json();
   } catch (e) {
     main.innerHTML = "<div class='state'>Server busy — retrying…</div>";
@@ -277,8 +278,15 @@ async function renderKBoard() {
 
   const hdr = document.createElement("div");
   hdr.className = "gamehdr";
-  hdr.textContent = "Today's K board — BETA (forward validation in progress)";
+  hdr.textContent = (KDAY === 1 ? "Tomorrow's" : "Today's") + " K board — BETA (forward validation in progress)";
   main.appendChild(hdr);
+  const dayRow = document.createElement("div");
+  dayRow.className = "winrow";
+  dayRow.innerHTML = `
+    <button class="winbtn ${KDAY === 0 ? "active" : ""}" onclick="KDAY=0;renderKBoard()">Today</button>
+    <button class="winbtn ${KDAY === 1 ? "active" : ""}" onclick="KDAY=1;renderKBoard()">Tomorrow</button>
+    <span class="meta">tomorrow = model numbers before the books hang lines; when an opener posts, the first priced read is what gets logged</span>`;
+  main.appendChild(dayRow);
   const meta = document.createElement("div");
   meta.className = "meta";
   meta.style.cssText = "margin:0 0 4px";
@@ -315,7 +323,7 @@ async function renderKBoard() {
         : `<span style="color:#e0a12f" title="all nine slots priced at league until the lineup posts">not posted</span>`;
       h += `<tr><td class="name" style="cursor:default">${s.starter} <span class="vs">${s.team} ${s.hand}HP</span></td>
         <td style="text-align:left;color:#7a8694;font-family:Inter">${s.opp}</td>
-        <td>${s.line != null ? s.line : "–"}</td>
+        <td>${s.line != null ? s.line : (s.fair_line != null ? `<span class="vs" style="display:inline" title="model fair line — the half-point the model prices at a coin flip; compare openers against it">model ${s.fair_line}</span>` : "–")}</td>
         <td style="color:var(--blue);font-weight:600">${s.p_over != null ? (s.p_over * 100).toFixed(1) + "%" : "–"}</td>
         ${sideCell(s, "over")}${sideCell(s, "under")}
         <td>${s.mean_k}</td><td>${lu}</td></tr>`;
