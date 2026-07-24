@@ -674,6 +674,10 @@ function renderKLab(main, kj) {
   saveRow.className = "winrow";
   saveRow.innerHTML = `<button class="winbtn" onclick="klabSaveConfig()">Save K knobs</button><span class="meta">changes apply to the NEXT K run</span>`;
   main.appendChild(saveRow);
+  const fitRow = document.createElement("div");
+  fitRow.className = "winrow";
+  fitRow.innerHTML = `<button class="winbtn" onclick="klabFitCalib()">Fit K calibration</button><span class="meta" id="kfit-status">fits the correction curve from your largest stored raw K run (k_calib_weight=0) and applies it live — receipts shown here</span>`;
+  main.appendChild(fitRow);
 
   // K market test
   const mHdr = document.createElement("div");
@@ -769,6 +773,29 @@ async function klabMarket() {
   document.getElementById("kmarket-status").textContent =
     j.error ? "✖ " + j.error : (j.started ? "⏳ started…" : "already running");
   if (j.started) setTimeout(renderLab, 5000);
+}
+
+async function klabFitCalib() {
+  const el = document.getElementById("kfit-status");
+  el.textContent = "fitting…";
+  const r = await fetch("/api/klab/fit", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({token: labToken()})});
+  const j = await r.json();
+  if (j.error) { el.textContent = "✖ " + j.error; return; }
+  if (!j.source) {
+    el.textContent = "✖ no raw K run stored — run a K backtest with k_calib_weight=0 first";
+    return;
+  }
+  const src = `${j.source.n} predictions, ${j.source.days}d run (${new Date(j.source.ts * 1000).toLocaleDateString()})`;
+  if (!j.points || !j.points.length) {
+    el.textContent = `✖ largest raw run (${src}) has no bucket with ≥100 predictions — run a longer backtest to fit`;
+    return;
+  }
+  const curve = j.points.map(p => `${p.predicted}%→${p.actual}%`).join(", ");
+  let msg = `✓ fitted from ${src}, ${j.buckets_used}/${j.buckets_total} buckets: ${curve}`;
+  if (!j.matched) msg += " — ⚠️ no raw run matches current knobs, used largest raw run (run a k_calib_weight=0 backtest under these knobs to fit properly)";
+  if (!(j.calib_weight > 0)) msg += " — note: k_calib_weight is 0, so the curve was fitted but NOT applied";
+  el.textContent = msg;
 }
 
 async function klabSaveConfig() {
