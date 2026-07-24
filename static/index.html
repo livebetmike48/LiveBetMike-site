@@ -367,6 +367,10 @@ function renderKSim() {
     <datalist id="ksim-players"></datalist>
     <div style="margin:4px 0">${slots}</div>
     <div class="winrow">
+      <input id="ksim-tbf" type="number" min="9" max="45" placeholder="TBF" style="width:70px;background:#0d1420;border:1px solid #26303e;color:var(--white);padding:5px 8px;border-radius:4px;font-size:12.5px">
+      <span class="meta">optional fixed batters-faced — pitch limits, piggybacks, deep-leash days (blank = his real workload mixture; the Limit channel is your source)</span>
+    </div>
+    <div class="winrow">
       <button class="winbtn" onclick="ksimRun()">Run sim</button>
       <span class="meta" id="ksim-status"></span>
     </div>
@@ -406,7 +410,7 @@ async function ksimRun() {
   }
   st.textContent = "simulating…";
   const r = await fetch("/api/ksim", {method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({starter_id: sid, batter_ids: ids, d: KDAY})});
+    body: JSON.stringify({starter_id: sid, batter_ids: ids, d: KDAY, tbf: parseInt(document.getElementById("ksim-tbf").value) || null})});
   const j = await r.json();
   if (j.error) { st.textContent = "✖ " + j.error; return; }
   st.textContent = misses.length ? `⚠️ not matched (priced at league): ${misses.join(", ")}` : "done";
@@ -427,7 +431,7 @@ async function ksimRun() {
   }
   const slots = j.slots.map(s => `<div>${s.slot}. ${s.name || "league"} — ${s.basis} · K/PA ${(s.p_k_per_pa*100).toFixed(1)}%</div>`).join("");
   out.innerHTML = `<div class="board" style="margin-top:10px"><div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">
-    <div style="color:var(--blue);font-weight:600">${j.starter} (${j.hand}HP${j.slate ? ", " + j.slate.team + " v " + j.slate.opp : ""}) — projected <b>${j.mean_k}</b> K over ${j.tbf_mean} TBF · model line <b>${j.fair_line}</b>${j.league_fallback_slots ? ` · ${j.league_fallback_slots} league slot(s)` : ""}${j.park_k_factor ? ` · park ${j.park_k_factor}` : ""}</div>
+    <div style="color:var(--blue);font-weight:600">${j.starter} (${j.hand}HP${j.slate ? ", " + j.slate.team + " v " + j.slate.opp : ""}) — projected <b>${j.mean_k}</b> K over ${j.tbf_mean} TBF (${j.tbf_mode}) · model line <b>${j.fair_line}</b>${j.league_fallback_slots ? ` · ${j.league_fallback_slots} league slot(s)` : ""}${j.park_k_factor ? ` · park ${j.park_k_factor}` : ""}</div>
     <table style="margin-top:8px;text-align:center"><thead><tr><th colspan="5" style="text-align:left">P(over) ladder</th></tr></thead><tbody><tr>${ladder}</tr></tbody></table>
     ${mkt}
     <div style="margin-top:8px;color:#7a8694">${slots}</div>
