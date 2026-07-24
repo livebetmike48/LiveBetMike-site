@@ -434,18 +434,23 @@ def log_details(days: int = 1) -> dict:
         row = {"date": date, "starter": name, "line": line,
                "p_over": p_over, "actual_k": actual, "cleared": cleared,
                "lineup_posted": bool(lineup), "bets": []}
-        if cleared is not None:
-            for side, ev, price, book, hit in (
-                    ("over", ev_o, pr_o, bk_o, cleared),
-                    ("under", ev_u, pr_u, bk_u, 1 - cleared)):
-                if ev is None or price is None or ev < EV_LOG_MIN:
-                    continue
-                u = round(odds_api.american_to_decimal(price) - 1, 2) if hit else -1.0
+        for side, ev, price, book, hit in (
+                ("over", ev_o, pr_o, bk_o, cleared),
+                ("under", ev_u, pr_u, bk_u,
+                 (1 - cleared) if cleared is not None else None)):
+            if ev is None or price is None or ev < EV_LOG_MIN:
+                continue
+            if cleared is None:
+                # logged bet, game not graded yet -- keep its identity
                 row["bets"].append({"side": side, "price": price, "book": book,
-                                    "ev": ev, "won": bool(hit), "units": u})
-                bets += 1
-                wins += 1 if hit else 0
-                units += u
+                                    "ev": ev, "won": None, "units": None})
+                continue
+            u = round(odds_api.american_to_decimal(price) - 1, 2) if hit else -1.0
+            row["bets"].append({"side": side, "price": price, "book": book,
+                                "ev": ev, "won": bool(hit), "units": u})
+            bets += 1
+            wins += 1 if hit else 0
+            units += u
         out_rows.append(row)
     graded_rows = [r for r in out_rows if r["cleared"] is not None]
     brier = brier_constant = lean_hits = None
@@ -628,6 +633,36 @@ def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0,
             "slots": kdist["inputs"]["slots"],
             "tbf_mode": tbf_mode,
             "ladder": ladder, "market": market}
+
+
+def log_csv(days: int = 400) -> str:
+    """The forward log as a spreadsheet: one row per logged paper bet
+    (side, price, book, EV, result, units) plus no-bet reads (side
+    'no-bet') so lean accuracy is analyzable too. Raw material for Mike's
+    own threshold/side analysis -- same frozen data, zero new collection."""
+    d = log_details(days)
+    lines = ["date,starter,line,side,price,book,ev_pct,model_p_over,actual_k,result,units,lineup_posted"]
+    def esc(x):
+        s = "" if x is None else str(x)
+        return f'"{s}"' if "," in s else s
+    for r in d["rows"]:
+        base = [r["date"], esc(r["starter"]), r["line"]]
+        if r["bets"]:
+            for b in r["bets"]:
+                res = "" if b["won"] is None else ("win" if b["won"] else "loss")
+                lines.append(",".join(str(x) for x in base + [
+                    b["side"], b["price"], esc(b["book"]), b["ev"], r["p_over"],
+                    r["actual_k"] if r["actual_k"] is not None else "",
+                    res, b["units"] if b["units"] is not None else "",
+                    1 if r["lineup_posted"] else 0]))
+        else:
+            res = "" if r["cleared"] is None else (
+                "lean-hit" if (r["p_over"] >= 0.5) == bool(r["cleared"]) else "lean-miss")
+            lines.append(",".join(str(x) for x in base + [
+                "no-bet", "", "", "", r["p_over"],
+                r["actual_k"] if r["actual_k"] is not None else "",
+                res, "", 1 if r["lineup_posted"] else 0]))
+    return "\n".join(lines) + "\n"
 
 
 def refresh(offset: int = 0) -> dict:
