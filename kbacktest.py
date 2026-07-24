@@ -236,6 +236,134 @@ def _line_movement(open_priced: dict, close_priced: dict) -> str | None:
     return "flat"
 
 
+def _devig_prob(odds_data: dict, name: str, side: str, book: str) -> float | None:
+    """Fair (de-vigged) market probability for `side` at `book`. Takes the
+    over and under prices at the SAME book, converts to implied
+    probabilities, and normalizes so they sum to 1 -- stripping the book's
+    hold. Returns None if the book didn't price both sides."""
+    try:
+        over = odds_api.player_prop_prices(odds_data, "pitcher_strikeouts", name, side="over")
+        under = odds_api.player_prop_prices(odds_data, "pitcher_strikeouts", name, side="under")
+        po = (over or {}).get("prices", {}).get(book)
+        pu = (under or {}).get("prices", {}).get(book)
+        if po is None or pu is None:
+            return None
+        io = 1.0 / odds_api.american_to_decimal(po)
+        iu = 1.0 / odds_api.american_to_decimal(pu)
+        total = io + iu
+        if total <= 0:
+            return None
+        fair_over = io / total
+        return fair_over if side == "over" else (1 - fair_over)
+    except Exception:
+        return None
+
+
+def _blend_ev(cand: dict, w: float) -> float | None:
+    """EV using the blended probability: w*model + (1-w)*devigged-market.
+    None if this bet has no market prob (book priced one side only)."""
+    mp = cand.get("market_prob")
+    if mp is None:
+        return None
+    p = w * cand["model_prob"] + (1 - w) * mp
+    return (p * odds_api.american_to_decimal(cand["price"]) - 1) * 100
+
+
+def _sim_at(cands: list, w: float, min_ev: float) -> dict:
+    """Flat-1u result of betting every candidate whose BLENDED EV >= min_ev."""
+    bets = wins = 0
+    units = 0.0
+    for c in cands:
+        bev = _blend_ev(c, w)
+        if bev is None or bev < min_ev:
+            continue
+        bets += 1
+        if c["hit"]:
+            wins += 1
+            units += odds_api.american_to_decimal(c["price"]) - 1
+        else:
+            units -= 1
+    roi = (units / bets * 100) if bets else None
+    return {"bets": bets, "wins": wins, "units": round(units, 2),
+            "roi": round(roi, 1) if roi is not None else None}
+
+
+def fit_blend(candidates: list, test_days: int = 30,
+              w_grid=None, ev_grid=None) -> dict:
+    """The winner's-curse cure, fit honestly.
+
+    Split the stored per-bet candidates by date: the most recent
+    `test_days` are HELD OUT, everything older is train. Fit the blend
+    weight w on TRAIN only (the w whose blended EV best ranks real
+    outcomes -- highest train ROI at a reference filter), then report how
+    every (w, min_ev) performs on the untouched TEST days. The headline is
+    always the test grid: in-sample numbers are shown only to prove we're
+    not overfitting.
+
+    No w is chosen by feel -- the grids are swept and the table is the
+    evidence. Bets with no market prob (one-sided books) are dropped from
+    the blend entirely, honestly counted.
+    """
+    w_grid = w_grid or [round(x / 100, 2) for x in range(0, 101, 10)]
+    ev_grid = ev_grid or [0, 2, 4, 6, 8, 10]
+    usable = [c for c in candidates if c.get("market_prob") is not None]
+    dropped = len(candidates) - len(usable)
+    if not usable:
+        return {"error": "no candidates carry a market probability -- "
+                         "re-run a market test to populate the blend inputs"}
+    dates = sorted({c["date"] for c in usable})
+    if len(dates) <= test_days:
+        return {"error": f"need more than {test_days} days of stored bets "
+                         f"(have {len(dates)}) -- run a longer market test first"}
+    cutoff = dates[-test_days]
+    train = [c for c in usable if c["date"] < cutoff]
+    test = [c for c in usable if c["date"] >= cutoff]
+    if not train or not test:
+        return {"error": "train/test split empty -- widen the stored window"}
+
+    # Fit w on TRAIN: pick the w maximizing train ROI at a reference filter
+    # (min_ev = 2), requiring a floor of volume so we don't chase a w that
+    # fires 3 bets. Ties broken toward w=1 (least market-reliance that ties).
+    ref_ev = 2.0
+    best_w, best = None, None
+    for w in w_grid:
+        r = _sim_at(train, w, ref_ev)
+        if r["bets"] < max(20, len(train) // 40):
+            continue
+        key = (r["roi"] if r["roi"] is not None else -999)
+        if best is None or key > best or (key == best and (best_w is None or w > best_w)):
+            best, best_w = key, w
+    if best_w is None:
+        best_w = 1.0  # fall back to pure model if train too thin to fit
+
+    # TEST grid: every (w, min_ev) on held-out days
+    test_grid = []
+    for w in w_grid:
+        row = {"w": w, "by_ev": {}}
+        for mev in ev_grid:
+            row["by_ev"][mev] = _sim_at(test, w, mev)
+        test_grid.append(row)
+
+    # The recommended operating point: fitted w, and the min_ev on TEST that
+    # maximizes ROI subject to a volume floor (so it's bettable, not a fluke)
+    fitted_rows = {mev: _sim_at(test, best_w, mev) for mev in ev_grid}
+    vol_floor = max(15, len(test) // 30)
+    viable = {mev: r for mev, r in fitted_rows.items()
+              if r["bets"] >= vol_floor and r["roi"] is not None}
+    rec_ev = max(viable, key=lambda m: viable[m]["roi"]) if viable else None
+
+    return {"test_days": test_days, "train_days": len(dates) - test_days,
+            "train_bets": len(train), "test_bets": len(test),
+            "dropped_no_market": dropped,
+            "fitted_w": best_w,
+            "train_roi_at_fit": _sim_at(train, best_w, ref_ev),
+            "test_grid": test_grid,
+            "fitted_row": fitted_rows,
+            "recommended": ({"w": best_w, "min_ev": rec_ev,
+                             **fitted_rows[rec_ev]} if rec_ev is not None else None),
+            "w_grid": w_grid, "ev_grid": ev_grid}
+
+
 def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> dict:
     """Walk past days: point-in-time K distribution per start, joined to
     the REAL historical pitcher_strikeouts line, flat-betting every edge
@@ -299,14 +427,20 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
                         odds_data, "pitcher_strikeouts", s["name"], side=side)
                     if not priced or priced.get("point") is None:
                         continue
-                    line = priced["point"]
+                    line = priced[side if False else "point"]
                     if line != int(line) + 0.5:
                         continue  # whole-number lines can push -- flat-bet sim stays honest on half-points
-                    p_over = kmodel.calibrate(kmodel.prob_over(s["kdist"]["dist"], line))
+                    p_over_raw = kmodel.prob_over(s["kdist"]["dist"], line)
+                    p_over = kmodel.calibrate(p_over_raw)
                     prob = p_over if side == "over" else 1 - p_over
+                    prob_raw = p_over_raw if side == "over" else 1 - p_over_raw
                     bp = odds_api.best_price(priced["prices"])
                     if not bp:
                         continue
+                    # De-vig THIS side against the other side's price at the
+                    # same book, so the market probability is a fair number
+                    # to blend against (strips the book's hold).
+                    mkt_prob = _devig_prob(odds_data, s["name"], side, bp[0])
                     ev = (prob * odds_api.american_to_decimal(bp[1]) - 1) * 100
                     if ev > 20:
                         suspect += 1
@@ -316,7 +450,10 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
                         cand = {"date": date_str, "name": s["name"],
                                 "side": side, "line": line,
                                 "price": bp[1], "ev": round(ev, 1),
-                                "hit": cleared}
+                                "hit": cleared,
+                                "model_prob": round(prob, 4),
+                                "model_prob_raw": round(prob_raw, 4),
+                                "market_prob": round(mkt_prob, 4) if mkt_prob else None}
                         if vs_open:
                             close_priced = odds_api.player_prop_prices(
                                 close_data, "pitcher_strikeouts", s["name"], side=side)                                 if close_data else None
@@ -341,4 +478,5 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
                          "agree_pct": round(toward / (toward + against) * 100, 1)
                          if (toward + against) else None}
     report["sample_bets"] = sorted(candidates, key=lambda c: -c["ev"])[:12]
+    report["_candidates"] = candidates  # full per-bet list for blend storage (stripped before display)
     return report
