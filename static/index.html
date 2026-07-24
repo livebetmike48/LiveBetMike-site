@@ -114,6 +114,7 @@ footer b{color:var(--gray)}
   <button class="tab active" id="tab-board" onclick="showView('board')">Matchup Board</button>
   <button class="tab" id="tab-bullpen" onclick="showView('bullpen')">Bullpen Usage</button>
   <button class="tab" id="tab-model" onclick="showView('model')">Model Board</button>
+  <button class="tab" id="tab-kboard" onclick="showView('kboard')">K Board</button>
   <button class="tab" id="tab-pitchers" onclick="showView('pitchers')">Pitcher Projections</button>
   <button class="tab" id="tab-lab" onclick="showView('lab')">Model Lab</button>
 </div>
@@ -137,11 +138,12 @@ const sortState = {};
 
 function showView(v) {
   VIEW = v;
-  for (const t of ["board", "bullpen", "model", "pitchers", "lab"])
+  for (const t of ["board", "bullpen", "model", "kboard", "pitchers", "lab"])
     document.getElementById("tab-" + t).classList.toggle("active", v === t);
   if (v === "board") render();
   else if (v === "bullpen") renderBullpen();
   else if (v === "model") renderModelBoard();
+  else if (v === "kboard") renderKBoard();
   else if (v === "pitchers") renderPitchers();
   else renderLab();
 }
@@ -233,6 +235,103 @@ function reprojectPitcher(inp) {
   row.querySelector(".ph").textContent = hh.toFixed(2);
   row.querySelector(".pbb").textContent = bb.toFixed(2);
   row.querySelector(".pouts").textContent = Math.max(0, tbf - hh - bb).toFixed(2);
+}
+
+async function renderKBoard() {
+  const main = document.getElementById("main");
+  main.innerHTML = "<div class='state'>Loading K board…</div>";
+  let j;
+  try {
+    const r = await fetch("/api/kboard");
+    j = await r.json();
+  } catch (e) {
+    main.innerHTML = "<div class='state'>Server busy — retrying…</div>";
+    setTimeout(() => { if (VIEW === "kboard") renderKBoard(); }, 8000);
+    return;
+  }
+  if (VIEW !== "kboard") return;
+  main.innerHTML = "";
+  if (j.error) { main.innerHTML = `<div class='state'>✖ ${j.error}</div>`; return; }
+  if (j.status === "warming" && !j.starters) {
+    main.innerHTML = `<div class='state'>Modeling today's starters (${j.progress || "starting"}) — first build takes a couple minutes, then it's cached.<div class='bar'><i></i></div></div>`;
+    setTimeout(() => { if (VIEW === "kboard") renderKBoard(); }, 6000);
+    return;
+  }
+
+  const rl = j.result_log || {};
+  const logHdr = document.createElement("div");
+  logHdr.className = "gamehdr";
+  logHdr.textContent = "Permanent K result log (forward, out-of-sample)";
+  main.appendChild(logHdr);
+  const logBox = document.createElement("div");
+  logBox.className = "meta";
+  logBox.style.cssText = "margin:4px 0 0";
+  if (!rl.n) {
+    logBox.textContent = `No graded K predictions yet${rl.pending ? ` — ${rl.pending} logged and waiting on final boxscores` : " — the log starts filling the morning after the first slate"}. Every priced read is frozen at first sight, before first pitch. No revisions, no cherry-picking.`;
+  } else {
+    const beats = rl.brier_model < rl.brier_constant;
+    const ucol = rl.units > 0 ? "#4caf7d" : (rl.units < 0 ? "#d7483a" : "#7a8694");
+    logBox.innerHTML = `<b style="color:var(--white)">${rl.n}</b> graded starts over ${rl.days} day(s) — Brier <b style="color:var(--white)">${rl.brier_model}</b> vs constant ${rl.brier_constant} ${beats ? "<span style='color:#4caf7d'>✅</span>" : "<span style='color:#e0a12f'>⚠️</span>"} · paper units on logged edges ≥ +2% EV: <b style="color:${ucol}">${rl.units > 0 ? "+" : ""}${rl.units}u</b> (${rl.bets} bets, ${rl.wins} W)${rl.pending ? ` · ${rl.pending} awaiting grading` : ""} · frozen before first pitch, graded from real boxscores`;
+  }
+  main.appendChild(logBox);
+
+  const hdr = document.createElement("div");
+  hdr.className = "gamehdr";
+  hdr.textContent = "Today's K board — BETA (forward validation in progress)";
+  main.appendChild(hdr);
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.style.cssText = "margin:0 0 4px";
+  const built = j.built_at ? new Date(j.built_at * 1000).toLocaleTimeString() : "";
+  meta.innerHTML = `${j.lineups_posted ?? 0} of ${(j.starters || []).length} opposing lineups posted — unposted lineups are priced at league (9 unknown slots) and tighten as lineups drop. Board refreshes every ~15 min while viewed${built ? ` (built ${built})` : ""}${j.stale ? " — refreshing now" : ""}. EV = expected profit per $1 at the best live price, model-believed. Trust it only as far as the result log above earns it. Research, not advice.`;
+  main.appendChild(meta);
+
+  const rows = (j.starters || []).filter(s => s.status === "ok");
+  const noReads = (j.starters || []).filter(s => s.status !== "ok");
+  if (!rows.length) {
+    const none = document.createElement("div");
+    none.className = "state";
+    none.textContent = "No modelable starters on the slate yet.";
+    main.appendChild(none);
+  } else {
+    const box = document.createElement("div");
+    box.className = "board";
+    const sideCell = (s, side) => {
+      const o = s[side];
+      if (!o) return "<td>–</td>";
+      const ev = s["ev_" + side];
+      let evHtml = "";
+      if (s.ev_skipped) evHtml = `<span style="color:#7a8694" title="${s.ev_skipped}">push line</span>`;
+      else if (ev != null) {
+        const col = ev >= 2 ? "#4caf7d" : (ev <= -2 ? "#d7483a" : "#7a8694");
+        evHtml = `<span style="color:${col};font-weight:600">${ev > 0 ? "+" : ""}${ev}%</span>`;
+      }
+      return `<td>${o.price > 0 ? "+" : ""}${o.price} <span class="vs" style="display:inline">${o.book}</span><br>${evHtml}</td>`;
+    };
+    let h = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Starter</th><th style='text-align:left'>vs</th><th>Line</th><th>P(over)</th><th>Over · EV</th><th>Under · EV</th><th>Mean K</th><th>Lineup</th></tr></thead><tbody>";
+    for (const s of rows) {
+      const lu = s.lineup_posted
+        ? `${9 - (s.league_fallback_slots || 0)}/9${s.league_fallback_slots ? ` <span class="vs" style="display:inline" title="thin-sample slots priced at league">(${s.league_fallback_slots} @ lg)</span>` : ""}`
+        : `<span style="color:#e0a12f" title="all nine slots priced at league until the lineup posts">not posted</span>`;
+      h += `<tr><td class="name" style="cursor:default">${s.starter} <span class="vs">${s.team} ${s.hand}HP</span></td>
+        <td style="text-align:left;color:#7a8694;font-family:Inter">${s.opp}</td>
+        <td>${s.line != null ? s.line : "–"}</td>
+        <td style="color:var(--blue);font-weight:600">${s.p_over != null ? (s.p_over * 100).toFixed(1) + "%" : "–"}</td>
+        ${sideCell(s, "over")}${sideCell(s, "under")}
+        <td>${s.mean_k}</td><td>${lu}</td></tr>`;
+    }
+    h += "</tbody></table>";
+    box.innerHTML = h;
+    main.appendChild(box);
+  }
+  if (noReads.length) {
+    const nr = document.createElement("div");
+    nr.className = "meta";
+    nr.style.cssText = "margin:6px 0 0";
+    nr.innerHTML = "No read (house minimums): " + noReads.map(s => `${s.starter} <span class="vs" style="display:inline">${s.why}</span>`).join(" · ");
+    main.appendChild(nr);
+  }
+  setTimeout(() => { if (VIEW === "kboard") renderKBoard(); }, 120000);
 }
 
 function renderModelBoard() {
