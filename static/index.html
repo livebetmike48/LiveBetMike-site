@@ -299,7 +299,7 @@ async function renderKBoard() {
   meta.className = "meta";
   meta.style.cssText = "margin:0 0 4px";
   const built = j.built_at ? new Date(j.built_at * 1000).toLocaleTimeString() : "";
-  meta.innerHTML = `${j.lineups_posted ?? 0} of ${(j.starters || []).length} opposing lineups posted — unposted lineups are priced at league (9 unknown slots) and tighten as lineups drop. Board refreshes every ~15 min while viewed${built ? ` (built ${built})` : ""}${j.stale ? " — refreshing now" : ""}. EV = expected profit per $1 at the best live price, model-believed. Trust it only as far as the result log above earns it. Research, not advice.`;
+  meta.innerHTML = `${j.lineups_posted ?? 0} of ${(j.starters || []).length} opposing lineups posted — unposted lineups are priced at the opponent's real team K rate vs the starter's hand and tighten as lineups drop. Board refreshes every ~15 min while viewed${built ? ` (built ${built})` : ""}${j.stale ? " — refreshing now" : ""}. EV = expected profit per $1 at the best live price, model-believed. Trust it only as far as the result log above earns it. Research, not advice.`;
   main.appendChild(meta);
 
   const rows = (j.starters || []).filter(s => s.status === "ok");
@@ -328,7 +328,7 @@ async function renderKBoard() {
     for (const s of rows) {
       const lu = s.lineup_posted
         ? `${9 - (s.league_fallback_slots || 0)}/9${s.league_fallback_slots ? ` <span class="vs" style="display:inline" title="thin-sample slots priced at league">(${s.league_fallback_slots} @ lg)</span>` : ""}`
-        : `<span style="color:#e0a12f" title="all nine slots priced at league until the lineup posts">not posted</span>`;
+        : `<span style="color:#e0a12f" title="slots priced at the opponent's team K rate vs hand until the lineup posts">not posted</span>`;
       h += `<tr><td class="name" style="cursor:default">${s.starter} <span class="vs">${s.team} ${s.hand}HP</span></td>
         <td style="text-align:left;color:#7a8694;font-family:Inter">${s.opp}</td>
         <td>${s.line != null ? s.line : (s.fair_line != null ? `<span class="vs" style="display:inline" title="model fair line — the half-point the model prices at a coin flip; compare openers against it">model ${s.fair_line}</span>` : "–")}</td>
@@ -900,6 +900,20 @@ function renderKLab(main, kj) {
     <button class="winbtn" onclick="klabMarket()">Run K market test</button>
     <span class="meta" id="kmarket-status">${kj.market && kj.market.status === "running" ? "⏳ " + kj.market.progress : ((kj.market && kj.market.progress) || "historical pitcher_strikeouts closing lines (~20 credits/game); half-point lines only (no pushes)")}</span>`;
   main.appendChild(mCtl);
+
+  const bCtl = document.createElement("div");
+  bCtl.className = "winrow";
+  bCtl.style.marginTop = "6px";
+  bCtl.innerHTML = `
+    <button class="winbtn" onclick="klabBlend()">Fit market blend</button>
+    <select id="kblend-source"><option value="close" selected>closing lines</option><option value="open">opening lines</option></select>
+    <select id="kblend-test"><option value="30" selected>test last 30d</option><option value="14">test last 14d</option><option value="45">test last 45d</option></select>
+    <span class="meta" id="kblend-status">shrinks model toward the de-vigged market by a data-fit weight — fixes the winner's curse so a threshold means something. Reads stored bets (no credits). Run a market test first.</span>`;
+  main.appendChild(bCtl);
+  const bOut = document.createElement("div");
+  bOut.id = "kblend-out";
+  main.appendChild(bOut);
+
   if (kj.market && kj.market.status === "running") setTimeout(renderLab, 8000);
   for (const run of (kj.market_history || [])) {
     const rep = run.report;
@@ -987,6 +1001,54 @@ async function klabMarket() {
   document.getElementById("kmarket-status").textContent =
     j.error ? "✖ " + j.error : (j.started ? "⏳ started…" : "already running");
   if (j.started) setTimeout(renderLab, 5000);
+}
+
+async function klabBlend() {
+  const el = document.getElementById("kblend-status");
+  const out = document.getElementById("kblend-out");
+  el.textContent = "fitting blend on stored bets…";
+  out.innerHTML = "";
+  const source = document.getElementById("kblend-source").value;
+  const test_days = parseInt(document.getElementById("kblend-test").value);
+  const r = await fetch("/api/klab/blend", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({token: labToken(), source: source, test_days: test_days})});
+  const j = await r.json();
+  if (j.error) { el.textContent = "✖ " + j.error; return; }
+  el.textContent = `fitted on ${j.train_bets} train bets, tested on ${j.test_bets} held-out bets` +
+    (j.dropped_no_market ? ` (${j.dropped_no_market} dropped: book priced one side only)` : "");
+
+  const rec = j.recommended;
+  const evs = j.ev_grid;
+  // recommendation banner
+  let h = "";
+  if (rec) {
+    h += `<div class="board" style="margin:8px 0;padding:12px 14px;font-family:'IBM Plex Mono',monospace">
+      <div style="color:var(--blue);font-weight:600;font-size:13px">Recommended operating point (from held-out data)</div>
+      <div style="margin-top:4px">Blend weight <b>w = ${j.fitted_w}</b> · bet only blended EV ≥ <b>+${rec.min_ev}%</b></div>
+      <div style="margin-top:2px">On the ${j.test_bets} test bets it never saw: <b style="color:${rec.roi>=0?'#4caf7d':'#d7483a'}">${rec.units>=0?'+':''}${rec.units}u, ${rec.roi>=0?'+':''}${rec.roi}% ROI</b> (${rec.wins}-${rec.bets-rec.wins}, ${rec.bets} bets)</div>
+      <div class="meta" style="margin-top:4px">w=1 is pure model, w=0 is pure market. Lower w = more shrinkage toward the books.</div>
+    </div>`;
+  } else {
+    h += `<div class="meta" style="margin:8px 0">No operating point cleared the volume floor on test days — need more stored bets. Run a longer market test.</div>`;
+  }
+
+  // full sweep table: rows = w, cols = min_ev, cells = test ROI
+  h += `<div style="overflow-x:auto"><table style="font-family:'IBM Plex Mono',monospace;font-size:12px;margin-top:4px">
+    <thead><tr><th style="text-align:left">w \\ min EV</th>${evs.map(e=>`<th>+${e}%</th>`).join("")}</tr></thead><tbody>`;
+  for (const row of j.test_grid) {
+    const isFit = row.w === j.fitted_w;
+    h += `<tr${isFit?' style="background:rgba(47,111,237,0.12)"':''}><td style="text-align:left">${isFit?'▶ ':''}${row.w}</td>`;
+    for (const e of evs) {
+      const c = row.by_ev[e];
+      if (!c || c.bets === 0 || c.roi === null) { h += `<td class="meta">–</td>`; continue; }
+      const col = c.roi >= 5 ? "#4caf7d" : (c.roi <= 0 ? "#d7483a" : "var(--white)");
+      h += `<td title="${c.bets} bets, ${c.units>=0?'+':''}${c.units}u"><b style="color:${col}">${c.roi>=0?'+':''}${c.roi}%</b><br><span class="meta" style="font-size:10px">${c.bets}</span></td>`;
+    }
+    h += `</tr>`;
+  }
+  h += `</tbody></table></div>
+    <div class="meta" style="margin-top:6px">Held-out test ROI at each blend weight (rows) and minimum blended-EV threshold (columns); small number = bet count. ▶ = the weight fit on the training days. This is out-of-sample — the fit never saw these bets. Green ≥5% ROI.</div>`;
+  out.innerHTML = h;
 }
 
 async function klabFitCalib() {
