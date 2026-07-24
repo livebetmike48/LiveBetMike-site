@@ -209,10 +209,43 @@ def run_k_backtest(days: int, progress=None) -> dict:
     }
 
 
-def run_k_market_backtest(days: int, progress=None) -> dict:
+K_OPEN_SNAPSHOT_UTC = "16:00:00"   # ~noon ET -- "opening" K lines snapshot
+
+
+def _line_movement(open_priced: dict, close_priced: dict) -> str | None:
+    """Which side did the market move toward between open and close for
+    this pitcher? Line change decides; same line -> average over-price
+    change decides; ~flat -> 'flat'. None when close is unpriced."""
+    if not close_priced or close_priced.get("point") is None:
+        return None
+    lo, lc = open_priced["point"], close_priced["point"]
+    if lc > lo:
+        return "over"
+    if lc < lo:
+        return "under"
+    def avg_dec(p):
+        vals = [odds_api.american_to_decimal(v) for v in (p.get("prices") or {}).values()]
+        return sum(vals) / len(vals) if vals else None
+    do, dc = avg_dec(open_priced), avg_dec(close_priced)
+    if do is None or dc is None:
+        return None
+    if dc < do * 0.99:
+        return "over"      # over price shortened -> market moved toward over
+    if dc > do * 1.01:
+        return "under"
+    return "flat"
+
+
+def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> dict:
     """Walk past days: point-in-time K distribution per start, joined to
-    the REAL historical closing pitcher_strikeouts line, flat-betting every
-    edge above each threshold. Units don't lie."""
+    the REAL historical pitcher_strikeouts line, flat-betting every edge
+    above each threshold. Units don't lie.
+
+    vs_open=True prices and grades against the ~noon-ET OPENING snapshot
+    instead of close -- the bet Mike actually places -- and, since the
+    closing snapshot is fetched anyway, reports CLV: how often the close
+    moved TOWARD the model's bet. Movement converges on truth far faster
+    than units. Roughly doubles credits (two snapshots per game)."""
     p_league = kmodel.league_k_rate()
     end = datetime.now(timezone.utc) - timedelta(hours=4)
     hand_cache: dict = {}
@@ -243,9 +276,20 @@ def run_k_market_backtest(days: int, progress=None) -> dict:
             ev_match = odds_api.find_event(hist_events, starts[0]["home_name"], starts[0]["away_name"])
             if not ev_match:
                 continue
-            snapshot_at = ev_match.get("commence_time") or f"{date_str}T23:00:00Z"
-            odds_data = odds_api.get_historical_event_odds(
-                ev_match.get("id"), snapshot_at, market="pitcher_strikeouts")
+            close_at = ev_match.get("commence_time") or f"{date_str}T23:00:00Z"
+            if vs_open:
+                open_data = odds_api.get_historical_event_odds(
+                    ev_match.get("id"), f"{date_str}T{K_OPEN_SNAPSHOT_UTC}Z",
+                    market="pitcher_strikeouts")
+                close_data = odds_api.get_historical_event_odds(
+                    ev_match.get("id"), close_at, market="pitcher_strikeouts")
+                odds_data = open_data
+                if not odds_data:
+                    continue  # no opener posted by the snapshot -- skip honestly
+            else:
+                close_data = None
+                odds_data = odds_api.get_historical_event_odds(
+                    ev_match.get("id"), close_at, market="pitcher_strikeouts")
             if not odds_data:
                 continue
             games_priced += 1
@@ -269,17 +313,32 @@ def run_k_market_backtest(days: int, progress=None) -> dict:
                         continue  # >20% edges vs closing K lines = model error, not value
                     if ev >= min(backtest.THRESHOLDS):
                         cleared = 1 if s["actual_k"] > line else 0
-                        candidates.append({"date": date_str, "name": s["name"],
-                                           "side": side, "line": line,
-                                           "price": bp[1], "ev": round(ev, 1),
-                                           "hit": cleared})
+                        cand = {"date": date_str, "name": s["name"],
+                                "side": side, "line": line,
+                                "price": bp[1], "ev": round(ev, 1),
+                                "hit": cleared}
+                        if vs_open:
+                            close_priced = odds_api.player_prop_prices(
+                                close_data, "pitcher_strikeouts", s["name"], side=side)                                 if close_data else None
+                            cand["clv"] = _line_movement(priced, close_priced)
+                        candidates.append(cand)
             if progress:
                 progress(i, days, games_priced, len(candidates))
 
     report = {"days": days, "games_priced": games_priced,
               "suspect_excluded": suspect,
-              "credits_estimate": games_priced * 20 + days,
+              "credits_estimate": games_priced * (40 if vs_open else 20) + days,
               "candidates": len(candidates),
               "by_threshold": backtest._simulate_bets(candidates)}
+    if vs_open:
+        report["vs_open"] = True
+        toward = sum(1 for c in candidates if c.get("clv") == c["side"])
+        against = sum(1 for c in candidates
+                      if c.get("clv") not in (None, "flat", c["side"]))
+        flat = sum(1 for c in candidates if c.get("clv") == "flat")
+        n = toward + against + flat
+        report["clv"] = {"n": n, "toward": toward, "against": against, "flat": flat,
+                         "agree_pct": round(toward / (toward + against) * 100, 1)
+                         if (toward + against) else None}
     report["sample_bets"] = sorted(candidates, key=lambda c: -c["ev"])[:12]
     return report
