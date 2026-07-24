@@ -238,9 +238,15 @@ function reprojectPitcher(inp) {
 }
 
 let KDAY = 0;
+let KB_STARTERS = [];
 async function renderKBoard() {
-  const main = document.getElementById("main");
-  main.innerHTML = "<div class='state'>Loading K board…</div>";
+  const outer = document.getElementById("main");
+  let main = document.getElementById("kb-live");
+  if (!main) {
+    outer.innerHTML = "<div id='kb-live'><div class='state'>Loading K board…</div></div><div id='kb-sim'></div>";
+    main = document.getElementById("kb-live");
+    renderKSim();
+  }
   let j;
   try {
     const r = await fetch("/api/kboard?d=" + KDAY);
@@ -250,8 +256,10 @@ async function renderKBoard() {
     setTimeout(() => { if (VIEW === "kboard") renderKBoard(); }, 8000);
     return;
   }
-  if (VIEW !== "kboard") return;
+  if (VIEW !== "kboard" || !document.getElementById("kb-live")) return;
   main.innerHTML = "";
+  KB_STARTERS = (j.starters || []).filter(s => s.status === "ok");
+  ksimStarterOptions();
   if (j.error) { main.innerHTML = `<div class='state'>✖ ${j.error}</div>`; return; }
   if (j.status === "warming" && !j.starters) {
     main.innerHTML = `<div class='state'>Modeling today's starters (${j.progress || "starting"}) — first build takes a couple minutes, then it's cached.<div class='bar'><i></i></div></div>`;
@@ -340,6 +348,90 @@ async function renderKBoard() {
     main.appendChild(nr);
   }
   setTimeout(() => { if (VIEW === "kboard") renderKBoard(); }, 120000);
+}
+
+let KSIM_PLAYERS = null;
+function renderKSim() {
+  const box = document.getElementById("kb-sim");
+  if (!box || box.childElementCount) return;
+  let slots = "";
+  for (let i = 1; i <= 9; i++)
+    slots += `<input id="ksim-b${i}" list="ksim-players" placeholder="${i}. batter (blank = league)" style="width:230px;margin:2px 4px 2px 0;background:#0d1420;border:1px solid #26303e;color:var(--white);padding:5px 8px;border-radius:4px;font-size:12.5px" onfocus="ksimLoadPlayers()">${i % 3 === 0 ? "<br>" : ""}`;
+  box.innerHTML = `
+    <div class="gamehdr" style="margin-top:18px">K Sim — run any lineup through the model</div>
+    <div class="meta" style="margin:2px 0 6px">You know projected lineups before the boxscore does — type one in and see what the model thinks with it. Same validated model as the board; blank slots price at league. Nothing here is logged, posted, or saved.</div>
+    <div class="winrow" style="flex-wrap:wrap">
+      <select id="ksim-starter" style="max-width:280px"></select>
+      <span class="meta">starter (from the ${KDAY === 1 ? "tomorrow" : "today"} board)</span>
+    </div>
+    <datalist id="ksim-players"></datalist>
+    <div style="margin:4px 0">${slots}</div>
+    <div class="winrow">
+      <button class="winbtn" onclick="ksimRun()">Run sim</button>
+      <span class="meta" id="ksim-status"></span>
+    </div>
+    <div id="ksim-out"></div>`;
+  ksimStarterOptions();
+}
+function ksimStarterOptions() {
+  const sel = document.getElementById("ksim-starter");
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = KB_STARTERS.map(s =>
+    `<option value="${s.starter_id}">${s.starter} (${s.team} v ${s.opp})</option>`).join("")
+    || "<option value=''>board still loading…</option>";
+  if (cur && [...sel.options].some(o => o.value === cur)) sel.value = cur;
+}
+async function ksimLoadPlayers() {
+  if (KSIM_PLAYERS) return;
+  KSIM_PLAYERS = [];
+  try {
+    const r = await fetch("/api/kplayers");
+    const j = await r.json();
+    KSIM_PLAYERS = j.players || [];
+    document.getElementById("ksim-players").innerHTML =
+      KSIM_PLAYERS.map(p => `<option value="${p.name}">`).join("");
+  } catch (e) { KSIM_PLAYERS = null; }
+}
+async function ksimRun() {
+  const st = document.getElementById("ksim-status");
+  const sid = parseInt(document.getElementById("ksim-starter").value || "0");
+  if (!sid) { st.textContent = "pick a starter (let the board load first)"; return; }
+  const ids = []; const misses = [];
+  for (let i = 1; i <= 9; i++) {
+    const name = document.getElementById("ksim-b" + i).value.trim();
+    if (!name) { ids.push(null); continue; }
+    const hit = (KSIM_PLAYERS || []).find(p => p.name.toLowerCase() === name.toLowerCase());
+    if (hit) ids.push(hit.id); else { ids.push(null); misses.push(name); }
+  }
+  st.textContent = "simulating…";
+  const r = await fetch("/api/ksim", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({starter_id: sid, batter_ids: ids, d: KDAY})});
+  const j = await r.json();
+  if (j.error) { st.textContent = "✖ " + j.error; return; }
+  st.textContent = misses.length ? `⚠️ not matched (priced at league): ${misses.join(", ")}` : "done";
+  const out = document.getElementById("ksim-out");
+  const ladder = j.ladder.map(l => `<td>${l.line}<br><b style="color:var(--blue)">${(l.p_over*100).toFixed(1)}%</b></td>`).join("");
+  let mkt = "";
+  if (j.market) {
+    const m = j.market;
+    const cell = (side) => {
+      const bk = m[side]; if (!bk) return "–";
+      const ev = m["ev_" + side];
+      return `${bk.price > 0 ? "+" : ""}${bk.price} ${bk.book}` +
+        (ev != null ? ` · EV <b style="color:${ev >= 2 ? "#4caf7d" : (ev <= -2 ? "#d7483a" : "#7a8694")}">${ev > 0 ? "+" : ""}${ev}%</b>` : (m.ev_skipped ? " · push line" : ""));
+    };
+    mkt = `<div style="margin-top:8px">Market line <b>${m.line}</b>: simmed P(over) <b style="color:var(--blue)">${(m.p_over*100).toFixed(1)}%</b> (board had ${(m.board_p_over*100).toFixed(1)}%) — O ${cell("over")} | U ${cell("under")} <span class="vs" style="display:inline">at last board prices — may be stale</span></div>`;
+  } else {
+    mkt = `<div class="meta" style="margin-top:8px">no priced line cached for this starter — model line is your number vs the opener</div>`;
+  }
+  const slots = j.slots.map(s => `<div>${s.slot}. ${s.name || "league"} — ${s.basis} · K/PA ${(s.p_k_per_pa*100).toFixed(1)}%</div>`).join("");
+  out.innerHTML = `<div class="board" style="margin-top:10px"><div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">
+    <div style="color:var(--blue);font-weight:600">${j.starter} (${j.hand}HP${j.slate ? ", " + j.slate.team + " v " + j.slate.opp : ""}) — projected <b>${j.mean_k}</b> K over ${j.tbf_mean} TBF · model line <b>${j.fair_line}</b>${j.league_fallback_slots ? ` · ${j.league_fallback_slots} league slot(s)` : ""}${j.park_k_factor ? ` · park ${j.park_k_factor}` : ""}</div>
+    <table style="margin-top:8px;text-align:center"><thead><tr><th colspan="5" style="text-align:left">P(over) ladder</th></tr></thead><tbody><tr>${ladder}</tr></tbody></table>
+    ${mkt}
+    <div style="margin-top:8px;color:#7a8694">${slots}</div>
+  </div></div>`;
 }
 
 function renderModelBoard() {
