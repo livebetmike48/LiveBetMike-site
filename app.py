@@ -165,7 +165,7 @@ def api_klab_market(payload: dict):
     days = int(payload.get("days", 14))
     if days not in (7, 14, 30, 60, 120):
         return {"error": "days must be 7/14/30/60/120"}
-    return {"started": lab.run_k_market_async(days)}
+    return {"started": lab.run_k_market_async(days, bool(payload.get("vs_open")))}
 
 
 @app.post("/api/klab/fit")
