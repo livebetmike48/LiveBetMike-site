@@ -70,6 +70,14 @@ def api_kboard(d: int = 0):
         return {"error": str(e)}
 
 
+@app.get("/api/klog")
+def api_klog(days: int = 1):
+    try:
+        return kboard.log_details(days)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/api/lab/run")
 def api_lab_run(payload: dict):
     # token in the BODY, never the URL -- URLs get written to logs
