@@ -108,6 +108,12 @@ def init_db():
             ts INTEGER, days INTEGER, config TEXT, report TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS k_market_runs (
             ts INTEGER, days INTEGER, report TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS k_market_bets (
+            run_ts INTEGER, date TEXT, name TEXT, side TEXT, line REAL,
+            price INTEGER, ev REAL, hit INTEGER, model_prob REAL,
+            model_prob_raw REAL, market_prob REAL, vs_open INTEGER)""")
+        c.execute("""CREATE INDEX IF NOT EXISTS idx_kmbets_ts
+            ON k_market_bets(run_ts)""")
 
 
 def load_priors_csv(csv_text: str) -> dict:
@@ -484,9 +490,18 @@ def run_k_market_async(days: int, vs_open: bool = False) -> bool:
             report = kbacktest.run_k_market_backtest(days, progress=_progress,
                                                      vs_open=vs_open)
             init_db()
+            ts = int(time.time())
+            cands = report.pop("_candidates", [])  # strip full list out of the display report
             with _conn() as c:
                 c.execute("INSERT INTO k_market_runs VALUES (?, ?, ?)",
-                          (int(time.time()), days, json.dumps(report)))
+                          (ts, days, json.dumps(report)))
+                if cands:
+                    c.executemany(
+                        "INSERT INTO k_market_bets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        [(ts, c_["date"], c_["name"], c_["side"], c_["line"],
+                          c_["price"], c_["ev"], c_["hit"], c_.get("model_prob"),
+                          c_.get("model_prob_raw"), c_.get("market_prob"),
+                          1 if vs_open else 0) for c_ in cands])
             _k_market_state.update({"status": "idle", "progress": "done"})
         except Exception as e:
             log.error("k market backtest failed: %s", e)
@@ -496,7 +511,37 @@ def run_k_market_async(days: int, vs_open: bool = False) -> bool:
     return True
 
 
-def k_lab_state() -> dict:
+def fit_k_blend(test_days: int = 30, source: str = "close") -> dict:
+    """Pull the stored per-bet candidates from the most recent LARGE market
+    run of the requested source (close or open) and fit the blend on them.
+    Reads bets, never re-spends credits. Uses the newest run that has bets
+    so the fit reflects current model config."""
+    init_db()
+    want_open = 1 if source == "open" else 0
+    with _conn() as c:
+        row = c.execute(
+            "SELECT run_ts, COUNT(*) n, MIN(date) mn, MAX(date) mx "
+            "FROM k_market_bets WHERE vs_open=? GROUP BY run_ts "
+            "ORDER BY run_ts DESC", (want_open,)).fetchall()
+        if not row:
+            return {"error": f"no stored {source} market bets yet — run a "
+                             f"K market test ({'opener' if want_open else 'closing'} "
+                             f"lines) first, then fit"}
+        # pick the newest run with the widest date span (most days = best split)
+        best = max(row, key=lambda r: (r[1] >= 50, r[0]))
+        run_ts = best[0]
+        bets = [dict(zip(
+            ["date", "name", "side", "line", "price", "ev", "hit",
+             "model_prob", "model_prob_raw", "market_prob"], r))
+            for r in c.execute(
+            "SELECT date, name, side, line, price, ev, hit, model_prob, "
+            "model_prob_raw, market_prob FROM k_market_bets WHERE run_ts=?",
+            (run_ts,)).fetchall()]
+    result = kbacktest.fit_blend(bets, test_days=test_days)
+    result["source"] = source
+    result["run_ts"] = run_ts
+    result["total_stored_bets"] = len(bets)
+    return result
     init_db()
     runs = []
     market = []
