@@ -242,20 +242,32 @@ def get_events() -> list[dict]:
         return []
 
 
-def get_event_props(event_id: str, market_key: str) -> dict | None:
+def get_event_props(event_id: str, market_key: str,
+                    bookmakers: str | None = None) -> dict | None:
     """One event's prop odds for one market, cached 30 min. None if the
-    plan/books don't carry it -- callers degrade gracefully."""
+    plan/books don't carry it -- callers degrade gracefully.
+    bookmakers: optional comma-separated book keys (e.g.
+    "fanduel,draftkings,betmgm,williamhill_us"); replaces the regions
+    param when given -- fewer books returned AND cheaper (<=10 named books
+    bills as 1 unit vs 2 for both regions). Cache is keyed per filter so
+    filtered and unfiltered callers never cross-contaminate."""
     if not API_KEY or not event_id:
         return None
     now = time.time()
-    key = (event_id, market_key)
+    key = (event_id, market_key, bookmakers or "")
     cached = _event_cache.get(key)
     if cached and now - cached[0] < CACHE_SECONDS:
         return cached[1]
+    params = {"apiKey": API_KEY, "markets": market_key, "oddsFormat": "american",
+              "includeLinks": "true", "includeSids": "true"}
+    if bookmakers:
+        params["bookmakers"] = bookmakers
+    else:
+        params["regions"] = REGIONS
     try:
         resp = requests.get(
             f"{EVENTS_BASE}/{event_id}/odds",
-            params={"apiKey": API_KEY, "regions": REGIONS, "markets": market_key, "oddsFormat": "american", "includeLinks": "true", "includeSids": "true"},
+            params=params,
             timeout=20,
         )
         if resp.status_code != 200:
