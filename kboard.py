@@ -532,7 +532,8 @@ def players_list() -> list[dict]:
     return _players_cache["players"]
 
 
-def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0) -> dict:
+def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0,
+               tbf_override: int | None = None) -> dict:
     """What-if: this starter vs an arbitrary 9-man order. Same
     k_distribution the backtests validated -- no separate sim math. Blank
     slots price at league exactly like an unposted lineup. Market compare
@@ -578,6 +579,23 @@ def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0) -> dict:
         before=None, park_k_factor=_park_k((slate_entry or {}).get("venue")))
     if kdist is None:
         return {"error": "model refuses this start (starter sample under house minimums)"}
+    tbf_mode = "workload mixture (his real start logs)"
+    if tbf_override:
+        # Fixed-TBF what-if (pitch limits, piggybacks, deep-leash days).
+        # Rebuilt from kmodel's OWN exported pieces -- the per-slot K probs
+        # the model just computed, its slot-PA arithmetic, its exact
+        # Poisson-binomial -- so a fixed-TBF sim can never drift from the
+        # validated math; only the workload assumption changes.
+        tbf = max(9, min(45, int(tbf_override)))
+        slot_probs = [s["p_k_per_pa"] for s in kdist["inputs"]["slots"]]
+        counts = kmodel.slot_pa_counts(tbf)
+        seq = [slot_probs[i] for i in range(9) for _ in range(counts[i])]
+        pb = kmodel.poisson_binomial(seq)
+        kdist = dict(kdist)
+        kdist["dist"] = [round(m, 6) for m in pb]
+        kdist["mean_k"] = round(sum(k * m for k, m in enumerate(pb)), 3)
+        kdist["tbf_mean"] = float(tbf)
+        tbf_mode = f"FIXED at {tbf} TBF (override)"
     ladder = []
     for half in range(3, 8):
         line = half + 0.5
@@ -608,6 +626,7 @@ def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0) -> dict:
             "league_fallback_slots": kdist["inputs"]["league_fallback_slots"],
             "park_k_factor": kdist["inputs"]["park_k_factor"],
             "slots": kdist["inputs"]["slots"],
+            "tbf_mode": tbf_mode,
             "ladder": ladder, "market": market}
 
 
