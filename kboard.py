@@ -400,6 +400,52 @@ def _build_board(date: str, progress: dict) -> dict:
             "built_at": int(time.time())}
 
 
+def log_details(days: int = 1) -> dict:
+    """Graded forward-log detail for the last N days -- the recap feed.
+    Grades pending rows first (cheap, no odds credits), then returns each
+    read with its paper-bet outcomes using the same >=EV_LOG_MIN flat-1u
+    convention as the summary, so the recap and the board can't disagree."""
+    days = max(1, min(30, days))
+    today = parlay.et_date_str(0)
+    try:
+        _grade_pending(today)
+    except Exception as e:
+        log.warning("klog grading pass failed: %s", e)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=4)
+              - timedelta(days=days)).strftime("%Y-%m-%d")
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT date, name, line, p_over, ev_over, price_over, book_over, "
+            "ev_under, price_under, book_under, actual_k, cleared, lineup_posted "
+            "FROM k_board_log WHERE date >= ? AND date < ? ORDER BY date, name",
+            (cutoff, today)).fetchall()
+    out_rows = []
+    units = bets = wins = 0
+    for (date, name, line, p_over, ev_o, pr_o, bk_o, ev_u, pr_u, bk_u,
+         actual, cleared, lineup) in rows:
+        row = {"date": date, "starter": name, "line": line,
+               "p_over": p_over, "actual_k": actual, "cleared": cleared,
+               "lineup_posted": bool(lineup), "bets": []}
+        if cleared is not None:
+            for side, ev, price, book, hit in (
+                    ("over", ev_o, pr_o, bk_o, cleared),
+                    ("under", ev_u, pr_u, bk_u, 1 - cleared)):
+                if ev is None or price is None or ev < EV_LOG_MIN:
+                    continue
+                u = round(odds_api.american_to_decimal(price) - 1, 2) if hit else -1.0
+                row["bets"].append({"side": side, "price": price, "book": book,
+                                    "ev": ev, "won": bool(hit), "units": u})
+                bets += 1
+                wins += 1 if hit else 0
+                units += u
+        out_rows.append(row)
+    return {"days": days, "rows": out_rows,
+            "graded": sum(1 for r in out_rows if r["cleared"] is not None),
+            "pending": sum(1 for r in out_rows if r["cleared"] is None),
+            "bets": bets, "wins": wins, "units": round(units, 2),
+            "overall": _result_log_summary()}
+
+
 def refresh(offset: int = 0) -> dict:
     """Synchronous build for background consumers (the K plays scanner):
     builds the board, freezes new log reads, and shares the result with
