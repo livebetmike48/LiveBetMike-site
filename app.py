@@ -70,6 +70,24 @@ def api_kboard(d: int = 0):
         return {"error": str(e)}
 
 
+@app.get("/api/kplayers")
+def api_kplayers():
+    try:
+        return {"players": kboard.players_list()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/ksim")
+def api_ksim(payload: dict):
+    try:
+        return kboard.sim_lineup(int(payload.get("starter_id") or 0),
+                                 payload.get("batter_ids") or [],
+                                 int(payload.get("d") or 0))
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/kvalidation")
 def api_kvalidation():
     try:
