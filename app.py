@@ -168,6 +168,18 @@ def api_klab_market(payload: dict):
     return {"started": lab.run_k_market_async(days, bool(payload.get("vs_open")))}
 
 
+@app.post("/api/klab/blend")
+def api_klab_blend(payload: dict):
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    try:
+        test_days = int(payload.get("test_days", 30))
+        source = "open" if payload.get("source") == "open" else "close"
+        return lab.fit_k_blend(test_days=test_days, source=source)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/api/klab/fit")
 def api_klab_fit(payload: dict):
     if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
