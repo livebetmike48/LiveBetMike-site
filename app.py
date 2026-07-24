@@ -1,7 +1,7 @@
 import logging
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 import os
@@ -85,6 +85,16 @@ def api_ksim(payload: dict):
                                  payload.get("batter_ids") or [],
                                  int(payload.get("d") or 0),
                                  int(payload["tbf"]) if payload.get("tbf") else None)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/klog.csv")
+def api_klog_csv(days: int = 400):
+    try:
+        return PlainTextResponse(kboard.log_csv(days), media_type="text/csv",
+                                 headers={"Content-Disposition":
+                                          "attachment; filename=k_forward_log.csv"})
     except Exception as e:
         return {"error": str(e)}
 
