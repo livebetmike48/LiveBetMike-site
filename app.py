@@ -83,7 +83,8 @@ def api_ksim(payload: dict):
     try:
         return kboard.sim_lineup(int(payload.get("starter_id") or 0),
                                  payload.get("batter_ids") or [],
-                                 int(payload.get("d") or 0))
+                                 int(payload.get("d") or 0),
+                                 int(payload["tbf"]) if payload.get("tbf") else None)
     except Exception as e:
         return {"error": str(e)}
 
