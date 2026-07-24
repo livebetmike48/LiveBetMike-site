@@ -467,6 +467,47 @@ def log_details(days: int = 1) -> dict:
             "overall": _result_log_summary()}
 
 
+def validation_summary() -> dict:
+    """The model's credentials: the newest stored K market test per window
+    (backtested vs real historical closing lines) plus the latest CALIBRATED
+    backtest -- read straight from the Lab's tables so Discord shows exactly
+    what the site shows. Clearly historical; the forward log is the live test."""
+    market = []
+    backtest = None
+    with _conn() as c:
+        seen_days = set()
+        for ts, days, report in c.execute(
+                "SELECT ts, days, report FROM k_market_runs ORDER BY ts DESC"):
+            if days in seen_days:
+                continue
+            seen_days.add(days)
+            rep = json.loads(report)
+            thr = (rep.get("by_threshold") or {}).get("2") or {}
+            market.append({"days": days, "ts": ts,
+                           "games": rep.get("games_priced"),
+                           "bets": thr.get("bets"), "wins": thr.get("wins"),
+                           "units": thr.get("units"), "roi_pct": thr.get("roi_pct")})
+        for ts, days, config, report in c.execute(
+                "SELECT ts, days, config, report FROM k_backtest_runs ORDER BY ts DESC"):
+            cfg = json.loads(config) if config else {}
+            if not cfg.get("k_calib_weight"):
+                continue
+            rep = json.loads(report)
+            if not rep.get("n"):
+                continue
+            beats = (rep.get("brier_model") is not None
+                     and rep["brier_model"] < (rep.get("brier_constant") or 1)
+                     and (rep.get("brier_naive") is None
+                          or rep["brier_model"] < rep["brier_naive"]))
+            backtest = {"days": days, "ts": ts, "n": rep["n"],
+                        "brier_model": rep.get("brier_model"),
+                        "brier_constant": rep.get("brier_constant"),
+                        "brier_naive": rep.get("brier_naive"), "beats": beats}
+            break
+    market.sort(key=lambda m: -(m["days"] or 0))
+    return {"market_tests": market[:4], "backtest": backtest}
+
+
 def refresh(offset: int = 0) -> dict:
     """Synchronous build for background consumers (the K plays scanner):
     builds the board, freezes new log reads, and shares the result with
