@@ -508,6 +508,109 @@ def validation_summary() -> dict:
     return {"market_tests": market[:4], "backtest": backtest}
 
 
+# ---------- K Sim: run any lineup through the exact validated model ----------
+
+_players_cache = {"date": None, "players": []}
+
+
+def players_list() -> list[dict]:
+    """All active MLB players (one schedule-API call, cached per day) --
+    feeds the sim's name autocomplete and id->name display."""
+    date = parlay.et_date_str(0)
+    if _players_cache["date"] == date and _players_cache["players"]:
+        return _players_cache["players"]
+    try:
+        season = date[:4]
+        data = requests.get(f"{MLB_BASE}/sports/1/players",
+                            params={"season": season}, timeout=30).json()
+        players = [{"id": p["id"], "name": p.get("fullName", "")}
+                   for p in data.get("people", []) if p.get("id")]
+        if players:
+            _players_cache.update({"date": date, "players": players})
+    except Exception as e:
+        log.warning("k sim: players fetch failed: %s", e)
+    return _players_cache["players"]
+
+
+def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0) -> dict:
+    """What-if: this starter vs an arbitrary 9-man order. Same
+    k_distribution the backtests validated -- no separate sim math. Blank
+    slots price at league exactly like an unposted lineup. Market compare
+    uses the cached board's prices only (no odds credits); the EVs are
+    recomputed for the SIMMED probabilities at those prices."""
+    offset = 1 if offset == 1 else 0
+    date = parlay.et_date_str(offset)
+    names = {p["id"]: p["name"] for p in players_list()}
+    try:
+        hand = parlay.get_starter_hand(starter_id)
+    except Exception:
+        hand = None
+    if hand not in ("L", "R"):
+        return {"error": "starter handedness unavailable"}
+    try:
+        s_rows = parlay.get_player_season_rows(starter_id, True)
+    except Exception:
+        s_rows = []
+    slate_entry = None
+    for g in _slate(date):
+        for side in ("home", "away"):
+            if g["teams"][side]["starter_id"] == starter_id:
+                slate_entry = {"game_pk": g["game_pk"], "venue": g.get("venue"),
+                               "team": g["teams"][side]["abbrev"],
+                               "opp": g["teams"]["away" if side == "home" else "home"]["abbrev"]}
+    lineup = []
+    for pid in (batter_ids or [])[:9]:
+        if not pid:
+            lineup.append(None)
+            continue
+        try:
+            rows = parlay.get_player_season_rows(int(pid), False)
+        except Exception:
+            lineup.append(None)
+            continue
+        side = _majority_side(rows)
+        lineup.append({"rows": rows, "side": side,
+                       "name": names.get(int(pid), str(pid))} if side else None)
+    while len(lineup) < 9:
+        lineup.append(None)
+    kdist = kmodel.k_distribution(
+        lineup, s_rows, hand, kmodel.league_k_rate(),
+        before=None, park_k_factor=_park_k((slate_entry or {}).get("venue")))
+    if kdist is None:
+        return {"error": "model refuses this start (starter sample under house minimums)"}
+    ladder = []
+    for half in range(3, 8):
+        line = half + 0.5
+        pr = kmodel.price_line(kdist, line)
+        ladder.append({"line": line, "p_over": pr["p_over"]})
+    market = None
+    with _lock:
+        cached = (_boards.get(date) or {}).get("data")
+    if cached:
+        for s in cached.get("starters", []):
+            if s.get("starter_id") == starter_id and s.get("line") is not None:
+                pr = kmodel.price_line(kdist, s["line"])
+                market = {"line": s["line"], "p_over": pr["p_over"],
+                          "board_p_over": s.get("p_over"),
+                          "over": s.get("over"), "under": s.get("under"),
+                          "ev_skipped": s.get("ev_skipped")}
+                if not s.get("ev_skipped"):
+                    for side, p in (("over", pr["p_over"]), ("under", pr["p_under"])):
+                        bk = s.get(side)
+                        if bk:
+                            market["ev_" + side] = round(
+                                (p * odds_api.american_to_decimal(bk["price"]) - 1) * 100, 1)
+                break
+    return {"date": date, "starter": names.get(starter_id, str(starter_id)),
+            "hand": hand, "slate": slate_entry,
+            "mean_k": kdist["mean_k"], "tbf_mean": kdist["tbf_mean"],
+            "fair_line": _fair_line(kdist),
+            "league_fallback_slots": kdist["inputs"]["league_fallback_slots"],
+            "park_k_factor": kdist["inputs"]["park_k_factor"],
+            "slots": kdist["inputs"]["slots"],
+            "ladder": ladder, "market": market}
+
+
 def refresh(offset: int = 0) -> dict:
     """Synchronous build for background consumers (the K plays scanner):
     builds the board, freezes new log reads, and shares the result with
