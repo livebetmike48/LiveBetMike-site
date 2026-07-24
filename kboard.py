@@ -43,6 +43,12 @@ MLB_BASE = "https://statsapi.mlb.com/api/v1"
 DB_PATH = os.getenv("DB_PATH", "odds_history.db")
 REFRESH_SECONDS = 900   # rebuild at most every 15 min, and only when viewed
 EV_LOG_MIN = 2.0        # paper-track units simulate flat-betting edges >= this
+# The K model prices against the MAIN books only -- lines you can actually
+# bet. Soft/regional books produced fantasy best-prices and fantasy EVs.
+# Comma-separated Odds API book keys; also halves prop-credit cost
+# (named books <=10 bill as 1 unit vs 2 for both regions).
+KBOARD_BOOKS = os.getenv("KBOARD_BOOKS",
+                         "fanduel,draftkings,betmgm,williamhill_us")
 
 _boards: dict = {}   # date -> {"status", "data", "built", "progress"}
 _graded_on: set = set()
@@ -298,7 +304,8 @@ def _price_starter(events, home_name, away_name, starter_name, kdist):
     ev_match = odds_api.find_event(events, home_name, away_name) if events else None
     if not ev_match:
         return out
-    props = odds_api.get_event_props(ev_match.get("id"), "pitcher_strikeouts")
+    props = odds_api.get_event_props(ev_match.get("id"), "pitcher_strikeouts",
+                                     bookmakers=KBOARD_BOOKS)
     if not props:
         return out
     over = odds_api.player_prop_prices(props, "pitcher_strikeouts", starter_name, side="over")
