@@ -10,6 +10,7 @@ import matchups
 import bullpen
 import lab
 import kboard
+import kplays
 import projections
 import pitchers as pitchers_mod
 
@@ -18,6 +19,8 @@ LAB_TOKEN = os.getenv("LAB_TOKEN", "")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 app = FastAPI(title="Matchup Board")
+
+kplays.start()  # K play auto-poster: OFF unless DISCORD_KPLAYS_WEBHOOK is set
 
 
 @app.get("/api/matchups")
@@ -60,9 +63,9 @@ def api_lab():
 
 
 @app.get("/api/kboard")
-def api_kboard():
+def api_kboard(d: int = 0):
     try:
-        return kboard.get_board()
+        return kboard.get_board(d)
     except Exception as e:
         return {"error": str(e)}
 
