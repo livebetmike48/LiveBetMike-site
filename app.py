@@ -70,6 +70,14 @@ def api_kboard(d: int = 0):
         return {"error": str(e)}
 
 
+@app.get("/api/kvalidation")
+def api_kvalidation():
+    try:
+        return kboard.validation_summary()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/klog")
 def api_klog(days: int = 1):
     try:
