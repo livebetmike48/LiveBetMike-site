@@ -270,7 +270,7 @@ async function renderKBoard() {
   const rl = j.result_log || {};
   const logHdr = document.createElement("div");
   logHdr.className = "gamehdr";
-  logHdr.textContent = "Permanent K result log (forward, out-of-sample)";
+  logHdr.innerHTML = `Permanent K result log (forward, out-of-sample) <a href="/api/klog.csv?days=400" download style="color:var(--blue);font-size:12px;font-weight:400;margin-left:8px">⬇ download CSV</a>`;
   main.appendChild(logHdr);
   const logBox = document.createElement("div");
   logBox.className = "meta";
