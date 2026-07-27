@@ -243,8 +243,9 @@ async function renderKBoard() {
   const outer = document.getElementById("main");
   let main = document.getElementById("kb-live");
   if (!main) {
-    outer.innerHTML = "<div id='kb-live'><div class='state'>Loading K board…</div></div><div id='kb-sim'></div>";
+    outer.innerHTML = "<div id='kb-live'><div class='state'>Loading K board…</div></div><div id='kb-recap'></div><div id='kb-sim'></div>";
     main = document.getElementById("kb-live");
+    renderKRecap();
     renderKSim();
   }
   let j;
@@ -351,6 +352,97 @@ async function renderKBoard() {
 }
 
 let KSIM_PLAYERS = null;
+
+// ---------- Recent results: the forward log, bet by bet (/api/klog) ----------
+// Lives OUTSIDE #kb-live so the board's 2-min auto-refresh never wipes it or
+// re-fires the fetch; loads once per tab visit + on window change. Reads the
+// same frozen log as the summary and the bot's /recap — zero odds credits.
+let KRECAP_DAYS = 7;
+function renderKRecap() {
+  const box = document.getElementById("kb-recap");
+  if (!box || box.childElementCount) return;
+  box.innerHTML = `
+    <div class="gamehdr" style="margin-top:18px">Recent results — every logged read, graded</div>
+    <div class="winrow" id="krecap-btns"></div>
+    <div id="krecap-out"><div class="meta" style="margin-top:6px">loading…</div></div>`;
+  krecapButtons();
+  krecapLoad();
+}
+function krecapButtons() {
+  const row = document.getElementById("krecap-btns");
+  if (!row) return;
+  const wins = [[1, "Yesterday"], [3, "3d"], [7, "7d"], [14, "14d"], [30, "30d"]];
+  row.innerHTML = wins.map(([d, label]) =>
+    `<button class="winbtn ${KRECAP_DAYS === d ? "active" : ""}" onclick="KRECAP_DAYS=${d};krecapButtons();krecapLoad()">${label}</button>`
+  ).join("") + `<span class="meta">frozen before first pitch, graded from real boxscores — same data as the summary above and the CSV</span>`;
+}
+async function krecapLoad() {
+  const out = document.getElementById("krecap-out");
+  if (!out) return;
+  out.innerHTML = `<div class="meta" style="margin-top:6px">loading…</div>`;
+  let d;
+  try {
+    const r = await fetch("/api/klog?days=" + KRECAP_DAYS);
+    d = await r.json();
+  } catch (e) {
+    out.innerHTML = `<div class="meta" style="margin-top:6px">✖ recap request failed — refresh in a minute</div>`;
+    return;
+  }
+  if (!out.isConnected) return;
+  if (d.error) { out.innerHTML = `<div class="meta" style="margin-top:6px">✖ ${d.error}</div>`; return; }
+  const rows = d.rows || [];
+  if (!rows.length) {
+    out.innerHTML = `<div class="meta" style="margin-top:6px">No reads frozen in this window — the log only fills on days the board was built before first pitch.</div>`;
+    return;
+  }
+
+  // window stats strip — the numbers come from the site, never recomputed here
+  const ucol = d.units > 0 ? "#4caf7d" : (d.units < 0 ? "#d7483a" : "#7a8694");
+  const beats = d.brier != null && d.brier_constant != null && d.brier < d.brier_constant;
+  let h = `<div class="meta" style="margin:6px 0 0">`;
+  if (d.bets) {
+    h += `Paper bets (≥ +2% EV, flat 1u): <b style="color:var(--white)">${d.wins}-${d.bets - d.wins}</b> · <b style="color:${ucol}">${d.units > 0 ? "+" : ""}${d.units}u</b>${d.roi != null ? ` (${d.roi > 0 ? "+" : ""}${d.roi}% ROI)` : ""}`;
+  } else {
+    h += `No qualifying paper bets in this window`;
+  }
+  if (d.graded) {
+    h += ` · ${d.graded} reads graded${d.brier != null ? `, Brier <b style="color:var(--white)">${d.brier}</b> vs ${d.brier_constant} ${beats ? "<span style='color:#4caf7d'>✅</span>" : "<span style='color:#e0a12f'>⚠️</span>"}` : ""}${d.lean_hits != null ? ` · lean ${d.lean_hits}/${d.graded}` : ""}`;
+  }
+  if (d.pending) h += ` · ${d.pending} awaiting grading`;
+  h += `</div>`;
+
+  // rows, newest date first, grouped by date
+  const byDate = {};
+  for (const r of rows) (byDate[r.date] = byDate[r.date] || []).push(r);
+  const dates = Object.keys(byDate).sort().reverse();
+  h += `<div class="board" style="margin-top:10px"><div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">`;
+  for (const date of dates) {
+    h += `<div style="color:var(--blue);font-weight:600;margin-top:8px">${date}</div>`;
+    for (const r of byDate[date]) {
+      const actual = r.actual_k != null ? `${r.actual_k} K` : "pending";
+      if (r.bets && r.bets.length) {
+        for (const b of r.bets) {
+          const mark = b.won == null ? "⏳" : (b.won ? "✅" : "❌");
+          const units = b.units == null ? "" :
+            ` · <b style="color:${b.units > 0 ? "#4caf7d" : "#d7483a"}">${b.units > 0 ? "+" : ""}${b.units}u</b>`;
+          h += `<div style="margin-top:2px">${mark} <b>${r.starter}</b> ${b.side === "over" ? "O" : "U"} ${r.line} ${b.price > 0 ? "+" : ""}${b.price} <span class="vs" style="display:inline">${b.book || ""}</span> (EV +${b.ev}%) → ${actual}${units}${r.lineup_posted ? "" : ` <span class="vs" style="display:inline" title="logged before the opposing lineup posted">🟡 pre-lineup</span>`}</div>`;
+        }
+      } else {
+        const lean = r.p_over != null && r.p_over >= 0.5 ? "over" : "under";
+        let leanMark = "";
+        if (r.cleared != null && r.p_over != null) {
+          leanMark = ((r.p_over >= 0.5) === !!r.cleared) ? "✅ lean hit" : "❌ lean miss";
+        } else if (r.cleared == null) {
+          leanMark = "⏳";
+        }
+        h += `<div style="margin-top:2px;color:#7a8694">— <b style="color:var(--white)">${r.starter}</b> ${r.line != null ? (lean === "over" ? "O " : "U ") + r.line : ""} no-bet read (model ${r.p_over != null ? (r.p_over * 100).toFixed(0) + "% over" : "–"}) → ${actual} ${leanMark}</div>`;
+      }
+    }
+  }
+  h += `</div></div>`;
+  out.innerHTML = h;
+}
+
 function renderKSim() {
   const box = document.getElementById("kb-sim");
   if (!box || box.childElementCount) return;
