@@ -53,8 +53,8 @@ EV_LOG_MAX = float(os.getenv("KBOARD_EV_LOG_MAX", "20.0"))
 # the forward record is directly comparable; bands answer the
 # winner's-curse question (does ROI fall as EV rises?) and isolate the
 # >20% zone the market tests exclude as suspect.
-EV_THRESHOLDS = (2.0, 5.0, 10.0)
-EV_BANDS = ((2.0, 5.0), (5.0, 10.0), (10.0, 20.0), (20.0, None))
+EV_THRESHOLDS = (2.0, 5.0, 10.0, 15.0)
+EV_BANDS = ((2.0, 5.0), (5.0, 10.0), (10.0, 15.0), (15.0, 20.0), (20.0, None))
 # The K model prices against the MAIN books only -- lines you can actually
 # bet. Soft/regional books produced fantasy best-prices and fantasy EVs.
 # Comma-separated Odds API book keys; also halves prop-credit cost
@@ -496,8 +496,9 @@ def _breakdown(graded_bets: list[dict]) -> dict:
         return {"bets": n, "wins": wins, "units": units, "roi": roi}
 
     thresholds = []
+    counted = [b for b in graded_bets if b["ev"] <= EV_LOG_MAX]
     for t in EV_THRESHOLDS:
-        s = _stats([b for b in graded_bets if b["ev"] >= t])
+        s = _stats([b for b in counted if b["ev"] >= t])
         s["min_ev"] = t
         thresholds.append(s)
     bands = []
