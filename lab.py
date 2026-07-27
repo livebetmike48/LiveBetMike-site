@@ -542,6 +542,9 @@ def fit_k_blend(test_days: int = 30, source: str = "close") -> dict:
     result["run_ts"] = run_ts
     result["total_stored_bets"] = len(bets)
     return result
+
+
+def k_lab_state() -> dict:
     init_db()
     runs = []
     market = []
