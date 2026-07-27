@@ -1033,6 +1033,41 @@ function renderKLab(main, kj) {
   bOut.id = "kblend-out";
   main.appendChild(bOut);
 
+  // EV-range BACKTEST: same band cuts as the live recap, computed over the
+  // stored per-bet market-test rows (zero credits). The backtested "before"
+  // to compare the forward log's bands against, cell for cell.
+  const bb = kj.band_backtest;
+  const bbHdr = document.createElement("div");
+  bbHdr.className = "gamehdr";
+  bbHdr.textContent = "EV-range backtest — stored market-test bets, same cuts as the live recap";
+  main.appendChild(bbHdr);
+  const bbBox = document.createElement("div");
+  if (!bb || bb.error) {
+    bbBox.className = "meta";
+    bbBox.textContent = (bb && bb.error) ? bb.error
+      : "run a K market test to populate per-bet storage — this table then computes free";
+  } else {
+    bbBox.className = "board";
+    bbBox.style.maxWidth = "560px";
+    const cell = (s) => {
+      if (!s || !s.bets) return `<td class="meta">–</td><td class="meta">–</td><td class="meta">–</td>`;
+      const col = s.units > 0 ? "#4caf7d" : (s.units < 0 ? "#d7483a" : "#7a8694");
+      return `<td>${s.wins}-${s.bets - s.wins}</td>` +
+        `<td style="color:${col};font-weight:600">${s.units > 0 ? "+" : ""}${s.units}u</td>` +
+        `<td>${s.roi != null ? (s.roi > 0 ? "+" : "") + s.roi + "%" : "–"}</td>`;
+    };
+    let bh = `<table><thead><tr><th style="text-align:left;padding-left:14px">EV bucket (${bb.total_bets} bets, ${bb.date_min} → ${bb.date_max}, vs ${bb.source} lines)</th><th>W-L</th><th>Units</th><th>ROI</th></tr></thead><tbody>`;
+    for (const t of bb.thresholds) bh += `<tr><td class="name" style="cursor:default">≥ +${t.min_ev}%</td>${cell(t)}</tr>`;
+    bh += `<tr><td colspan="4" style="padding:4px 14px;color:#5d6873;font-family:Inter;font-size:11px;border-bottom:1px solid var(--line)">exclusive bands — the honest per-range answer, from real closing lines</td></tr>`;
+    for (const b of bb.bands) {
+      const label = b.hi != null ? `${b.lo}–${b.hi}%` : `${b.lo}%+ <span class="vs" style="display:inline" title="the market test excludes >20% reads as suspect at run time, so this band is structurally near-empty here">⚠️</span>`;
+      bh += `<tr><td class="name" style="cursor:default">${label}</td>${cell(b)}</tr>`;
+    }
+    bh += "</tbody></table>";
+    bbBox.innerHTML = bh;
+  }
+  main.appendChild(bbBox);
+
   if (kj.market && kj.market.status === "running") setTimeout(renderLab, 8000);
   for (const run of (kj.market_history || [])) {
     const rep = run.report;
