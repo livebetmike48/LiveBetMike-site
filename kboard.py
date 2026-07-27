@@ -43,6 +43,13 @@ MLB_BASE = "https://statsapi.mlb.com/api/v1"
 DB_PATH = os.getenv("DB_PATH", "odds_history.db")
 REFRESH_SECONDS = 900   # rebuild at most every 15 min, and only when viewed
 EV_LOG_MIN = 2.0        # paper-track units simulate flat-betting edges >= this
+# Cumulative EV thresholds and exclusive EV bands for the forward-log
+# breakdown. Thresholds match the Lab's market-test convention (>= X) so
+# the forward record is directly comparable; bands answer the
+# winner's-curse question (does ROI fall as EV rises?) and isolate the
+# >20% zone the market tests exclude as suspect.
+EV_THRESHOLDS = (2.0, 5.0, 10.0)
+EV_BANDS = ((2.0, 5.0), (5.0, 10.0), (10.0, 20.0), (20.0, None))
 # The K model prices against the MAIN books only -- lines you can actually
 # bet. Soft/regional books produced fantasy best-prices and fantasy EVs.
 # Comma-separated Odds API book keys; also halves prop-credit cost
@@ -407,6 +414,35 @@ def _build_board(date: str, progress: dict) -> dict:
             "built_at": int(time.time())}
 
 
+def _breakdown(graded_bets: list[dict]) -> dict:
+    """EV threshold + band breakdown of graded paper bets. Thresholds are
+    cumulative (>= X, the Lab's market-test convention, directly
+    comparable); bands are exclusive (the winner's-curse diagnostic —
+    does ROI fall as EV rises? — with 20+ isolating the reads the market
+    tests exclude as suspect). Same flat-1u units the rows carry; nothing
+    is recomputed differently anywhere."""
+    def _stats(bets):
+        n = len(bets)
+        wins = sum(1 for b in bets if b["won"])
+        units = round(sum(b["units"] for b in bets), 2)
+        roi = round(units / n * 100, 1) if n else None
+        return {"bets": n, "wins": wins, "units": units, "roi": roi}
+
+    thresholds = []
+    for t in EV_THRESHOLDS:
+        s = _stats([b for b in graded_bets if b["ev"] >= t])
+        s["min_ev"] = t
+        thresholds.append(s)
+    bands = []
+    for lo, hi in EV_BANDS:
+        s = _stats([b for b in graded_bets
+                    if b["ev"] >= lo and (hi is None or b["ev"] < hi)])
+        s["lo"] = lo
+        s["hi"] = hi
+        bands.append(s)
+    return {"thresholds": thresholds, "bands": bands}
+
+
 def log_details(days: int = 1) -> dict:
     """Graded forward-log detail + stats for the last N days (400 = season)
     -- the recap/record feed. Grades pending rows first (cheap, no odds
@@ -428,6 +464,7 @@ def log_details(days: int = 1) -> dict:
             "FROM k_board_log WHERE date >= ? AND date < ? ORDER BY date, name",
             (cutoff, today)).fetchall()
     out_rows = []
+    graded_bets = []
     units = bets = wins = 0
     for (date, name, line, p_over, ev_o, pr_o, bk_o, ev_u, pr_u, bk_u,
          actual, cleared, lineup) in rows:
@@ -448,6 +485,7 @@ def log_details(days: int = 1) -> dict:
             u = round(odds_api.american_to_decimal(price) - 1, 2) if hit else -1.0
             row["bets"].append({"side": side, "price": price, "book": book,
                                 "ev": ev, "won": bool(hit), "units": u})
+            graded_bets.append({"ev": ev, "won": bool(hit), "units": u})
             bets += 1
             wins += 1 if hit else 0
             units += u
@@ -469,6 +507,7 @@ def log_details(days: int = 1) -> dict:
             "roi": round(units / bets * 100, 1) if bets else None,
             "brier": brier, "brier_constant": brier_constant,
             "lean_hits": lean_hits,
+            "breakdown": _breakdown(graded_bets),
             "overall": _result_log_summary()}
 
 
