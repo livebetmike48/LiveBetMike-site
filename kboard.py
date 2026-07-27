@@ -43,6 +43,11 @@ MLB_BASE = "https://statsapi.mlb.com/api/v1"
 DB_PATH = os.getenv("DB_PATH", "odds_history.db")
 REFRESH_SECONDS = 900   # rebuild at most every 15 min, and only when viewed
 EV_LOG_MIN = 2.0        # paper-track units simulate flat-betting edges >= this
+# Paper bets follow the SAME 2-20% policy the market tests validated:
+# edges above EV_LOG_MAX are logged and shown (20+ band in the breakdown)
+# but NOT counted as paper bets -- they're overwhelmingly stale/thin
+# lines, and the tests that earned the model's credentials excluded them.
+EV_LOG_MAX = float(os.getenv("KBOARD_EV_LOG_MAX", "20.0"))
 # Cumulative EV thresholds and exclusive EV bands for the forward-log
 # breakdown. Thresholds match the Lab's market-test convention (>= X) so
 # the forward record is directly comparable; bands answer the
@@ -172,7 +177,7 @@ def _result_log_summary() -> dict:
     units = bets = wins = 0
     for p_over, cleared, ev_o, pr_o, ev_u, pr_u in rows:
         for side_hit, ev, price in ((cleared, ev_o, pr_o), (1 - cleared, ev_u, pr_u)):
-            if ev is None or price is None or ev < EV_LOG_MIN:
+            if ev is None or price is None or ev < EV_LOG_MIN or ev > EV_LOG_MAX:
                 continue
             bets += 1
             if side_hit:
@@ -183,6 +188,65 @@ def _result_log_summary() -> dict:
     return {"n": len(rows), "days": days, "pending": pending,
             "brier_model": brier, "brier_constant": brier_constant,
             "bets": bets, "wins": wins, "units": round(units, 2)}
+
+
+# ---------- live model state (the July-24 boot fix, now actually deployed) ----------
+
+_live_model_loaded = 0.0
+
+
+def _ensure_live_model():
+    """Load saved K knobs + refit the calibration curve into the live
+    kmodel before pricing anything. Without this, every redeploy leaves
+    the board on boot defaults with an EMPTY curve -- the raw K-shy model
+    at fantasy EVs. Throttled to once per 5 minutes."""
+    global _live_model_loaded
+    if time.time() - _live_model_loaded < 300:
+        return
+    try:
+        import lab
+        lab._apply_k_config()
+        _live_model_loaded = time.time()
+    except Exception as e:
+        log.warning("live model config load failed (board runs on current state): %s", e)
+
+
+# ---------- opponent team K rate (real data for unknown lineup slots) ----------
+
+_team_rate_cache: dict = {"date": None, "rates": {}}
+
+
+def _team_k_rate(team_id: int, hand: str) -> float | None:
+    """The opposing TEAM's season K/PA vs this starter hand, from MLB
+    statSplits (vl/vr). Cached per day. None (-> league) when the split
+    is thin (<500 PA) or the fetch fails -- never invented."""
+    if not team_id or hand not in ("L", "R"):
+        return None
+    today = parlay.et_date_str(0)
+    if _team_rate_cache["date"] != today:
+        _team_rate_cache.update({"date": today, "rates": {}})
+    key = (team_id, hand)
+    if key in _team_rate_cache["rates"]:
+        return _team_rate_cache["rates"][key]
+    rate = None
+    try:
+        split = "vl" if hand == "L" else "vr"
+        data = requests.get(
+            f"{MLB_BASE}/teams/{team_id}/stats",
+            params={"stats": "statSplits", "sitCodes": split,
+                    "group": "hitting", "season": today[:4]},
+            timeout=15).json()
+        for s in (data.get("stats") or []):
+            for sp in (s.get("splits") or []):
+                st = sp.get("stat") or {}
+                pa = st.get("plateAppearances")
+                so = st.get("strikeOuts")
+                if pa and so is not None and int(pa) >= 500:
+                    rate = int(so) / int(pa)
+    except Exception as e:
+        log.warning("team K rate fetch failed (team %s vs %sHP): %s", team_id, hand, e)
+    _team_rate_cache["rates"][key] = rate
+    return rate
 
 
 # ---------- live input assembly (kbacktest's, with before=None) ----------
@@ -207,6 +271,7 @@ def _slate(date: str) -> list[dict]:
                 team = t.get("team") or {}
                 pp = t.get("probablePitcher") or {}
                 teams[side] = {
+                    "id": team.get("id"),
                     "abbrev": team.get("abbreviation") or team.get("teamName") or "?",
                     "name": team.get("name") or "",
                     "starter_id": pp.get("id"),
@@ -342,6 +407,7 @@ def _price_starter(events, home_name, away_name, starter_name, kdist):
 
 
 def _build_board(date: str, progress: dict) -> dict:
+    _ensure_live_model()
     p_league = kmodel.league_k_rate()
     slate = _slate(date)
     events = []
@@ -383,7 +449,8 @@ def _build_board(date: str, progress: dict) -> dict:
                 entry["lineup_known_slots"] = known
                 kdist = kmodel.k_distribution(
                     lineup, s_rows, hand, p_league,
-                    before=None, park_k_factor=_park_k(g.get("venue")))
+                    before=None, park_k_factor=_park_k(g.get("venue")),
+                    unknown_slot_rate=_team_k_rate(opp.get("id"), hand))
                 if kdist is None:
                     entry.update({"status": "no read",
                                   "why": "starter sample too thin (house minimums)"})
@@ -435,10 +502,19 @@ def _breakdown(graded_bets: list[dict]) -> dict:
         thresholds.append(s)
     bands = []
     for lo, hi in EV_BANDS:
-        s = _stats([b for b in graded_bets
-                    if b["ev"] >= lo and (hi is None or b["ev"] < hi)])
+        # Boundary rule matches the counting policy exactly: the band
+        # ending at EV_LOG_MAX includes it (a 20.0% bet is counted), and
+        # the open top band is strictly ABOVE the cap (never counted).
+        if hi is None:
+            members = [b for b in graded_bets if b["ev"] > lo]
+        elif hi == EV_LOG_MAX:
+            members = [b for b in graded_bets if lo <= b["ev"] <= hi]
+        else:
+            members = [b for b in graded_bets if lo <= b["ev"] < hi]
+        s = _stats(members)
         s["lo"] = lo
         s["hi"] = hi
+        s["counted"] = not (hi is None and lo >= EV_LOG_MAX)
         bands.append(s)
     return {"thresholds": thresholds, "bands": bands}
 
@@ -477,14 +553,27 @@ def log_details(days: int = 1) -> dict:
                  (1 - cleared) if cleared is not None else None)):
             if ev is None or price is None or ev < EV_LOG_MIN:
                 continue
+            if ev > EV_LOG_MAX:
+                # visible in rows + the 20+ breakdown band, never a counted bet
+                u = (round(odds_api.american_to_decimal(price) - 1, 2)
+                     if (cleared is not None and hit) else
+                     (-1.0 if cleared is not None else None))
+                row["bets"].append({"side": side, "price": price, "book": book,
+                                    "ev": ev, "won": (bool(hit) if cleared is not None else None),
+                                    "units": u, "counted": False})
+                if cleared is not None:
+                    graded_bets.append({"ev": ev, "won": bool(hit), "units": u})
+                continue
             if cleared is None:
                 # logged bet, game not graded yet -- keep its identity
                 row["bets"].append({"side": side, "price": price, "book": book,
-                                    "ev": ev, "won": None, "units": None})
+                                    "ev": ev, "won": None, "units": None,
+                                    "counted": True})
                 continue
             u = round(odds_api.american_to_decimal(price) - 1, 2) if hit else -1.0
             row["bets"].append({"side": side, "price": price, "book": book,
-                                "ev": ev, "won": bool(hit), "units": u})
+                                "ev": ev, "won": bool(hit), "units": u,
+                                "counted": True})
             graded_bets.append({"ev": ev, "won": bool(hit), "units": u})
             bets += 1
             wins += 1 if hit else 0
@@ -584,6 +673,7 @@ def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0,
     uses the cached board's prices only (no odds credits); the EVs are
     recomputed for the SIMMED probabilities at those prices."""
     offset = 1 if offset == 1 else 0
+    _ensure_live_model()
     date = parlay.et_date_str(offset)
     names = {p["id"]: p["name"] for p in players_list()}
     try:
