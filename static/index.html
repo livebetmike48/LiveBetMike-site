@@ -281,7 +281,7 @@ async function renderKBoard() {
   } else {
     const beats = rl.brier_model < rl.brier_constant;
     const ucol = rl.units > 0 ? "#4caf7d" : (rl.units < 0 ? "#d7483a" : "#7a8694");
-    logBox.innerHTML = `<b style="color:var(--white)">${rl.n}</b> graded starts over ${rl.days} day(s) — Brier <b style="color:var(--white)">${rl.brier_model}</b> vs constant ${rl.brier_constant} ${beats ? "<span style='color:#4caf7d'>✅</span>" : "<span style='color:#e0a12f'>⚠️</span>"} · paper units on logged edges ≥ +2% EV: <b style="color:${ucol}">${rl.units > 0 ? "+" : ""}${rl.units}u</b> (${rl.bets} bets, ${rl.wins} W)${rl.pending ? ` · ${rl.pending} awaiting grading` : ""} · frozen before first pitch, graded from real boxscores`;
+    logBox.innerHTML = `<b style="color:var(--white)">${rl.n}</b> graded starts over ${rl.days} day(s) — Brier <b style="color:var(--white)">${rl.brier_model}</b> vs constant ${rl.brier_constant} ${beats ? "<span style='color:#4caf7d'>✅</span>" : "<span style='color:#e0a12f'>⚠️</span>"} · paper units on logged 2–20% EV edges (the market-test policy; 20%+ shown below, never counted): <b style="color:${ucol}">${rl.units > 0 ? "+" : ""}${rl.units}u</b> (${rl.bets} bets, ${rl.wins} W)${rl.pending ? ` · ${rl.pending} awaiting grading` : ""} · frozen before first pitch, graded from real boxscores`;
   }
   main.appendChild(logBox);
 
@@ -431,7 +431,7 @@ async function krecapLoad() {
     }
     h += `<tr><td colspan="4" style="padding:4px 14px;color:#5d6873;font-family:Inter;font-size:11px;border-bottom:1px solid var(--line)">exclusive bands — does ROI fall as EV rises?</td></tr>`;
     for (const b of bd.bands) {
-      const label = b.hi != null ? `${b.lo}–${b.hi}%` : `${b.lo}%+ <span class="vs" style="display:inline" title="the zone the Lab's market tests exclude as suspect — usually stale or thin lines, not real edge">⚠️</span>`;
+      const label = b.hi != null ? `${b.lo}–${b.hi}%` : `${b.lo}%+ <span class="vs" style="display:inline" title="the zone the Lab's market tests exclude as suspect — usually stale or thin lines, not real edge. Shown for transparency, NOT counted in paper units">⚠️ not counted</span>`;
       h += `<tr><td class="name" style="cursor:default">${label}</td>${cell(b)}</tr>`;
     }
     h += `</tbody></table></div>`;
@@ -449,9 +449,10 @@ async function krecapLoad() {
       if (r.bets && r.bets.length) {
         for (const b of r.bets) {
           const mark = b.won == null ? "⏳" : (b.won ? "✅" : "❌");
+          const dim = b.counted === false;
           const units = b.units == null ? "" :
             ` · <b style="color:${b.units > 0 ? "#4caf7d" : "#d7483a"}">${b.units > 0 ? "+" : ""}${b.units}u</b>`;
-          h += `<div style="margin-top:2px">${mark} <b>${r.starter}</b> ${b.side === "over" ? "O" : "U"} ${r.line} ${b.price > 0 ? "+" : ""}${b.price} <span class="vs" style="display:inline">${b.book || ""}</span> (EV +${b.ev}%) → ${actual}${units}${r.lineup_posted ? "" : ` <span class="vs" style="display:inline" title="logged before the opposing lineup posted">🟡 pre-lineup</span>`}</div>`;
+          h += `<div style="margin-top:2px${dim ? ";opacity:.55" : ""}">${mark} <b>${r.starter}</b> ${b.side === "over" ? "O" : "U"} ${r.line} ${b.price > 0 ? "+" : ""}${b.price} <span class="vs" style="display:inline">${b.book || ""}</span> (EV +${b.ev}%) → ${actual}${units}${r.lineup_posted ? "" : ` <span class="vs" style="display:inline" title="logged before the opposing lineup posted">🟡 pre-lineup</span>`}${dim ? ` <span class="vs" style="display:inline" title="EV above the 20% cap — shown for transparency, excluded from paper units (market-test policy: 20%+ is usually a stale or thin line)">not counted</span>` : ""}</div>`;
         }
       } else {
         const lean = r.p_over != null && r.p_over >= 0.5 ? "over" : "under";
