@@ -544,6 +544,72 @@ def fit_k_blend(test_days: int = 30, source: str = "close") -> dict:
     return result
 
 
+def band_report(source: str = "close") -> dict:
+    """EV-range backtest over STORED market-test bets (k_market_bets) --
+    the same rows the blend fits on, zero credits to compute. Uses the
+    forward log's exact band cuts (2-5/5-10/10-15/15-20/20+) and
+    cap-aware thresholds so the backtest table and the live recap table
+    are directly comparable, band for band.
+
+    Note: the market test itself excludes >20% EV reads as suspect at run
+    time, so the 20+ band is structurally near-empty here -- that's the
+    run's policy showing, not missing data."""
+    init_db()
+    want_open = 1 if source == "open" else 0
+    with _conn() as c:
+        runs = c.execute(
+            "SELECT run_ts, COUNT(*) FROM k_market_bets WHERE vs_open=? "
+            "GROUP BY run_ts ORDER BY run_ts DESC", (want_open,)).fetchall()
+        if not runs:
+            return {"error": f"no stored {source}-line bets yet — run a K market "
+                             f"test first (per-bet storage), then this is free"}
+        run_ts = max(runs, key=lambda r: (r[1] >= 50, r[0]))[0]
+        rows = c.execute(
+            "SELECT ev, price, hit, date FROM k_market_bets WHERE run_ts=?",
+            (run_ts,)).fetchall()
+
+    def _units(price, hit):
+        if hit:
+            p = int(price)
+            return round((p / 100.0) if p > 0 else (100.0 / -p), 2)
+        return -1.0
+
+    bets = [{"ev": ev, "hit": hit, "units": _units(price, hit)}
+            for ev, price, hit, _ in rows if ev is not None and price is not None]
+
+    def _stats(sub):
+        n = len(sub)
+        wins = sum(1 for b in sub if b["hit"])
+        units = round(sum(b["units"] for b in sub), 2)
+        return {"bets": n, "wins": wins, "units": units,
+                "roi": round(units / n * 100, 1) if n else None}
+
+    cap = 20.0
+    counted = [b for b in bets if b["ev"] <= cap]
+    thresholds = []
+    for t in (2.0, 5.0, 10.0, 15.0):
+        s = _stats([b for b in counted if b["ev"] >= t])
+        s["min_ev"] = t
+        thresholds.append(s)
+    bands = []
+    for lo, hi in ((2.0, 5.0), (5.0, 10.0), (10.0, 15.0), (15.0, 20.0), (20.0, None)):
+        if hi is None:
+            sub = [b for b in bets if b["ev"] > lo]
+        elif hi == cap:
+            sub = [b for b in bets if lo <= b["ev"] <= hi]
+        else:
+            sub = [b for b in bets if lo <= b["ev"] < hi]
+        s = _stats(sub)
+        s["lo"], s["hi"] = lo, hi
+        s["counted"] = hi is not None
+        bands.append(s)
+    dates = [r[3] for r in rows if r[3]]
+    return {"source": source, "run_ts": run_ts, "total_bets": len(bets),
+            "date_min": min(dates) if dates else None,
+            "date_max": max(dates) if dates else None,
+            "thresholds": thresholds, "bands": bands}
+
+
 def k_lab_state() -> dict:
     init_db()
     runs = []
@@ -556,10 +622,16 @@ def k_lab_state() -> dict:
         for ts, days, report in c.execute(
                 "SELECT ts, days, report FROM k_market_runs ORDER BY ts DESC LIMIT 10"):
             market.append({"ts": ts, "days": days, "report": json.loads(report)})
+    try:
+        bands = band_report("close")
+    except Exception as e:
+        log.warning("band report failed: %s", e)
+        bands = {"error": str(e)}
     return {
         "run": dict(_k_run_state),
         "config": get_k_config(),
         "history": runs,
         "market": dict(_k_market_state),
         "market_history": market,
+        "band_backtest": bands,
     }
