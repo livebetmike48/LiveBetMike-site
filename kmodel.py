@@ -184,7 +184,8 @@ def k_arsenal_rate(batter_rows: list[dict], starter_rows: list[dict],
     return {"rate": rate, "detail": detail}
 
 
-def tbf_samples(starter_rows: list[dict]) -> list[int]:
+def tbf_samples(starter_rows: list[dict],
+                start_game_pks: set | None = None) -> list[int]:
     """The starter's REAL batters-faced count for each of his STARTS --
     the workload distribution, straight from his logs.
 
@@ -218,7 +219,10 @@ def tbf_samples(starter_rows: list[dict]) -> list[int]:
         ev = r.get("events")
         if ev and ev not in statcast_api.NON_PA_EVENTS:
             games[key] = games.get(key, 0) + 1
-    if has_inning:
+    if start_game_pks is not None:
+        # authoritative: MLB game log says which games he STARTED
+        games = {k: v for k, v in games.items() if k[1] in start_game_pks}
+    elif has_inning:
         games = {k: v for k, v in games.items() if first_inning.get(k) == 1}
     samples = sorted(games.values())
     if K_MIN_TBF_SAMPLE > 0:
@@ -226,6 +230,49 @@ def tbf_samples(starter_rows: list[dict]) -> list[int]:
         if kept:
             samples = kept
     return samples
+
+
+_starts_cache = {"date": None, "pks": {}}
+
+
+def fetch_start_games(starter_id: int, before: str | None = None) -> set | None:
+    """game_pks of games this pitcher STARTED, from MLB's game log
+    (gamesStarted per game -- authoritative, no inference). Cached per
+    day. `before` filters to starts strictly before that date so the
+    backtest's point-in-time discipline holds. None on ANY failure --
+    the mixture then falls back to its legacy grouping, never refusing
+    someone because a fetch hiccuped."""
+    if not starter_id:
+        return None
+    today = time.strftime("%Y-%m-%d")
+    if _starts_cache["date"] != today:
+        _starts_cache.update({"date": today, "pks": {}})
+    if starter_id in _starts_cache["pks"]:
+        entries = _starts_cache["pks"][starter_id]
+    else:
+        try:
+            season = today[:4]
+            data = requests.get(
+                f"{MLB_BASE}/people/{starter_id}/stats",
+                params={"stats": "gameLog", "group": "pitching", "season": season},
+                timeout=20).json()
+            entries = []
+            for s in (data.get("stats") or []):
+                for sp in (s.get("splits") or []):
+                    st = sp.get("stat") or {}
+                    gpk = ((sp.get("game") or {}).get("gamePk"))
+                    date = sp.get("date")
+                    if gpk and int(st.get("gamesStarted") or 0) >= 1:
+                        entries.append((gpk, date or ""))
+            _starts_cache["pks"][starter_id] = entries
+        except Exception as e:
+            log.warning("start-games fetch failed for %s: %s", starter_id, e)
+            return None
+    if not entries:
+        return None  # no starts on record -> honest legacy fallback
+    if before:
+        return {gpk for gpk, d in entries if d and d < before}
+    return {gpk for gpk, _ in entries}
 
 
 def slot_pa_counts(tbf: int) -> list[int]:
@@ -258,7 +305,8 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
                    starter_hand: str, p_league: float,
                    before: str | None = None,
                    park_k_factor: float | None = None,
-                   unknown_slot_rate: float | None = None) -> dict | None:
+                   unknown_slot_rate: float | None = None,
+                   start_game_pks: set | None = None) -> dict | None:
     """The strikeout distribution for one start.
 
     lineup: 9 entries in batting order -- {'rows': [...], 'side': 'L'/'R',
@@ -269,7 +317,7 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
     anything honest.
     """
     s_rows = rows_before(starter_rows, before)
-    samples = tbf_samples(s_rows)
+    samples = tbf_samples(s_rows, start_game_pks=start_game_pks)
     if len(samples) < K_MIN_STARTS:
         return None
 
