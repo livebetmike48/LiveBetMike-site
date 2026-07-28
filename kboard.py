@@ -450,7 +450,8 @@ def _build_board(date: str, progress: dict) -> dict:
                 kdist = kmodel.k_distribution(
                     lineup, s_rows, hand, p_league,
                     before=None, park_k_factor=_park_k(g.get("venue")),
-                    unknown_slot_rate=_team_k_rate(opp.get("id"), hand))
+                    unknown_slot_rate=_team_k_rate(opp.get("id"), hand),
+                    start_game_pks=kmodel.fetch_start_games(team["starter_id"]))
                 if kdist is None:
                     entry.update({"status": "no read",
                                   "why": "starter sample too thin (house minimums)"})
@@ -711,7 +712,8 @@ def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0,
         lineup.append(None)
     kdist = kmodel.k_distribution(
         lineup, s_rows, hand, kmodel.league_k_rate(),
-        before=None, park_k_factor=_park_k((slate_entry or {}).get("venue")))
+        before=None, park_k_factor=_park_k((slate_entry or {}).get("venue")),
+        start_game_pks=kmodel.fetch_start_games(starter_id))
     if kdist is None:
         return {"error": "model refuses this start (starter sample under house minimums)"}
     tbf_mode = "workload mixture (his real start logs)"
