@@ -105,8 +105,10 @@ def _game_starts(game_pk: int, date_str: str, p_league: float,
             b_side = _majority_side(b_rows, date_str)
             lineup.append({"rows": b_rows, "side": b_side, "name": pid} if b_side else None)
 
-        kdist = kmodel.k_distribution(lineup, starter_rows, hand, p_league,
-                                      before=date_str, park_k_factor=_park_k(venue))
+        kdist = kmodel.k_distribution(
+            lineup, starter_rows, hand, p_league,
+            before=date_str, park_k_factor=_park_k(venue),
+            start_game_pks=kmodel.fetch_start_games(starter_id, before=date_str))
         if kdist is None:
             continue
 
@@ -456,7 +458,8 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
                                 "market_prob": round(mkt_prob, 4) if mkt_prob else None}
                         if vs_open:
                             close_priced = odds_api.player_prop_prices(
-                                close_data, "pitcher_strikeouts", s["name"], side=side)                                 if close_data else None
+                                close_data, "pitcher_strikeouts", s["name"], side=side) \
+                                if close_data else None
                             cand["clv"] = _line_movement(priced, close_priced)
                         candidates.append(cand)
             if progress:
