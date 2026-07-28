@@ -185,19 +185,41 @@ def k_arsenal_rate(batter_rows: list[dict], starter_rows: list[dict],
 
 
 def tbf_samples(starter_rows: list[dict]) -> list[int]:
-    """The starter's REAL batters-faced count for each of his starts --
-    the workload distribution, straight from his logs. K_MIN_TBF_SAMPLE>0
-    additionally drops ultra-short starts from the mixture (never
-    filtering to nothing); at 0 (default) the validated mixture is
-    untouched."""
+    """The starter's REAL batters-faced count for each of his STARTS --
+    the workload distribution, straight from his logs.
+
+    July 27 fix: the spec always said start logs, but the grouping
+    counted EVERY appearance -- so a converted reliever's mixture was a
+    pile of 1-inning stints, projecting ~2-3 K and manufacturing fantasy
+    under-edges (the Griffin Jax +59% read). A game only enters the
+    mixture if he appeared in the FIRST inning (he started it). Rows
+    without inning data fall back to the legacy all-appearances grouping
+    -- never silently refusing on missing fields.
+
+    K_MIN_TBF_SAMPLE > 0 additionally drops ultra-short starts (never
+    filtering to nothing); at 0 (default) only the start-filter applies."""
     games: dict = {}
+    first_inning: dict = {}
+    has_inning = False
     for r in starter_rows:
         gpk, date = r.get("game_pk"), r.get("game_date")
         if gpk is None or not date:
             continue
+        key = (date, gpk)
+        inn = r.get("inning")
+        if inn is not None:
+            has_inning = True
+            try:
+                inn = int(inn)
+                if key not in first_inning or inn < first_inning[key]:
+                    first_inning[key] = inn
+            except (TypeError, ValueError):
+                pass
         ev = r.get("events")
         if ev and ev not in statcast_api.NON_PA_EVENTS:
-            games[(date, gpk)] = games.get((date, gpk), 0) + 1
+            games[key] = games.get(key, 0) + 1
+    if has_inning:
+        games = {k: v for k, v in games.items() if first_inning.get(k) == 1}
     samples = sorted(games.values())
     if K_MIN_TBF_SAMPLE > 0:
         kept = [t for t in samples if t >= K_MIN_TBF_SAMPLE]
