@@ -296,6 +296,9 @@ def _slate(date: str) -> list[dict]:
                 }
             out.append({"game_pk": g.get("gamePk"),
                         "venue": ((g.get("venue") or {}).get("name")),
+                        "game_date_utc": g.get("gameDate"),
+                        "state": ((g.get("status") or {})
+                                  .get("abstractGameState")) or "",
                         "teams": teams})
     return out
 
@@ -447,6 +450,20 @@ def _build_board(date: str, progress: dict) -> dict:
             entry = {"game_pk": g["game_pk"], "starter_id": team["starter_id"],
                      "starter": team["starter_name"], "team": team["abbrev"],
                      "opp": opp["abbrev"]}
+            started = (g.get("state") in ("Live", "Final"))
+            if not started and g.get("game_date_utc"):
+                try:
+                    gd = datetime.fromisoformat(
+                        g["game_date_utc"].replace("Z", "+00:00"))
+                    started = datetime.now(timezone.utc) >= gd
+                except (TypeError, ValueError):
+                    pass
+            if started:
+                entry.update({"status": "no read",
+                              "why": "game underway — live lines are remaining-K "
+                                     "lines; pregame reads already frozen in the log"})
+                starters.append(entry)
+                continue
             try:
                 try:
                     hand = parlay.get_starter_hand(team["starter_id"])
