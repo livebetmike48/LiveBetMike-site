@@ -404,16 +404,20 @@ def _fit_k_calibration_detail():
                 continue
             matches = all(abs(knobs.get(k, K_CONFIG_DEFAULTS[k]["value"]) - v) < 1e-9
                           for k, v in current.items())
-            if matches and (best is None or rep["n"] > best.get("n", 0)):
+            # NEWEST matching raw run wins -- never largest. The model's
+            # internals can change without a knob changing (July 28: the
+            # start-only mixture), so an older, bigger run must never
+            # outrank the run that reflects the code as it is now.
+            if matches and (best_src is None or ts > best_src["ts"]):
                 best, best_src = rep, {"ts": ts, "days": days, "n": rep["n"]}
-            if fallback is None or rep["n"] > fallback.get("n", 0):
+            if fallback_src is None or ts > fallback_src["ts"]:
                 fallback, fallback_src = rep, {"ts": ts, "days": days, "n": rep["n"]}
     matched = best is not None
     if best is None:
         best, best_src = fallback, fallback_src
         if best:
             log.warning("K calibration: no raw run matches current knobs -- "
-                        "using largest raw run as fallback")
+                        "using newest raw run as fallback")
     if not best:
         return [], {"source": None, "matched": False, "buckets_used": 0,
                     "buckets_total": 0}
