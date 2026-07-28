@@ -351,6 +351,7 @@ def fetch_recent_lineup(team_id: int, hand: str, before: str | None = None,
                     games.append((g.get("officialDate") or d.get("date"),
                                   g.get("gamePk")))
         games.sort(reverse=True)  # newest first
+        hand_lookup: dict = {}
         for gdate, gpk in games[:10]:
             box = requests.get(f"{MLB_BASE}/game/{gpk}/boxscore",
                                timeout=20).json()
@@ -368,8 +369,19 @@ def fetch_recent_lineup(team_id: int, hand: str, before: str | None = None,
                 continue
             sp = ((teams.get(opp) or {}).get("players") or {}).get(
                 f"ID{opp_pitchers[0]}") or {}
+            # boxscore person records often OMIT pitchHand -- use it as a
+            # fast path only, and fall back to the codebase's canonical
+            # hand source (July 28 lesson: never assume a field exists)
             opp_hand = (((sp.get("person") or {}).get("pitchHand") or {})
                         .get("code"))
+            if opp_hand not in ("L", "R"):
+                sid = opp_pitchers[0]
+                if sid not in hand_lookup:
+                    try:
+                        hand_lookup[sid] = parlay.get_starter_hand(sid)
+                    except Exception:
+                        hand_lookup[sid] = None
+                opp_hand = hand_lookup[sid]
             if opp_hand != hand:
                 continue
             result = {"batter_ids": [int(b) for b in order[:9]], "date": gdate}
@@ -382,6 +394,10 @@ def fetch_recent_lineup(team_id: int, hand: str, before: str | None = None,
     if result:
         log.info("proxy lineup team %s vs %sHP: from %s", team_id, hand,
                  result["date"])
+    else:
+        # NEVER silent: a missing proxy must say so (observability rule)
+        log.info("proxy lineup team %s vs %sHP: none found -- team-rate slots",
+                 team_id, hand)
     return result
 
 
