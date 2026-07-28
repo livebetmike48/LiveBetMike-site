@@ -329,7 +329,9 @@ async function renderKBoard() {
     for (const s of rows) {
       const lu = s.lineup_posted
         ? `${9 - (s.league_fallback_slots || 0)}/9${s.league_fallback_slots ? ` <span class="vs" style="display:inline" title="thin-sample slots priced at league">(${s.league_fallback_slots} @ lg)</span>` : ""}`
-        : `<span style="color:#e0a12f" title="slots priced at the opponent's team K rate vs hand until the lineup posts">not posted</span>`;
+        : ((s.lineup_source || "").startsWith("projected")
+          ? `<span style="color:#e0a12f" title="no lineup posted yet — slots priced from the opponent's most recent real lineup vs this hand (~7-8 of 9 usually repeat); tightens when today's lineup drops">${s.lineup_source}</span>`
+          : `<span style="color:#e0a12f" title="slots priced at the opponent's team K rate vs hand until the lineup posts">not posted</span>`);
       h += `<tr><td class="name" style="cursor:default">${s.starter} <span class="vs">${s.team} ${s.hand}HP</span></td>
         <td style="text-align:left;color:#7a8694;font-family:Inter">${s.opp}</td>
         <td>${s.line != null ? s.line : (s.fair_line != null ? `<span class="vs" style="display:inline" title="model fair line — the half-point the model prices at a coin flip; compare openers against it">model ${s.fair_line}</span>` : "–")}</td>
