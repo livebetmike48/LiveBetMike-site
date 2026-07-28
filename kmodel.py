@@ -269,14 +269,23 @@ def fetch_start_games(starter_id: int, before: str | None = None) -> set | None:
             season = today[:4]
             data = requests.get(
                 f"{MLB_BASE}/people/{starter_id}/stats",
-                params={"stats": "gameLog", "group": "pitching", "season": season},
+                params={"stats": "gameLog", "group": "pitching",
+                        "season": season, "sportId": 1},
                 timeout=20).json()
             entries = []
+            splits_seen = 0
             for s in (data.get("stats") or []):
                 for sp in (s.get("splits") or []):
+                    splits_seen += 1
                     st = sp.get("stat") or {}
-                    gpk = ((sp.get("game") or {}).get("gamePk"))
-                    date = sp.get("date")
+                    # gamePk location varies by stats-API shape -- check
+                    # every place it's known to appear
+                    gpk = ((sp.get("game") or {}).get("gamePk")
+                           or sp.get("gamePk")
+                           or (st.get("game") or {}).get("gamePk")
+                           if isinstance(st.get("game"), dict) else
+                           ((sp.get("game") or {}).get("gamePk") or sp.get("gamePk")))
+                    date = sp.get("date") or ((sp.get("game") or {}).get("date"))
                     if gpk and int(st.get("gamesStarted") or 0) >= 1:
                         try:
                             gpk = int(gpk)
@@ -284,11 +293,19 @@ def fetch_start_games(starter_id: int, before: str | None = None) -> set | None:
                             continue
                         entries.append((gpk, date or ""))
             _starts_cache["pks"][starter_id] = entries
+            log.info("start-games %s: %d starts from %d game-log rows",
+                     starter_id, len(entries), splits_seen)
+            if splits_seen and not entries:
+                log.warning("start-games %s: %d log rows but 0 starts parsed "
+                            "-- gamePk location mismatch? sample keys: %s",
+                            starter_id, splits_seen,
+                            sorted((data.get("stats") or [{}])[0].get("splits", [{}])[0].keys())
+                            if (data.get("stats") or [{}])[0].get("splits") else "none")
         except Exception as e:
             log.warning("start-games fetch failed for %s: %s", starter_id, e)
             return None
     if not entries:
-        return None  # no starts on record -> honest legacy fallback
+        return None  # no starts on record -> legacy fallback (logged above)
     if before:
         return {gpk for gpk, d in entries if d and d < before}
     return {gpk for gpk, _ in entries}
