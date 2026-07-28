@@ -53,8 +53,16 @@ EV_LOG_MAX = float(os.getenv("KBOARD_EV_LOG_MAX", "20.0"))
 # the forward record is directly comparable; bands answer the
 # winner's-curse question (does ROI fall as EV rises?) and isolate the
 # >20% zone the market tests exclude as suspect.
-EV_THRESHOLDS = (2.0, 5.0, 10.0, 15.0)
 EV_BANDS = ((2.0, 5.0), (5.0, 10.0), (10.0, 15.0), (15.0, 20.0), (20.0, None))
+
+# Model era stamped onto every logged read. Bump when the MODEL changes
+# (mixture, filter, curve source -- anything that alters predictions), so
+# the recap can split records by era instead of silently mixing them.
+# v1 = launch model (through 2026-07-27). v2 = start-only workload
+# mixture + curve refit from the 2,950-pred filtered run (2026-07-28).
+K_MODEL_VER = os.getenv("K_MODEL_VERSION", "v2")
+K_MODEL_ERA_LABELS = {"v1": "model v1 — through 7/27",
+                      "v2": "model v2 — since 7/28 (start-only workloads)"}
 # The K model prices against the MAIN books only -- lines you can actually
 # bet. Soft/regional books produced fantasy best-prices and fantasy EVs.
 # Comma-separated Odds API book keys; also halves prop-credit cost
@@ -79,6 +87,14 @@ def _conn():
         lineup_posted INTEGER, logged_ts INTEGER,
         actual_k INTEGER, cleared INTEGER,
         PRIMARY KEY (date, starter_id))""")
+    try:
+        conn.execute("ALTER TABLE k_board_log ADD COLUMN model_ver TEXT")
+        # one-time backfill: reads frozen on/after the v2 cutover date were
+        # made by the v2 model before this column existed
+        conn.execute("UPDATE k_board_log SET model_ver='v2' "
+                     "WHERE date >= '2026-07-28' AND model_ver IS NULL")
+    except Exception:
+        pass  # column already exists
     return conn
 
 
@@ -100,6 +116,7 @@ def _log_predictions(data: dict):
             (s.get("under") or {}).get("price"), (s.get("under") or {}).get("book"),
             s.get("ev_under"),
             1 if s.get("lineup_posted") else 0, int(time.time()),
+            K_MODEL_VER,
         ))
     if not rows:
         return
@@ -107,8 +124,8 @@ def _log_predictions(data: dict):
         c.executemany("""INSERT OR IGNORE INTO k_board_log
             (date, game_pk, starter_id, name, line, p_over, p_over_raw,
              price_over, book_over, ev_over, price_under, book_under, ev_under,
-             lineup_posted, logged_ts, actual_k, cleared)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""", rows)
+             lineup_posted, logged_ts, model_ver, actual_k, cleared)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""", rows)
 
 
 def _grade_pending(today: str):
@@ -483,12 +500,11 @@ def _build_board(date: str, progress: dict) -> dict:
 
 
 def _breakdown(graded_bets: list[dict]) -> dict:
-    """EV threshold + band breakdown of graded paper bets. Thresholds are
-    cumulative (>= X, the Lab's market-test convention, directly
-    comparable); bands are exclusive (the winner's-curse diagnostic —
-    does ROI fall as EV rises? — with 20+ isolating the reads the market
-    tests exclude as suspect). Same flat-1u units the rows carry; nothing
-    is recomputed differently anywhere."""
+    """Totals + exclusive-band breakdown of graded paper bets. Every bet
+    lives in exactly ONE band and the totals line counts it exactly once
+    (no cumulative >=X rows -- Mike's call: a public record should never
+    look double-counted). risked = bets at flat 1u. 20+ band isolates the
+    reads the market tests exclude as suspect; shown, never counted."""
     def _stats(bets):
         n = len(bets)
         wins = sum(1 for b in bets if b["won"])
@@ -496,12 +512,9 @@ def _breakdown(graded_bets: list[dict]) -> dict:
         roi = round(units / n * 100, 1) if n else None
         return {"bets": n, "wins": wins, "units": units, "roi": roi}
 
-    thresholds = []
     counted = [b for b in graded_bets if b["ev"] <= EV_LOG_MAX]
-    for t in EV_THRESHOLDS:
-        s = _stats([b for b in counted if b["ev"] >= t])
-        s["min_ev"] = t
-        thresholds.append(s)
+    totals = _stats(counted)
+    totals["risked"] = totals["bets"]  # flat 1u -- risked units = bet count
     bands = []
     for lo, hi in EV_BANDS:
         # Boundary rule matches the counting policy exactly: the band
@@ -518,7 +531,7 @@ def _breakdown(graded_bets: list[dict]) -> dict:
         s["hi"] = hi
         s["counted"] = not (hi is None and lo >= EV_LOG_MAX)
         bands.append(s)
-    return {"thresholds": thresholds, "bands": bands}
+    return {"totals": totals, "bands": bands}
 
 
 def log_details(days: int = 1) -> dict:
@@ -538,17 +551,19 @@ def log_details(days: int = 1) -> dict:
     with _conn() as c:
         rows = c.execute(
             "SELECT date, name, line, p_over, ev_over, price_over, book_over, "
-            "ev_under, price_under, book_under, actual_k, cleared, lineup_posted "
+            "ev_under, price_under, book_under, actual_k, cleared, lineup_posted, "
+            "model_ver "
             "FROM k_board_log WHERE date >= ? AND date < ? ORDER BY date, name",
             (cutoff, today)).fetchall()
     out_rows = []
     graded_bets = []
     units = bets = wins = 0
     for (date, name, line, p_over, ev_o, pr_o, bk_o, ev_u, pr_u, bk_u,
-         actual, cleared, lineup) in rows:
+         actual, cleared, lineup, mver) in rows:
+        mver = mver or "v1"  # rows logged before versioning = launch model
         row = {"date": date, "starter": name, "line": line,
                "p_over": p_over, "actual_k": actual, "cleared": cleared,
-               "lineup_posted": bool(lineup), "bets": []}
+               "lineup_posted": bool(lineup), "model": mver, "bets": []}
         for side, ev, price, book, hit in (
                 ("over", ev_o, pr_o, bk_o, cleared),
                 ("under", ev_u, pr_u, bk_u,
@@ -564,7 +579,8 @@ def log_details(days: int = 1) -> dict:
                                     "ev": ev, "won": (bool(hit) if cleared is not None else None),
                                     "units": u, "counted": False})
                 if cleared is not None:
-                    graded_bets.append({"ev": ev, "won": bool(hit), "units": u})
+                    graded_bets.append({"ev": ev, "won": bool(hit), "units": u,
+                                        "model": mver})
                 continue
             if cleared is None:
                 # logged bet, game not graded yet -- keep its identity
@@ -576,7 +592,8 @@ def log_details(days: int = 1) -> dict:
             row["bets"].append({"side": side, "price": price, "book": book,
                                 "ev": ev, "won": bool(hit), "units": u,
                                 "counted": True})
-            graded_bets.append({"ev": ev, "won": bool(hit), "units": u})
+            graded_bets.append({"ev": ev, "won": bool(hit), "units": u,
+                                "model": mver})
             bets += 1
             wins += 1 if hit else 0
             units += u
@@ -591,6 +608,22 @@ def log_details(days: int = 1) -> dict:
                                    for r in graded_rows) / len(graded_rows), 4)
         lean_hits = sum(1 for r in graded_rows
                         if (r["p_over"] >= 0.5) == bool(r["cleared"]))
+    # Per-era recaps: each logged read carries the model version that
+    # produced it, so records split cleanly instead of silently mixing a
+    # retired model's bets with the live one's. History is never
+    # recomputed -- just grouped.
+    eras = []
+    for ver in sorted({r["model"] for r in out_rows}, reverse=True):
+        e_rows = [r for r in graded_rows if r["model"] == ver]
+        e_bets = [b for b in graded_bets if b["model"] == ver]
+        e_brier = (round(sum((r["p_over"] - r["cleared"]) ** 2
+                             for r in e_rows) / len(e_rows), 4)
+                   if e_rows else None)
+        eras.append({"model": ver,
+                     "label": K_MODEL_ERA_LABELS.get(ver, f"model {ver}"),
+                     "live": ver == K_MODEL_VER,
+                     "graded": len(e_rows), "brier": e_brier,
+                     "breakdown": _breakdown(e_bets)})
     return {"days": days, "rows": out_rows,
             "graded": len(graded_rows),
             "pending": sum(1 for r in out_rows if r["cleared"] is None),
@@ -599,6 +632,7 @@ def log_details(days: int = 1) -> dict:
             "brier": brier, "brier_constant": brier_constant,
             "lean_hits": lean_hits,
             "breakdown": _breakdown(graded_bets),
+            "eras": eras,
             "overall": _result_log_summary()}
 
 
