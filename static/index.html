@@ -411,12 +411,12 @@ async function krecapLoad() {
   if (d.pending) h += ` · ${d.pending} awaiting grading`;
   h += `</div>`;
 
-  // EV breakdown: cumulative thresholds (comparable to the Lab's market
-  // tests) + exclusive bands (the winner's-curse diagnostic; 20+ isolates
-  // the reads the market tests exclude as suspect). Numbers come from the
-  // site's breakdown — never recomputed here.
-  const bd = d.breakdown;
-  if (bd && d.bets) {
+  // EV breakdown per model era: one totals line + exclusive bands.
+  // Every bet lives in exactly one band and is counted exactly once —
+  // no cumulative >=X rows (they made single bets appear 4x). Eras split
+  // records by model version; history is grouped, never recomputed.
+  const eras = (d.eras && d.eras.length) ? d.eras : (d.breakdown ? [{model: "", label: null, breakdown: d.breakdown, graded: d.graded, brier: d.brier}] : []);
+  if (eras.length && d.bets) {
     const cell = (s) => {
       if (!s || !s.bets) return `<td class="meta">–</td><td class="meta">–</td><td class="meta">–</td>`;
       const col = s.units > 0 ? "#4caf7d" : (s.units < 0 ? "#d7483a" : "#7a8694");
@@ -424,15 +424,23 @@ async function krecapLoad() {
         `<td style="color:${col};font-weight:600">${s.units > 0 ? "+" : ""}${s.units}u</td>` +
         `<td>${s.roi != null ? (s.roi > 0 ? "+" : "") + s.roi + "%" : "–"}</td>`;
     };
-    h += `<div class="board" style="margin-top:10px;max-width:520px"><table>
+    h += `<div class="board" style="margin-top:10px;max-width:560px"><table>
       <thead><tr><th style="text-align:left;padding-left:14px">EV bucket</th><th>W-L</th><th>Units</th><th>ROI</th></tr></thead><tbody>`;
-    for (const t of bd.thresholds) {
-      h += `<tr><td class="name" style="cursor:default">≥ +${t.min_ev}%</td>${cell(t)}</tr>`;
-    }
-    h += `<tr><td colspan="4" style="padding:4px 14px;color:#5d6873;font-family:Inter;font-size:11px;border-bottom:1px solid var(--line)">exclusive bands — does ROI fall as EV rises?</td></tr>`;
-    for (const b of bd.bands) {
-      const label = b.hi != null ? `${b.lo}–${b.hi}%` : `${b.lo}%+ <span class="vs" style="display:inline" title="the zone the Lab's market tests exclude as suspect — usually stale or thin lines, not real edge. Shown for transparency, NOT counted in paper units">⚠️ not counted</span>`;
-      h += `<tr><td class="name" style="cursor:default">${label}</td>${cell(b)}</tr>`;
+    for (const era of eras) {
+      const bd = era.breakdown;
+      if (!bd) continue;
+      if (era.label) {
+        h += `<tr><td colspan="4" style="padding:7px 14px;color:${era.live ? "var(--white)" : "#5d6873"};font-family:Inter;font-size:11.5px;font-weight:600;border-bottom:1px solid var(--line)">${era.label}${era.live ? " · LIVE" : ""}${era.graded ? ` · ${era.graded} reads${era.brier != null ? ` · Brier ${era.brier}` : ""}` : ""}</td></tr>`;
+      }
+      const t = bd.totals;
+      if (t) {
+        h += `<tr><td class="name" style="cursor:default">all counted bets (2–20%) · ${t.risked || t.bets}u risked</td>${cell(t)}</tr>`;
+      }
+      h += `<tr><td colspan="4" style="padding:4px 14px;color:#5d6873;font-family:Inter;font-size:11px;border-bottom:1px solid var(--line)">exclusive bands — each bet counted once</td></tr>`;
+      for (const b of bd.bands) {
+        const label = b.hi != null ? `${b.lo}–${b.hi}%` : `${b.lo}%+ <span class="vs" style="display:inline" title="the zone the Lab's market tests exclude as suspect — usually stale or thin lines, not real edge. Shown for transparency, NOT counted in paper units">⚠️ not counted</span>`;
+        h += `<tr><td class="name" style="cursor:default">${label}</td>${cell(b)}</tr>`;
+      }
     }
     h += `</tbody></table></div>`;
   }
