@@ -1,130 +1,220 @@
 """
-K model -- per-start strikeout distributions.
+Strikeout-probability model v1 -- transparent and point-in-time.
 
-Per-hitter K probabilities (log5 vs the starter, shrunk, platoon-correct)
-run through the starter's REAL workload distribution to an exact
-Poisson-binomial strikeout distribution for the start. No invented
-leashes, no composite scores -- every number traces to Savant/MLB rows.
+SEPARATE from the hit model and from Pitcher Projections: this module
+never touches model.py or pitchers.py state. It reads the same validated
+row data and follows the same house rules -- log5, empirical-Bayes
+shrinkage, `before`-date discipline, every input exposed.
 
-July 27 changes (both additive; defaults reproduce the validated model
-byte-for-byte):
-1. k_distribution gains unknown_slot_rate (default None). When a lineup
-   slot is unknown (not posted / unmatchable), the slot prices at this
-   rate instead of league when provided. The K Board passes the OPPOSING
-   TEAM's season K rate vs the starter's hand here -- real data, not an
-   invented lineup. Backtests never pass it, so every validated path is
-   untouched.
-2. K_MIN_TBF_SAMPLE (default 0 = OFF): optional floor on the TBF samples
-   feeding the workload mixture. The mixture is already built from
-   per-START samples only, so relief outings never enter it -- but very
-   short true starts (opener games, injury-shortened starts) do, and for
-   a pitcher whose role changed they can drag the mixture. This is a
-   MODEL change, so it ships as a knob at 0 and must earn weight in the
-   Lab like everything else. Env-set for now (K_MIN_TBF_SAMPLE).
+Method (the Lab roadmap spec, now real):
+  1. Per-PA K probability for each lineup hitter: log5 of the STARTER's
+     K rate vs that side x the BATTER's K rate vs that hand / league.
+  2. Batters faced is a DISTRIBUTION, not a point: the starter's own real
+     TBF-per-start samples (point-in-time). His actual workload variance
+     supplies the "leash" -- no invented profiles.
+  3. Lineup slots get PAs by batting order arithmetic (slot 1 bats more
+     than slot 9), each PA a Bernoulli with its slot's probability.
+  4. Total strikeouts = mixture over TBF of the exact Poisson-binomial.
+     P(K >= line) read straight off the distribution -- no normal approx.
+
+July 27 additive changes (defaults reproduce the validated model exactly):
+  - k_distribution gains unknown_slot_rate (default None): unknown lineup
+    slots price at this rate when provided (the K Board passes the
+    opposing TEAM's real K rate vs the starter's hand) instead of league.
+    Backtests never pass it -- every validated path is untouched.
+  - K_MIN_TBF_SAMPLE (default 0 = OFF): optional floor on TBF samples
+    entering the workload mixture, dropping ultra-short true starts
+    (opener games, injury exits). A Lab gauntlet candidate, not a live
+    change; set via env K_MIN_TBF_SAMPLE.
 """
 import os
-import math
+import time
 import logging
+
+import requests
+
+import parlay
+import statcast_api
+from pitchers import K_EVENTS  # single source of truth for K accounting
 
 log = logging.getLogger("kmodel")
 
-# ---- knobs (lab._apply_k_config overwrites these from saved config) ----
-K_SHRINK_PA = 120
-K_MIN_BATTER_PA = 40
-K_MIN_STARTER_TBF = 60
-K_MIN_STARTS = 3
-K_ARSENAL_WEIGHT = 0.0
-K_PARK_WEIGHT = 1.0
-K_CALIB_WEIGHT = 1.0
-K_CALIB_POINTS: list = []
+MLB_BASE = "https://statsapi.mlb.com/api/v1"
 
-# Mixture floor: TBF samples BELOW this are excluded from the workload
-# mixture when > 0. Default 0 = off = the exact validated mixture.
-# A "short real start" floor candidate is ~8-12 TBF (~30 pitches).
+# ---- knobs (set by lab._apply_k_config; defaults = raw v1 baseline) ----
+K_SHRINK_PA = 120          # phantom league PAs both sides
+K_MIN_BATTER_PA = 40       # below: batter priced at league (flagged), not refused
+K_MIN_STARTER_TBF = 60     # below: refuse to predict
+K_MIN_STARTS = 3           # need real TBF samples for the workload mixture
+K_ARSENAL_WEIGHT = 0.0     # per-pitch K layer; 0 until a backtest earns it
+K_ARSENAL_SHRINK = 100
+K_PARK_WEIGHT = 1.0        # Savant strikeout park factor
+K_CALIB_WEIGHT = 1.0       # correction curve fit from stored K runs
+K_CALIB_POINTS: list = []  # [(predicted, actual)] on P(over) probabilities
+
+# Mixture floor: TBF samples BELOW this are dropped from the workload
+# mixture when > 0 (never filtering to nothing). Default 0 = OFF = the
+# exact validated mixture. Short-real-start candidate ~8-12 TBF.
 K_MIN_TBF_SAMPLE = int(os.getenv("K_MIN_TBF_SAMPLE", "0"))
 
 
-# ------------------------- rate extraction -------------------------
-
-def _sum_rows(rows: list[dict], keys: tuple[str, ...]) -> float:
-    total = 0.0
-    for r in rows or []:
-        for k in keys:
-            v = r.get(k)
-            if v is not None:
-                try:
-                    total += float(v)
-                except (TypeError, ValueError):
-                    pass
+def calibrate(p: float) -> float:
+    """Same piecewise-linear correction as the hit model, fit from the
+    K model's OWN stored raw runs."""
+    if not K_CALIB_POINTS or K_CALIB_WEIGHT <= 0:
+        return p
+    pts = K_CALIB_POINTS
+    if p <= pts[0][0]:
+        corrected = p + (pts[0][1] - pts[0][0])
+    elif p >= pts[-1][0]:
+        corrected = p + (pts[-1][1] - pts[-1][0])
+    else:
+        corrected = p
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            if x1 <= p <= x2:
+                t = (p - x1) / (x2 - x1) if x2 > x1 else 0
+                corrected = y1 + t * (y2 - y1)
                 break
-    return total
+    corrected = min(max(corrected, 0.01), 0.99)
+    return K_CALIB_WEIGHT * corrected + (1 - K_CALIB_WEIGHT) * p
 
 
-def _k_rate_vs(rows: list[dict], vs_hand: str, shrink_to: float,
-               min_pa: int) -> tuple[float | None, float]:
-    """(shrunk K/PA vs that hand, raw PA). None when the split is absent.
-    Empirical-Bayes shrink: (k + shrink_pa*league) / (pa + shrink_pa)."""
-    side_rows = [r for r in rows or []
-                 if (r.get("p_throws") or r.get("stand") or "").upper().startswith(vs_hand)]
-    if not side_rows:
-        side_rows = [r for r in rows or [] if r.get("split", "").upper() == f"VS {vs_hand}HP"
-                     or r.get("split", "").upper() == f"VS {vs_hand}HB"]
-    pa = _sum_rows(side_rows, ("pa", "abs", "ab"))
-    ks = _sum_rows(side_rows, ("strikeout", "so", "k"))
-    if pa <= 0:
-        return None, 0.0
-    rate = (ks + K_SHRINK_PA * shrink_to) / (pa + K_SHRINK_PA)
-    return rate, pa
+_league_cache = {"ts": 0, "p": None}
 
 
 def league_k_rate() -> float:
-    """Season league K/PA. The live layer (kboard) caches the real number
-    from MLB stats; this fallback keeps the module importable standalone."""
-    return _LEAGUE_CACHE.get("rate", 0.221)
+    """League per-PA strikeout rate from MLB's real season team totals."""
+    now = time.time()
+    if _league_cache["p"] and now - _league_cache["ts"] < 86400:
+        return _league_cache["p"]
+    resp = requests.get(
+        f"{MLB_BASE}/teams/stats",
+        params={"season": 2026, "group": "hitting", "stats": "season", "sportId": 1},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    ks = pa = 0
+    for split in resp.json()["stats"][0]["splits"]:
+        stat = split.get("stat", {})
+        ks += int(stat.get("strikeOuts", 0))
+        pa += int(stat.get("plateAppearances", 0))
+    if pa == 0:
+        raise RuntimeError("league totals unavailable")
+    p = ks / pa
+    _league_cache.update({"ts": now, "p": p})
+    log.info("League K rate: %.4f (%d K / %d PA)", p, ks, pa)
+    return p
 
 
-_LEAGUE_CACHE: dict = {}
+def rows_before(rows: list[dict], before: str | None) -> list[dict]:
+    if before is None:
+        return rows
+    return [r for r in rows if (r.get("game_date") or "9999") < before]
 
 
-def set_league_k_rate(rate: float):
-    _LEAGUE_CACHE["rate"] = float(rate)
-
-
-# --------------------- workload mixture (per-start) ---------------------
-
-def _tbf_samples(starter_rows: list[dict]) -> list[int]:
-    """Per-START batters-faced samples from the starter's game rows.
-    Rows are start-only by construction upstream (parlay's per-start log
-    fetch) -- relief outings never appear here. K_MIN_TBF_SAMPLE > 0
-    additionally drops ultra-short starts (opener games, injury exits)
-    from the mixture; at 0 (default) the validated mixture is untouched."""
-    samples = []
-    for r in starter_rows or []:
-        tbf = r.get("tbf") or r.get("batters_faced")
-        if tbf is None:
+def per_pa_k_rate(rows: list[dict], split_col: str, split_val: str) -> dict | None:
+    """K per PA within a split -- validated PA accounting."""
+    pa = k = 0
+    for r in rows:
+        if r.get(split_col) != split_val:
             continue
-        try:
-            tbf = int(tbf)
-        except (TypeError, ValueError):
+        ev = r.get("events")
+        if not ev or ev in statcast_api.NON_PA_EVENTS:
             continue
-        if tbf > 0:
-            samples.append(tbf)
+        pa += 1
+        if ev in K_EVENTS:
+            k += 1
+    if pa == 0:
+        return None
+    return {"pa": pa, "k": k, "rate": k / pa}
+
+
+def shrunk(k: int, pa: int, p_league: float, pseudo: float | None = None) -> float:
+    ps = K_SHRINK_PA if pseudo is None else pseudo
+    return (k + ps * p_league) / (pa + ps)
+
+
+def _odds(p: float) -> float:
+    p = min(max(p, 1e-6), 1 - 1e-6)
+    return p / (1 - p)
+
+
+def log5(p_batter_k: float, p_pitcher_k: float, p_league: float) -> float:
+    combined = _odds(p_batter_k) * _odds(p_pitcher_k) / _odds(p_league)
+    return combined / (1 + combined)
+
+
+def k_arsenal_rate(batter_rows: list[dict], starter_rows: list[dict],
+                   batter_overall_k: float) -> dict | None:
+    """Usage-weighted per-PA K rate: the batter's (heavily shrunk) K rate
+    against each pitch type, weighted by the starter's real usage vs his
+    side -- 'his slider problem counts in proportion to the sliders he'll
+    see', K edition."""
+    usage: dict = {}
+    for r in starter_rows:
+        pt = r.get("pitch_type")
+        if pt:
+            usage[pt] = usage.get(pt, 0) + 1
+    total = sum(usage.values())
+    if total < 100:
+        return None
+    per_pitch: dict = {}
+    for r in batter_rows:
+        ev = r.get("events")
+        if not ev or ev in statcast_api.NON_PA_EVENTS:
+            continue
+        pt = r.get("pitch_type")
+        if not pt:
+            continue
+        d = per_pitch.setdefault(pt, {"pa": 0, "k": 0})
+        d["pa"] += 1
+        if ev in K_EVENTS:
+            d["k"] += 1
+    if not per_pitch:
+        return None
+    rate = 0.0
+    detail = {}
+    for pt, count in usage.items():
+        w = count / total
+        d = per_pitch.get(pt, {"pa": 0, "k": 0})
+        sh = (d["k"] + K_ARSENAL_SHRINK * batter_overall_k) / (d["pa"] + K_ARSENAL_SHRINK)
+        rate += w * sh
+        if w >= 0.05:
+            detail[pt] = {"usage": round(w, 3), "batter_pa": d["pa"], "k_rate": round(sh, 4)}
+    return {"rate": rate, "detail": detail}
+
+
+def tbf_samples(starter_rows: list[dict]) -> list[int]:
+    """The starter's REAL batters-faced count for each of his starts --
+    the workload distribution, straight from his logs. K_MIN_TBF_SAMPLE>0
+    additionally drops ultra-short starts from the mixture (never
+    filtering to nothing); at 0 (default) the validated mixture is
+    untouched."""
+    games: dict = {}
+    for r in starter_rows:
+        gpk, date = r.get("game_pk"), r.get("game_date")
+        if gpk is None or not date:
+            continue
+        ev = r.get("events")
+        if ev and ev not in statcast_api.NON_PA_EVENTS:
+            games[(date, gpk)] = games.get((date, gpk), 0) + 1
+    samples = sorted(games.values())
     if K_MIN_TBF_SAMPLE > 0:
         kept = [t for t in samples if t >= K_MIN_TBF_SAMPLE]
-        if kept:  # never filter down to nothing
+        if kept:
             samples = kept
     return samples
 
 
 def slot_pa_counts(tbf: int) -> list[int]:
-    """PA per lineup slot for a given TBF: slot i (0-8) bats
-    (tbf - i + 8) // 9 times -- exact batting-order arithmetic."""
-    return [max(0, (int(tbf) - i + 8) // 9) for i in range(9)]
+    """PAs for batting-order slots 1-9 given total batters faced.
+    Slot i bats on trips i, i+9, i+18, ... -- exact order arithmetic."""
+    return [((tbf - i) // 9 + 1) if tbf >= i else 0 for i in range(1, 10)]
 
 
 def poisson_binomial(probs: list[float]) -> list[float]:
-    """Exact distribution of #successes over independent non-identical
-    Bernoullis. O(n^2), n <= ~45."""
+    """Exact distribution of the sum of independent Bernoullis.
+    Returns [P(K=0), P(K=1), ...]."""
     dist = [1.0]
     for p in probs:
         nxt = [0.0] * (len(dist) + 1)
@@ -136,137 +226,108 @@ def poisson_binomial(probs: list[float]) -> list[float]:
 
 
 def prob_over(dist: list[float], line: float) -> float:
-    """P(K > line). Half-point semantics: over 5.5 = P(K >= 6)."""
+    """P(K > line) for a half-point line (e.g. 5.5 -> P(K >= 6))."""
+    import math
     need = math.floor(line) + 1
-    return sum(m for k, m in enumerate(dist) if k >= need)
+    return sum(dist[need:]) if need < len(dist) else 0.0
 
 
-def calibrate(p: float) -> float:
-    """Piecewise-linear correction from the fitted curve, weighted by
-    K_CALIB_WEIGHT. Empty curve = identity."""
-    if K_CALIB_WEIGHT <= 0 or not K_CALIB_POINTS:
-        return p
-    pts = K_CALIB_POINTS
-    if p <= pts[0][0]:
-        corrected = pts[0][1]
-    elif p >= pts[-1][0]:
-        corrected = pts[-1][1]
-    else:
-        corrected = p
-        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
-            if x0 <= p <= x1:
-                t = 0.0 if x1 == x0 else (p - x0) / (x1 - x0)
-                corrected = y0 + t * (y1 - y0)
-                break
-    out = (1 - K_CALIB_WEIGHT) * p + K_CALIB_WEIGHT * corrected
-    return min(1.0, max(0.0, out))
-
-
-def price_line(kdist: dict, line: float) -> dict:
-    raw = prob_over(kdist["dist"], line)
-    cal = calibrate(raw)
-    return {"p_over": round(cal, 4), "p_over_raw": round(raw, 4),
-            "p_under": round(1 - cal, 4)}
-
-
-# ----------------------------- the model -----------------------------
-
-def k_distribution(lineup: list, starter_rows: list[dict], hand: str,
-                   p_league: float, before=None, park_k_factor: float | None = None,
+def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
+                   starter_hand: str, p_league: float,
+                   before: str | None = None,
+                   park_k_factor: float | None = None,
                    unknown_slot_rate: float | None = None) -> dict | None:
-    """Exact K distribution for one start.
+    """The strikeout distribution for one start.
 
-    lineup: 9 entries, each {"rows": [...], "side": "L"/"R", "name": ...}
-    or None for an unknown slot. Unknown slots price at unknown_slot_rate
-    when provided (the K Board passes the opposing team's K rate vs this
-    hand), else league -- the exact validated default.
+    lineup: 9 entries in batting order -- {'rows': [...], 'side': 'L'/'R',
+    'name': str} or None when the slot is unknown (priced at league, or at
+    unknown_slot_rate when provided -- the K Board passes the opposing
+    team's real K rate vs this hand; backtests never pass it).
+    Returns None only when the STARTER's sample is too thin to say
+    anything honest.
     """
-    if hand not in ("L", "R"):
-        return None
-
-    # starter K rate vs each batter side, gated on real sample
-    s_rate = {}
-    for side in ("L", "R"):
-        rate, pa = _k_rate_vs(starter_rows, side, p_league, 0)
-        if rate is None or pa < K_MIN_STARTER_TBF:
-            return None  # house minimum: refuse thin starters
-        s_rate[side] = rate
-
-    # workload mixture from real per-start samples
-    samples = _tbf_samples(starter_rows)
+    s_rows = rows_before(starter_rows, before)
+    samples = tbf_samples(s_rows)
     if len(samples) < K_MIN_STARTS:
         return None
-    tbf_mean = sum(samples) / len(samples)
 
-    slot_fallback_rate = unknown_slot_rate if unknown_slot_rate is not None else p_league
-    slot_basis_unknown = (f"team avg vs {hand}HP (slot unknown)"
-                          if unknown_slot_rate is not None else "league (slot unknown)")
+    fallback_rate = p_league if unknown_slot_rate is None else unknown_slot_rate
+    fb_unknown = ("league (slot unknown)" if unknown_slot_rate is None
+                  else f"team avg vs {starter_hand}HP (slot unknown)")
+    fb_thin = ("league (thin sample)" if unknown_slot_rate is None
+               else "team avg (thin sample)")
 
-    # per-slot K/PA via log5 vs the starter
-    slots = []
-    fallback = 0
-    for i in range(9):
-        entry = lineup[i] if i < len(lineup) else None
-        if not entry:
-            p = _log5(slot_fallback_rate, s_rate[_default_side(hand)], p_league)
-            slots.append({"slot": i + 1, "name": None,
-                          "p_k_per_pa": round(p, 4), "basis": slot_basis_unknown})
-            fallback += 1
-            continue
-        b_rate, b_pa = _k_rate_vs(entry["rows"], hand, p_league, K_MIN_BATTER_PA)
-        if b_rate is None or b_pa < K_MIN_BATTER_PA:
-            p = _log5(slot_fallback_rate, s_rate[_default_side(hand)], p_league)
-            slots.append({"slot": i + 1, "name": entry.get("name"),
-                          "p_k_per_pa": round(p, 4),
-                          "basis": ("team avg (thin sample)"
-                                    if unknown_slot_rate is not None
-                                    else "league (thin sample)")})
-            fallback += 1
-            continue
-        side = entry.get("side") or _default_side(hand)
-        p = _log5(b_rate, s_rate.get(side, s_rate[_default_side(hand)]), p_league)
-        slots.append({"slot": i + 1, "name": entry.get("name"),
-                      "p_k_per_pa": round(p, 4), "basis": f"log5 vs {hand}HP"})
+    slot_probs = []
+    slot_inputs = []
+    league_fallbacks = 0
+    for slot, entry in enumerate(lineup[:9], start=1):
+        side = (entry or {}).get("side") or "R"
+        s = per_pa_k_rate(s_rows, "stand", side)
+        if not s or s["pa"] < K_MIN_STARTER_TBF:
+            return None  # starter sample vs this side too thin -- refuse
+        s_rate = shrunk(s["k"], s["pa"], p_league)
 
-    # park factor (Savant K index, weight-controlled, neutral on absence)
-    park = 1.0
-    if park_k_factor is not None and K_PARK_WEIGHT > 0:
-        park = 1.0 + K_PARK_WEIGHT * (float(park_k_factor) - 1.0)
-    slot_probs = [min(0.95, max(0.005, s["p_k_per_pa"] * park)) for s in slots]
+        b_rate = fallback_rate
+        b_info = {"slot": slot, "name": None, "basis": fb_unknown}
+        if entry:
+            b_rows = rows_before(entry["rows"], before)
+            b = per_pa_k_rate(b_rows, "p_throws", starter_hand)
+            if b and b["pa"] >= K_MIN_BATTER_PA:
+                b_rate = shrunk(b["k"], b["pa"], p_league)
+                basis = f"{b['pa']} PA vs {starter_hand}HP"
+                if K_ARSENAL_WEIGHT > 0:
+                    b_split = [r for r in b_rows if r.get("p_throws") == starter_hand]
+                    s_split = [r for r in s_rows if r.get("stand") == side]
+                    ars = k_arsenal_rate(b_split, s_split, b["k"] / b["pa"])
+                    if ars:
+                        a_shrunk = (ars["rate"] * b["pa"] + K_SHRINK_PA * p_league) / (b["pa"] + K_SHRINK_PA)
+                        b_rate = K_ARSENAL_WEIGHT * a_shrunk + (1 - K_ARSENAL_WEIGHT) * b_rate
+                        basis += " +arsenal"
+                b_info = {"slot": slot, "name": entry.get("name"), "basis": basis}
+            else:
+                league_fallbacks += 1
+                b_info = {"slot": slot, "name": entry.get("name"),
+                          "basis": fb_thin}
 
-    # mixture over the real TBF samples
-    mixture_len = max(samples) + 1
-    mixture = [0.0] * mixture_len
+        p = log5(b_rate, s_rate, p_league)
+        if park_k_factor and K_PARK_WEIGHT > 0:
+            p = min(p * (max(0.85, min(1.15, park_k_factor)) ** K_PARK_WEIGHT), 0.9)
+        slot_probs.append(p)
+        b_info["p_k_per_pa"] = round(p, 4)
+        slot_inputs.append(b_info)
+
+    # Mixture over the starter's real workload distribution
+    weight = 1.0 / len(samples)
+    max_tbf = max(samples)
+    dist = [0.0] * (max_tbf + 1)
     for tbf in samples:
         counts = slot_pa_counts(tbf)
         seq = [slot_probs[i] for i in range(9) for _ in range(counts[i])]
         pb = poisson_binomial(seq)
         for k, m in enumerate(pb):
-            mixture[k] += m / len(samples)
+            dist[k] += weight * m
+    mean = sum(k * m for k, m in enumerate(dist))
 
-    mean_k = sum(k * m for k, m in enumerate(mixture))
     return {
-        "dist": [round(m, 6) for m in mixture],
-        "mean_k": round(mean_k, 3),
-        "tbf_mean": round(tbf_mean, 1),
+        "dist": [round(m, 6) for m in dist],
+        "mean_k": round(mean, 3),
+        "tbf_samples": samples,
+        "tbf_mean": round(sum(samples) / len(samples), 1),
         "inputs": {
-            "slots": slots,
-            "league_fallback_slots": fallback,
-            "park_k_factor": park_k_factor,
-            "tbf_samples": len(samples),
+            "league_k_rate": round(p_league, 4),
+            "starter_hand": starter_hand,
+            "shrink_pa": K_SHRINK_PA,
+            "park_k_factor": round(park_k_factor, 3) if park_k_factor else None,
+            "league_fallback_slots": league_fallbacks,
+            "slots": slot_inputs,
         },
     }
 
 
-def _default_side(hand: str) -> str:
-    """Unknown batters modeled as the platoon-common side vs this hand."""
-    return "L" if hand == "R" else "R"
-
-
-def _log5(b_rate: float, p_rate: float, league: float) -> float:
-    """Classic log5: batter K rate x pitcher K rate / league."""
-    if league <= 0:
-        return b_rate
-    num = (b_rate * p_rate) / league
-    den = num + ((1 - b_rate) * (1 - p_rate)) / (1 - league)
-    return num / den if den > 0 else b_rate
+def price_line(kdist: dict, line: float) -> dict:
+    """Model read on a posted line: calibrated P(over) / P(under) + fair
+    probability straight off the distribution shape."""
+    raw_over = prob_over(kdist["dist"], line)
+    p_over = calibrate(raw_over)
+    return {"line": line, "p_over": round(p_over, 4), "p_over_raw": round(raw_over, 4),
+            "p_under": round(1 - p_over, 4)}
