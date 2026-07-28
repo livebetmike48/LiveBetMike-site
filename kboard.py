@@ -461,8 +461,20 @@ def _build_board(date: str, progress: dict) -> dict:
                 except Exception:
                     s_rows = []
                 order = (orders.get(opp_side) or []) if isinstance(orders, dict) else []
-                lineup, known = _build_lineup(order)
                 entry["lineup_posted"] = bool(order)
+                entry["lineup_source"] = "posted"
+                if not order:
+                    # Tier-2 projection: the opponent's most recent REAL
+                    # posted lineup vs this hand (~7-8/9 repeat). Labeled,
+                    # never passed off as today's; team-rate remains the
+                    # per-slot fallback underneath.
+                    proxy = kmodel.fetch_recent_lineup(opp.get("id"), hand)
+                    if proxy:
+                        order = proxy["batter_ids"]
+                        entry["lineup_source"] = f"projected (last vs {hand}HP, {proxy['date']})"
+                    else:
+                        entry["lineup_source"] = "team avg (no recent lineup found)"
+                lineup, known = _build_lineup(order)
                 entry["lineup_known_slots"] = known
                 kdist = kmodel.k_distribution(
                     lineup, s_rows, hand, p_league,
