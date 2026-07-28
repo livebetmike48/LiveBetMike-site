@@ -105,30 +105,50 @@ def _game_starts(game_pk: int, date_str: str, p_league: float,
         if hand not in ("L", "R"):
             continue
 
-        lineup_order = list(order[:9])
+        start_pks = kmodel.fetch_start_games(starter_id, before=date_str)
+
+        def _entries(pids: list) -> list:
+            lu = []
+            for pid in pids[:9]:
+                try:
+                    b_rows = parlay.get_player_season_rows(pid, False)
+                except Exception:
+                    lu.append(None)
+                    continue
+                b_side = _majority_side(b_rows, date_str)
+                lu.append({"rows": b_rows, "side": b_side, "name": pid}
+                          if b_side else None)
+            while len(lu) < 9:
+                lu.append(None)
+            return lu
+
+        # The start POPULATION is defined by the ACTUAL-mode gate in every
+        # mode. Without this, league mode (all slots defaulting to R) dodges
+        # the starter's lefty-sample minimum and prices ~6% more starts than
+        # actual mode (July 28: 625 vs 587), making cross-mode Brier
+        # comparisons population-contaminated. Gate first, then re-price the
+        # SAME start under the mode's lineup knowledge.
+        actual_lineup = _entries(list(order))
+        kdist = kmodel.k_distribution(
+            actual_lineup, starter_rows, hand, p_league,
+            before=date_str, park_k_factor=_park_k(venue),
+            start_game_pks=start_pks)
+        if kdist is None:
+            continue  # actual-mode refusal -> out of population in ALL modes
         if K_LINEUP_MODE == "league":
-            lineup_order = []
+            kdist = kmodel.k_distribution(
+                [None] * 9, starter_rows, hand, p_league,
+                before=date_str, park_k_factor=_park_k(venue),
+                start_game_pks=start_pks)
         elif K_LINEUP_MODE == "proxy":
             batting_team_id = ((batting_team.get("team") or {}).get("id"))
             proxy = kmodel.fetch_recent_lineup(batting_team_id, hand,
                                                before=date_str)
-            lineup_order = proxy["batter_ids"] if proxy else []
-        lineup = []
-        for pid in lineup_order:
-            try:
-                b_rows = parlay.get_player_season_rows(pid, False)
-            except Exception:
-                lineup.append(None)
-                continue
-            b_side = _majority_side(b_rows, date_str)
-            lineup.append({"rows": b_rows, "side": b_side, "name": pid} if b_side else None)
-        while len(lineup) < 9:
-            lineup.append(None)
-
-        kdist = kmodel.k_distribution(
-            lineup, starter_rows, hand, p_league,
-            before=date_str, park_k_factor=_park_k(venue),
-            start_game_pks=kmodel.fetch_start_games(starter_id, before=date_str))
+            mode_lineup = _entries(proxy["batter_ids"]) if proxy else [None] * 9
+            kdist = kmodel.k_distribution(
+                mode_lineup, starter_rows, hand, p_league,
+                before=date_str, park_k_factor=_park_k(venue),
+                start_game_pks=start_pks)
         if kdist is None:
             continue
 
