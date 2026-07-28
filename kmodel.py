@@ -219,9 +219,24 @@ def tbf_samples(starter_rows: list[dict],
         ev = r.get("events")
         if ev and ev not in statcast_api.NON_PA_EVENTS:
             games[key] = games.get(key, 0) + 1
-    if start_game_pks is not None:
-        # authoritative: MLB game log says which games he STARTED
-        games = {k: v for k, v in games.items() if k[1] in start_game_pks}
+    if start_game_pks is not None and games:
+        # authoritative: MLB game log says which games he STARTED.
+        # game_pk types normalized both sides (Savant rows can carry
+        # str/float pks; the game log gives ints).
+        def _pk(v):
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                return None
+        norm_starts = {_pk(p) for p in start_game_pks}
+        filtered = {k: v for k, v in games.items() if _pk(k[1]) in norm_starts}
+        if filtered:
+            games = filtered
+        else:
+            # filter matched NOTHING against real appearances -> data
+            # mismatch, not a reliever. Legacy grouping, loudly.
+            log.warning("start filter matched 0 of %d games -- game_pk "
+                        "mismatch vs game log; using legacy grouping", len(games))
     elif has_inning:
         games = {k: v for k, v in games.items() if first_inning.get(k) == 1}
     samples = sorted(games.values())
@@ -263,6 +278,10 @@ def fetch_start_games(starter_id: int, before: str | None = None) -> set | None:
                     gpk = ((sp.get("game") or {}).get("gamePk"))
                     date = sp.get("date")
                     if gpk and int(st.get("gamesStarted") or 0) >= 1:
+                        try:
+                            gpk = int(gpk)
+                        except (TypeError, ValueError):
+                            continue
                         entries.append((gpk, date or ""))
             _starts_cache["pks"][starter_id] = entries
         except Exception as e:
