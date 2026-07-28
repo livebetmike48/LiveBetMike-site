@@ -31,6 +31,16 @@ except ImportError:
 
 log = logging.getLogger("kbacktest")
 
+# Lineup mode for the calibration backtest -- the Tier-2 gauntlet switch.
+#   actual (default): the real boxscore lineup (what the model knew after post)
+#   proxy:  the opponent's most recent prior lineup vs the same hand,
+#           point-in-time (simulates the PRE-lineup board honestly)
+#   league: all slots unknown (the pre-lineup floor baseline)
+# Set via env K_LINEUP_MODE; recorded in every report. Proxy earns the
+# pre-lineup job only if its Brier beats league on the same window.
+import os as _os
+K_LINEUP_MODE = _os.getenv("K_LINEUP_MODE", "actual").strip().lower()
+
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 
 LINE_LADDER = (3.5, 4.5, 5.5, 6.5, 7.5)
@@ -95,8 +105,16 @@ def _game_starts(game_pk: int, date_str: str, p_league: float,
         if hand not in ("L", "R"):
             continue
 
+        lineup_order = list(order[:9])
+        if K_LINEUP_MODE == "league":
+            lineup_order = []
+        elif K_LINEUP_MODE == "proxy":
+            batting_team_id = ((batting_team.get("team") or {}).get("id"))
+            proxy = kmodel.fetch_recent_lineup(batting_team_id, hand,
+                                               before=date_str)
+            lineup_order = proxy["batter_ids"] if proxy else []
         lineup = []
-        for pid in order[:9]:
+        for pid in lineup_order:
             try:
                 b_rows = parlay.get_player_season_rows(pid, False)
             except Exception:
@@ -104,6 +122,8 @@ def _game_starts(game_pk: int, date_str: str, p_league: float,
                 continue
             b_side = _majority_side(b_rows, date_str)
             lineup.append({"rows": b_rows, "side": b_side, "name": pid} if b_side else None)
+        while len(lineup) < 9:
+            lineup.append(None)
 
         kdist = kmodel.k_distribution(
             lineup, starter_rows, hand, p_league,
@@ -201,6 +221,7 @@ def run_k_backtest(days: int, progress=None) -> dict:
         "n": len(preds),
         "starts": len(starts),
         "days": days,
+        "lineup_mode": K_LINEUP_MODE,
         "calibration": calibration,
         "brier_model": model_brier,
         "brier_constant": constant_brier,
