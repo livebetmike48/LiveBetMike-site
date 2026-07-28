@@ -30,6 +30,7 @@ July 27 additive changes (defaults reproduce the validated model exactly):
 import os
 import time
 import logging
+from datetime import datetime, timedelta
 
 import requests
 
@@ -309,6 +310,79 @@ def fetch_start_games(starter_id: int, before: str | None = None) -> set | None:
     if before:
         return {gpk for gpk, d in entries if d and d < before}
     return {gpk for gpk, _ in entries}
+
+
+_lineup_cache = {"date": None, "lu": {}}
+
+
+def fetch_recent_lineup(team_id: int, hand: str, before: str | None = None,
+                        lookback: int = 12) -> dict | None:
+    """The team's most recent REAL posted batting order against a
+    same-handed starter: {'batter_ids': [9 ids], 'date': 'YYYY-MM-DD'}.
+
+    Tier-2 lineup projection: ~7-8 of 9 names usually repeat vs the same
+    hand, so yesterday's real lineup beats a team-average blur. `before`
+    restricts to games strictly before that date (point-in-time for the
+    backtest). None on any failure or no match -- callers fall back to
+    team-rate slots, never crash, never invent names."""
+    if not team_id or hand not in ("L", "R"):
+        return None
+    today = time.strftime("%Y-%m-%d")
+    if _lineup_cache["date"] != today:
+        _lineup_cache.update({"date": today, "lu": {}})
+    ck = (team_id, hand, before)
+    if ck in _lineup_cache["lu"]:
+        return _lineup_cache["lu"][ck]
+    result = None
+    try:
+        end = before or today
+        start = (datetime.strptime(end, "%Y-%m-%d")
+                 - timedelta(days=lookback)).strftime("%Y-%m-%d")
+        sched = requests.get(
+            f"{MLB_BASE}/schedule",
+            params={"sportId": 1, "teamId": team_id,
+                    "startDate": start, "endDate": end},
+            timeout=20).json()
+        games = []
+        for d in (sched.get("dates") or []):
+            for g in (d.get("games") or []):
+                st = ((g.get("status") or {}).get("abstractGameState"))
+                if st == "Final" and g.get("officialDate", d.get("date", "")) < end:
+                    games.append((g.get("officialDate") or d.get("date"),
+                                  g.get("gamePk")))
+        games.sort(reverse=True)  # newest first
+        for gdate, gpk in games[:10]:
+            box = requests.get(f"{MLB_BASE}/game/{gpk}/boxscore",
+                               timeout=20).json()
+            teams = box.get("teams") or {}
+            side = None
+            for s in ("home", "away"):
+                if (((teams.get(s) or {}).get("team") or {}).get("id")) == team_id:
+                    side = s
+            if side is None:
+                continue
+            opp = "away" if side == "home" else "home"
+            opp_pitchers = (teams.get(opp) or {}).get("pitchers") or []
+            order = (teams.get(side) or {}).get("battingOrder") or []
+            if not opp_pitchers or len(order) < 9:
+                continue
+            sp = ((teams.get(opp) or {}).get("players") or {}).get(
+                f"ID{opp_pitchers[0]}") or {}
+            opp_hand = (((sp.get("person") or {}).get("pitchHand") or {})
+                        .get("code"))
+            if opp_hand != hand:
+                continue
+            result = {"batter_ids": [int(b) for b in order[:9]], "date": gdate}
+            break
+    except Exception as e:
+        log.warning("recent-lineup fetch failed for team %s vs %sHP: %s",
+                    team_id, hand, e)
+        result = None
+    _lineup_cache["lu"][ck] = result
+    if result:
+        log.info("proxy lineup team %s vs %sHP: from %s", team_id, hand,
+                 result["date"])
+    return result
 
 
 def slot_pa_counts(tbf: int) -> list[int]:
