@@ -1126,7 +1126,7 @@ function renderKLab(main, kj) {
     box.style.marginBottom = "14px";
     const when = new Date(run.ts * 1000).toLocaleString();
     let h = `<div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">`;
-    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.starts ?? "?"} starts, ${rep.n} ladder predictions</div>`;
+    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.starts ?? "?"} starts, ${rep.n} ladder predictions${rep.lineup_mode && rep.lineup_mode !== "actual" ? ` — <span style="color:#e0a12f">lineup mode: ${rep.lineup_mode}</span>` : ""}</div>`;
     h += `<div style="margin:6px 0">Brier: model <b style="color:var(--white)">${rep.brier_model}</b> vs constant ${rep.brier_constant}${rep.brier_naive != null ? " vs naive " + rep.brier_naive : ""} (lower wins)`;
     const beats = rep.brier_model < rep.brier_constant && (rep.brier_naive == null || rep.brier_model < rep.brier_naive);
     h += beats ? ` <span style="color:#4caf7d">✅ beats baselines</span>` : ` <span style="color:#e0a12f">⚠️ not clearly better — don't ship</span>`;
