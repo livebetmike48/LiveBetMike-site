@@ -11,6 +11,7 @@ import bullpen
 import lab
 import kboard
 import kplays
+import csw
 import projections
 import pitchers as pitchers_mod
 
@@ -231,6 +232,17 @@ def api_projections():
             data = projections.attach_odds(dict(data))
         data["result_log"] = projections.result_log()
         return data
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/csw")
+def api_csw(name: str = "", pitcher_id: int = 0):
+    """CSW% verification: our numbers from Savant pitch rows, to be checked
+    against the FanGraphs leaderboard before CSW is allowed near the model.
+    Read-only, no odds credits."""
+    try:
+        return csw.pitcher_csw(pitcher_id or None, name or None)
     except Exception as e:
         return {"error": str(e)}
 
