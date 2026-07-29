@@ -29,8 +29,12 @@ against FanGraphs BEFORE it earns a gauntlet run.
 """
 import logging
 
+import requests
+
 import statcast_api
 import parlay
+
+MLB_BASE = "https://statsapi.mlb.com/api/v1"
 
 log = logging.getLogger("csw")
 
@@ -135,3 +139,106 @@ def pitcher_csw(pitcher_id: int | None = None, name: str | None = None) -> dict:
                            "pitches). Reconciled to the decimal 2026-07-29 "
                            "on Burns/Misiorowski/Luzardo."),
     }
+
+
+# ---------------------------------------------------------------------------
+# Bulk verification view. Temporary by design: this whole section plus the two
+# app.py routes can be deleted in one commit once CSW is verified and either
+# adopted or dropped. Nothing else imports it.
+# ---------------------------------------------------------------------------
+
+def slate_csw(date: str | None = None) -> dict:
+    """Every probable starter on a slate with his season CSW, sorted high to
+    low -- the whole board in one pass instead of one name at a time.
+
+    Costs zero odds credits (MLB schedule + Savant rows only). The first
+    call of a day is slow: one Savant pull per starter, cached per player
+    per day by parlay.get_player_season_rows, so reloads are instant."""
+    import time as _time
+    et = _time.gmtime(_time.time() - 4 * 3600)
+    date = date or _time.strftime("%Y-%m-%d", et)
+    try:
+        sched = requests.get(f"{MLB_BASE}/schedule",
+                             params={"sportId": 1, "date": date,
+                                     "hydrate": "probablePitcher,team"},
+                             timeout=20).json()
+    except Exception as e:
+        return {"error": f"schedule fetch failed: {e}", "date": date}
+
+    seen: set = set()
+    starters = []
+    for d in (sched.get("dates") or []):
+        for g in (d.get("games") or []):
+            for side in ("home", "away"):
+                t = (g.get("teams") or {}).get(side) or {}
+                p = t.get("probablePitcher") or {}
+                pid = p.get("id")
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                starters.append({
+                    "pitcher_id": pid,
+                    "name": p.get("fullName", "?"),
+                    "team": ((t.get("team") or {}).get("abbreviation") or "?"),
+                })
+
+    rows = []
+    for s in starters:
+        try:
+            pr = parlay.get_player_season_rows(int(s["pitcher_id"]), True)
+        except Exception as e:
+            log.warning("slate csw: rows failed for %s: %s", s["name"], e)
+            pr = None
+        if not pr:
+            rows.append({**s, "csw_pct": None, "note": "no pitch rows"})
+            continue
+        st = csw_stats(pr) or {}
+        top = next(iter(csw_by_pitch_type(pr).items()), None)
+        rows.append({**s, **st,
+                     "top_pitch": (f"{top[0]} {top[1]['csw_pct']}% CSW "
+                                   f"@ {top[1]['usage_pct']}% usage") if top else None})
+    rows.sort(key=lambda r: -(r.get("csw_pct") or -1))
+    return {"date": date, "n": len(rows), "starters": rows,
+            "note": ("CSW = (called strikes + swinging strikes) / total pitches. "
+                     "Foul tips and foul balls excluded -- matches FanGraphs. "
+                     "League average ~29%.")}
+
+
+def slate_csw_html(date: str | None = None) -> str:
+    """The same thing as a plain table you can eyeball against FanGraphs."""
+    data = slate_csw(date)
+    if data.get("error"):
+        return f"<p>{data['error']}</p>"
+    head = ("<tr><th>#</th><th style='text-align:left'>Pitcher</th><th>Tm</th>"
+            "<th>CSW%</th><th>CStr%</th><th>SwStr%</th><th>Whiff%<br><small>per swing</small></th>"
+            "<th>Pitches</th><th style='text-align:left'>Best pitch</th></tr>")
+    body = []
+    for i, r in enumerate(data["starters"], 1):
+        if r.get("csw_pct") is None:
+            body.append(f"<tr><td>{i}</td><td>{r['name']}</td><td>{r['team']}</td>"
+                        f"<td colspan='6'><i>{r.get('note', 'no data')}</i></td></tr>")
+            continue
+        c = r["csw_pct"]
+        color = "#4caf7d" if c >= 32 else ("#e0a12f" if c >= 28 else "#8b95a1")
+        body.append(
+            f"<tr><td>{i}</td><td style='text-align:left'>{r['name']}</td>"
+            f"<td>{r['team']}</td>"
+            f"<td style='color:{color};font-weight:700'>{c}</td>"
+            f"<td>{r['called_pct']}</td><td>{r['swstr_pct']}</td>"
+            f"<td>{r.get('whiff_pct_of_swings', '-')}</td>"
+            f"<td>{r['pitches']}</td>"
+            f"<td style='text-align:left'><small>{r.get('top_pitch') or '-'}</small></td></tr>")
+    return f"""<!doctype html><meta charset="utf-8">
+<title>CSW check - {data['date']}</title>
+<style>
+ body{{background:#0f1216;color:#e6e9ee;font:14px/1.5 -apple-system,Segoe UI,Inter,sans-serif;
+      padding:18px;max-width:1000px;margin:auto}}
+ h1{{font-size:17px;margin:0 0 4px}} p.note{{color:#8b95a1;font-size:12.5px;margin:0 0 14px}}
+ table{{border-collapse:collapse;width:100%}}
+ th,td{{padding:5px 8px;text-align:center;border-bottom:1px solid #222831}}
+ th{{color:#8b95a1;font-weight:600;font-size:12px}} small{{color:#8b95a1}}
+</style>
+<h1>CSW check - {data['date']} - {data['n']} starters</h1>
+<p class="note">{data['note']} Green 32+, amber 28+. Compare the CSW% column
+against the FanGraphs leaderboard.</p>
+<table>{head}{''.join(body)}</table>"""
