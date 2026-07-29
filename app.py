@@ -1,7 +1,7 @@
 import logging
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 import os
@@ -243,6 +243,24 @@ def api_csw(name: str = "", pitcher_id: int = 0):
     Read-only, no odds credits."""
     try:
         return csw.pitcher_csw(pitcher_id or None, name or None)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/csw")
+def page_csw(date: str = ""):
+    """Bulk CSW verification page -- today's starters in one table. Temporary:
+    delete this route, /api/csw, and csw.py together when done."""
+    try:
+        return HTMLResponse(csw.slate_csw_html(date or None))
+    except Exception as e:
+        return HTMLResponse(f"<p>error: {e}</p>")
+
+
+@app.get("/api/csw/slate")
+def api_csw_slate(date: str = ""):
+    try:
+        return csw.slate_csw(date or None)
     except Exception as e:
         return {"error": str(e)}
 
