@@ -306,6 +306,37 @@ def export_csv() -> str:
     return "\n".join(lines)
 
 
+def export_market_bets_csv(run_ts: int | None = None) -> str:
+    """Every per-bet row from the market tests, flat -- opens straight in
+    Sheets. run_ts limits to one run; default = ALL stored runs (the
+    archive era makes re-runs cheap, so the full history is the dataset).
+    Units are flat-1U at the stored American price; win pays price/100 or
+    100/|price|, loss = -1."""
+    init_db()
+    q = ("SELECT run_ts, date, name, side, line, price, ev, hit, model_prob, "
+         "model_prob_raw, market_prob, vs_open FROM k_market_bets")
+    args: tuple = ()
+    if run_ts:
+        q += " WHERE run_ts=?"
+        args = (run_ts,)
+    q += " ORDER BY run_ts, date, name"
+    with _conn() as c:
+        rows = c.execute(q, args).fetchall()
+    lines = ["run_time,date,starter,side,line,price,ev_pct,won,units,"
+             "model_prob,model_prob_raw,market_prob,priced_vs"]
+    for (ts, date, name, side, line, price, ev, hit, mp, mpr, mkp, vo) in rows:
+        if hit is None or price is None:
+            units = ""
+        elif hit:
+            units = round(price / 100, 3) if price > 0 else round(100 / abs(price), 3)
+        else:
+            units = -1
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        lines.append(f"{when},{date},{name},{side},{line},{price},{ev},{hit},{units},"
+                     f"{mp},{mpr},{mkp},{'open' if vo else 'close'}")
+    return "\n".join(lines)
+
+
 def run_market_async(days: int) -> bool:
     with _lock:
         if _market_state["status"] == "running":
