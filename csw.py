@@ -193,10 +193,15 @@ def slate_csw(date: str | None = None) -> dict:
             rows.append({**s, "csw_pct": None, "note": "no pitch rows"})
             continue
         st = csw_stats(pr) or {}
-        top = next(iter(csw_by_pitch_type(pr).items()), None)
+        by_pt = csw_by_pitch_type(pr)
+        # HIGHEST-CSW pitch, not the most-used one (csw_by_pitch_type sorts by
+        # volume). "Best pitch" must mean best, or the column lies.
+        best = max(by_pt.items(), key=lambda kv: kv[1]["csw_pct"], default=None)
+        most = next(iter(by_pt.items()), None)
         rows.append({**s, **st,
-                     "top_pitch": (f"{top[0]} {top[1]['csw_pct']}% CSW "
-                                   f"@ {top[1]['usage_pct']}% usage") if top else None})
+                     "best_pitch": (f"{best[0]} {best[1]['csw_pct']}% CSW "
+                                    f"@ {best[1]['usage_pct']}% usage") if best else None,
+                     "most_used": (f"{most[0]} @ {most[1]['usage_pct']}%") if most else None})
     rows.sort(key=lambda r: -(r.get("csw_pct") or -1))
     return {"date": date, "n": len(rows), "starters": rows,
             "note": ("CSW = (called strikes + swinging strikes) / total pitches. "
@@ -211,12 +216,13 @@ def slate_csw_html(date: str | None = None) -> str:
         return f"<p>{data['error']}</p>"
     head = ("<tr><th>#</th><th style='text-align:left'>Pitcher</th><th>Tm</th>"
             "<th>CSW%</th><th>CStr%</th><th>SwStr%</th><th>Whiff%<br><small>per swing</small></th>"
-            "<th>Pitches</th><th style='text-align:left'>Best pitch</th></tr>")
+            "<th>Pitches</th><th style='text-align:left'>Best pitch (highest CSW)</th>"
+            "<th style='text-align:left'>Most used</th></tr>")
     body = []
     for i, r in enumerate(data["starters"], 1):
         if r.get("csw_pct") is None:
             body.append(f"<tr><td>{i}</td><td>{r['name']}</td><td>{r['team']}</td>"
-                        f"<td colspan='6'><i>{r.get('note', 'no data')}</i></td></tr>")
+                        f"<td colspan='7'><i>{r.get('note', 'no data')}</i></td></tr>")
             continue
         c = r["csw_pct"]
         color = "#4caf7d" if c >= 32 else ("#e0a12f" if c >= 28 else "#8b95a1")
@@ -227,7 +233,8 @@ def slate_csw_html(date: str | None = None) -> str:
             f"<td>{r['called_pct']}</td><td>{r['swstr_pct']}</td>"
             f"<td>{r.get('whiff_pct_of_swings', '-')}</td>"
             f"<td>{r['pitches']}</td>"
-            f"<td style='text-align:left'><small>{r.get('top_pitch') or '-'}</small></td></tr>")
+            f"<td style='text-align:left'><small>{r.get('best_pitch') or '-'}</small></td>"
+            f"<td style='text-align:left'><small>{r.get('most_used') or '-'}</small></td></tr>")
     return f"""<!doctype html><meta charset="utf-8">
 <title>CSW check - {data['date']}</title>
 <style>
