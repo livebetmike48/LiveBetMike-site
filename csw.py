@@ -8,11 +8,21 @@ publishes the leaderboard, which is what these numbers should be checked
 against.
 
 Definitional care (this is the whole ballgame for matching a public
-number): the standard counts called strikes, swinging strikes, and foul
-tips into the glove, and EXCLUDES foul balls. That is exactly
-statcast_api.WHIFF_DESCRIPTIONS (validated line-by-line against Savant's
-own whiff numbers) plus called_strike -- so this module imports that set
-rather than redefining it. One source of truth, per the house rule.
+number), settled empirically on 2026-07-29 against FanGraphs:
+
+  CSW whiffs = swinging_strike + swinging_strike_blocked ONLY.
+  FOUL TIPS ARE NOT COUNTED.
+
+Verified on Burns / Misiorowski / Luzardo: our called-strike rate matched
+FanGraphs exactly (13.8 / 17.0 / 17.9) while our whiff rate ran 1.0-1.6
+points hot; removing foul tips reproduced all nine of their figures to
+the decimal (implied 23 / 29 / 20 foul tips = 1.0-1.6% of pitches).
+
+Savant's OWN Whiff% is a different metric and DOES count foul tips
+(validated years ago against Soto: 17.3% with, 15.4% without). Both live
+here, deliberately named apart, so the two can never be confused:
+  swstr_pct           -- swinging strikes per PITCH   (FanGraphs SwStr%)
+  whiff_pct_of_swings -- Savant whiffs per SWING      (Savant Whiff%)
 
 Nothing here touches the model. It exists so the input can be verified
 against FanGraphs BEFORE it earns a gauntlet run.
@@ -27,6 +37,12 @@ log = logging.getLogger("csw")
 # The other half of CSW. Savant's description field for a taken strike.
 CALLED_DESCRIPTIONS = {"called_strike"}
 
+# CSW's whiff half: swinging strikes only. Deliberately NOT
+# statcast_api.WHIFF_DESCRIPTIONS, which additionally counts foul tips and
+# missed bunts -- correct for Savant's Whiff%, wrong for CSW (proven
+# against FanGraphs, see module docstring).
+CSW_WHIFF_DESCRIPTIONS = {"swinging_strike", "swinging_strike_blocked"}
+
 
 def csw_stats(rows: list[dict]) -> dict | None:
     """CSW over any subset of pitch rows. Denominator = ALL pitches in the
@@ -35,20 +51,23 @@ def csw_stats(rows: list[dict]) -> dict | None:
         return None
     pitches = len(rows)
     called = sum(1 for r in rows if r.get("description") in CALLED_DESCRIPTIONS)
-    whiffs = sum(1 for r in rows if r.get("description") in statcast_api.WHIFF_DESCRIPTIONS)
+    sw_str = sum(1 for r in rows if r.get("description") in CSW_WHIFF_DESCRIPTIONS)
+    savant_whiffs = sum(1 for r in rows
+                        if r.get("description") in statcast_api.WHIFF_DESCRIPTIONS)
     swings = sum(1 for r in rows if r.get("description") in statcast_api.SWING_DESCRIPTIONS)
     out = {
         "pitches": pitches,
         "called_strikes": called,
-        "whiffs": whiffs,
-        "csw_pct": round((called + whiffs) / pitches * 100, 1),
+        "swinging_strikes": sw_str,
+        "foul_tips": savant_whiffs - sw_str,   # the FanGraphs gap, made visible
+        "csw_pct": round((called + sw_str) / pitches * 100, 1),
         "called_pct": round(called / pitches * 100, 1),
-        "swstr_pct": round(whiffs / pitches * 100, 1),   # whiffs per PITCH
+        "swstr_pct": round(sw_str / pitches * 100, 1),   # FanGraphs SwStr%
     }
     if swings:
-        # whiffs per SWING -- Savant's "Whiff%", kept beside CSW so the two
-        # never get confused with each other
-        out["whiff_pct_of_swings"] = round(whiffs / swings * 100, 1)
+        # Savant's "Whiff%" -- per SWING and foul tips INCLUDED. A different
+        # metric from the two above, kept beside them so nobody mixes them up.
+        out["whiff_pct_of_swings"] = round(savant_whiffs / swings * 100, 1)
     return out
 
 
@@ -110,8 +129,9 @@ def pitcher_csw(pitcher_id: int | None = None, name: str | None = None) -> dict:
         "overall": overall,
         "by_side": csw_by_side(rows),
         "by_pitch_type": csw_by_pitch_type(rows),
-        "verify_against": ("FanGraphs CSW% leaderboard (same definition: "
-                           "called strikes + whiffs incl. foul tips, "
-                           "excl. foul balls, over total pitches). "
-                           "League average ~29%."),
+        "verify_against": ("FanGraphs CSW% leaderboard -- definition matched "
+                           "exactly (called strikes + swinging strikes, "
+                           "foul tips and foul balls EXCLUDED, over total "
+                           "pitches). Reconciled to the decimal 2026-07-29 "
+                           "on Burns/Misiorowski/Luzardo."),
     }
