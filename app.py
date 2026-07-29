@@ -12,6 +12,7 @@ import lab
 import kboard
 import kplays
 import csw
+import kmatchup
 import projections
 import pitchers as pitchers_mod
 
@@ -261,6 +262,28 @@ def page_csw(date: str = ""):
 def api_csw_slate(date: str = ""):
     try:
         return csw.slate_csw(date or None)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/kmatchup")
+def page_kmatchup(starter: str = "", date: str = ""):
+    """Arsenal-vs-lineup verification page. Temporary, like /csw: delete
+    kmatchup.py and these two routes together when done."""
+    if not starter:
+        return HTMLResponse("<p>add ?starter=Name (a probable starter today)</p>")
+    try:
+        return HTMLResponse(kmatchup.matchup_html(starter, date or None))
+    except Exception as e:
+        return HTMLResponse(f"<p>error: {e}</p>")
+
+
+@app.get("/api/kmatchup")
+def api_kmatchup_arsenal(starter_id: int = 0, opp_team_id: int = 0, hand: str = ""):
+    try:
+        if hand not in ("L", "R"):
+            return {"error": "hand must be L or R"}
+        return kmatchup.lineup_matchup(starter_id, opp_team_id, hand)
     except Exception as e:
         return {"error": str(e)}
 
