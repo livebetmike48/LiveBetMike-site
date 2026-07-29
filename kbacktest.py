@@ -43,6 +43,78 @@ K_LINEUP_MODE = _os.getenv("K_LINEUP_MODE", "actual").strip().lower()
 
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 
+# ---------------- permanent odds archive (pay once, replay free) ----------------
+# Every historical odds snapshot a market test fetches is saved here forever.
+# Every fetch checks the archive FIRST, so re-running any window the archive
+# covers -- same knobs or new ones -- costs ~zero credits automatically.
+import os as _os
+import json as _json
+import sqlite3 as _sqlite3
+
+ARCHIVE_DB = _os.getenv("DB_PATH", "odds_history.db")
+
+
+def _archive_conn():
+    conn = _sqlite3.connect(ARCHIVE_DB)
+    conn.execute("""CREATE TABLE IF NOT EXISTS k_odds_archive (
+        event_id TEXT, snapshot TEXT, market TEXT, payload TEXT,
+        PRIMARY KEY (event_id, snapshot, market))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS k_events_archive (
+        snapshot TEXT PRIMARY KEY, payload TEXT)""")
+    return conn
+
+
+_fetch_stats = {"events_api": 0, "events_hit": 0, "odds_api": 0, "odds_hit": 0}
+
+
+def _hist_events(snapshot: str) -> list:
+    """Historical events list, archive-first."""
+    try:
+        with _archive_conn() as c:
+            row = c.execute("SELECT payload FROM k_events_archive WHERE snapshot=?",
+                            (snapshot,)).fetchone()
+        if row:
+            _fetch_stats["events_hit"] += 1
+            return _json.loads(row[0])
+    except Exception as e:
+        log.warning("events archive read failed: %s", e)
+    events = odds_api.get_historical_events(snapshot)
+    _fetch_stats["events_api"] += 1
+    if events:
+        try:
+            with _archive_conn() as c:
+                c.execute("INSERT OR IGNORE INTO k_events_archive VALUES (?,?)",
+                          (snapshot, _json.dumps(events)))
+        except Exception as e:
+            log.warning("events archive write failed: %s", e)
+    return events
+
+
+def _hist_odds(event_id: str, snapshot: str, market: str):
+    """Historical event odds, archive-first. The credit is spent at most
+    once per (event, snapshot, market) for the life of the database."""
+    try:
+        with _archive_conn() as c:
+            row = c.execute(
+                "SELECT payload FROM k_odds_archive WHERE event_id=? AND snapshot=? AND market=?",
+                (event_id, snapshot, market)).fetchone()
+        if row:
+            _fetch_stats["odds_hit"] += 1
+            return _json.loads(row[0])
+    except Exception as e:
+        log.warning("odds archive read failed: %s", e)
+    data = odds_api.get_historical_event_odds(event_id, snapshot, market=market)
+    _fetch_stats["odds_api"] += 1
+    if data:
+        try:
+            with _archive_conn() as c:
+                c.execute("INSERT OR IGNORE INTO k_odds_archive VALUES (?,?,?,?)",
+                          (event_id, snapshot, market, _json.dumps(data)))
+        except Exception as e:
+            log.warning("odds archive write failed: %s", e)
+    return data
+
+
 LINE_LADDER = (3.5, 4.5, 5.5, 6.5, 7.5)
 
 
@@ -418,6 +490,8 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
     moved TOWARD the model's bet. Movement converges on truth far faster
     than units. Roughly doubles credits (two snapshots per game)."""
     p_league = kmodel.league_k_rate()
+    for k in _fetch_stats:
+        _fetch_stats[k] = 0  # per-run credit receipts
     end = datetime.now(timezone.utc) - timedelta(hours=4)
     hand_cache: dict = {}
     candidates = []
@@ -432,7 +506,7 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
             continue
         if not games:
             continue
-        hist_events = odds_api.get_historical_events(f"{date_str}T16:00:00Z")
+        hist_events = _hist_events(f"{date_str}T16:00:00Z")
         log.info("k market day %d/%d (%s): %d games, %d hist events",
                  i, days, date_str, len(games), len(hist_events))
         for g in games:
@@ -449,18 +523,18 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
                 continue
             close_at = ev_match.get("commence_time") or f"{date_str}T23:00:00Z"
             if vs_open:
-                open_data = odds_api.get_historical_event_odds(
+                open_data = _hist_odds(
                     ev_match.get("id"), f"{date_str}T{K_OPEN_SNAPSHOT_UTC}Z",
-                    market="pitcher_strikeouts")
-                close_data = odds_api.get_historical_event_odds(
-                    ev_match.get("id"), close_at, market="pitcher_strikeouts")
+                    "pitcher_strikeouts")
+                close_data = _hist_odds(
+                    ev_match.get("id"), close_at, "pitcher_strikeouts")
                 odds_data = open_data
                 if not odds_data:
                     continue  # no opener posted by the snapshot -- skip honestly
             else:
                 close_data = None
-                odds_data = odds_api.get_historical_event_odds(
-                    ev_match.get("id"), close_at, market="pitcher_strikeouts")
+                odds_data = _hist_odds(
+                    ev_match.get("id"), close_at, "pitcher_strikeouts")
             if not odds_data:
                 continue
             games_priced += 1
@@ -523,4 +597,10 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
                          if (toward + against) else None}
     report["sample_bets"] = sorted(candidates, key=lambda c: -c["ev"])[:12]
     report["_candidates"] = candidates  # full per-bet list for blend storage (stripped before display)
+    # Credit receipts: api = credits actually spent this run; archive = free
+    # replays. Re-running an archived window costs ~zero -- pay once, replay
+    # forever. This line on the receipt is the proof.
+    report["odds_fetches"] = {
+        "api": _fetch_stats["events_api"] + _fetch_stats["odds_api"],
+        "archive": _fetch_stats["events_hit"] + _fetch_stats["odds_hit"]}
     return report
