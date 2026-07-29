@@ -235,6 +235,19 @@ def api_projections():
         return {"error": str(e)}
 
 
+@app.get("/api/kmarketbets.csv")
+def api_kmarketbets_csv(run_ts: int | None = None):
+    """Every per-bet row from the K market tests, flat CSV. run_ts limits
+    to one run (from the Lab history); default = all stored runs."""
+    try:
+        return PlainTextResponse(lab.export_market_bets_csv(run_ts),
+                                 media_type="text/csv",
+                                 headers={"Content-Disposition":
+                                          "attachment; filename=k_market_bets.csv"})
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/lab/export.csv")
 def api_lab_export():
     from fastapi.responses import PlainTextResponse
