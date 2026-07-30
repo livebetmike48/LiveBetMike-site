@@ -58,6 +58,48 @@ K_CALIB_POINTS: list = []  # [(predicted, actual)] on P(over) probabilities
 # exact validated mixture. Short-real-start candidate ~8-12 TBF.
 K_MIN_TBF_SAMPLE = int(os.getenv("K_MIN_TBF_SAMPLE", "0"))
 
+# ---- CSW shrinkage prior (July 30; env knob, default 0 = OFF) ----
+# What it changes: the TARGET a starter's per-side K rate shrinks toward.
+# At 0 (default) that target is the league rate -- the exact validated
+# model. At w > 0 it becomes w * (K rate implied by HIS OWN called-strike%
+# and swinging-strike%) + (1-w) * league: a six-start arm has ~30 K
+# outcomes but ~1,800 pitches, and the pitches know more. called% and
+# SwStr% enter SEPARATELY (same CSW can come from stealing strikes or
+# missing bats -- different skills, verified on Luzardo's SI vs CH) and
+# the mapping is FIT ON PRE-WINDOW DATA by the backtest, never assumed:
+# K_CSW_COEFS stays None until kbacktest fits and freezes it, so setting
+# the weight WITHOUT a fitted mapping changes nothing (live-board safe).
+K_CSW_PRIOR_WEIGHT = float(os.getenv("K_CSW_PRIOR_WEIGHT", "0"))
+K_CSW_COEFS: dict | None = None   # {a, b_called, c_swstr, n, r2, fit_before}
+
+# CSW's whiff half: swinging strikes ONLY -- foul tips excluded. This is
+# the FanGraphs-reconciled definition (proven to the decimal on
+# Burns/Misiorowski/Luzardo, 7/29); statcast_api.WHIFF_DESCRIPTIONS is a
+# DIFFERENT metric (Savant Whiff%, foul tips included) -- do not swap.
+CSW_WHIFF_DESCRIPTIONS = {"swinging_strike", "swinging_strike_blocked"}
+
+
+def called_swstr(rows: list[dict]) -> dict | None:
+    """Called-strike and swinging-strike fractions over total pitches --
+    the two components of CSW, kept separate on purpose."""
+    n = len(rows)
+    if not n:
+        return None
+    called = sum(1 for r in rows if r.get("description") == "called_strike")
+    sw = sum(1 for r in rows if r.get("description") in CSW_WHIFF_DESCRIPTIONS)
+    return {"pitches": n, "called": called / n, "swstr": sw / n}
+
+
+def csw_implied_k(called: float, swstr: float) -> float | None:
+    """Per-PA K rate implied by the frozen mapping. None until a fit
+    exists. Clamped to a sane band so a weird fit can never price a
+    starter at an impossible rate."""
+    c = K_CSW_COEFS
+    if not c:
+        return None
+    implied = c["a"] + c["b_called"] * called + c["c_swstr"] * swstr
+    return min(max(implied, 0.08), 0.45)
+
 
 def calibrate(p: float) -> float:
     """Same piecewise-linear correction as the hit model, fit from the
@@ -453,6 +495,26 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
     fb_thin = ("league (thin sample)" if unknown_slot_rate is None
                else "team avg (thin sample)")
 
+    # CSW shrinkage prior: per-side shrink target for the STARTER only.
+    # Inactive (exact validated math) unless the weight is on AND a fitted
+    # mapping is loaded AND his per-side pitch sample clears the floor.
+    csw_targets: dict = {}
+    csw_receipt: dict = {}
+    if K_CSW_PRIOR_WEIGHT > 0 and K_CSW_COEFS:
+        for side in ("L", "R"):
+            cs = called_swstr([r for r in s_rows if r.get("stand") == side])
+            if not cs or cs["pitches"] < 300:
+                continue
+            implied = csw_implied_k(cs["called"], cs["swstr"])
+            if implied is None:
+                continue
+            csw_targets[side] = (K_CSW_PRIOR_WEIGHT * implied
+                                 + (1 - K_CSW_PRIOR_WEIGHT) * p_league)
+            csw_receipt[side] = {"called": round(cs["called"], 4),
+                                 "swstr": round(cs["swstr"], 4),
+                                 "implied_k": round(implied, 4),
+                                 "pitches": cs["pitches"]}
+
     slot_probs = []
     slot_inputs = []
     league_fallbacks = 0
@@ -461,7 +523,7 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
         s = per_pa_k_rate(s_rows, "stand", side)
         if not s or s["pa"] < K_MIN_STARTER_TBF:
             return None  # starter sample vs this side too thin -- refuse
-        s_rate = shrunk(s["k"], s["pa"], p_league)
+        s_rate = shrunk(s["k"], s["pa"], csw_targets.get(side, p_league))
 
         b_rate = fallback_rate
         b_info = {"slot": slot, "name": None, "basis": fb_unknown}
@@ -513,6 +575,8 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
             "league_k_rate": round(p_league, 4),
             "starter_hand": starter_hand,
             "shrink_pa": K_SHRINK_PA,
+            "csw_prior": ({"weight": K_CSW_PRIOR_WEIGHT, **csw_receipt}
+                          if csw_receipt else None),
             "park_k_factor": round(park_k_factor, 3) if park_k_factor else None,
             "league_fallback_slots": league_fallbacks,
             "slots": slot_inputs,
