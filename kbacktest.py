@@ -240,6 +240,66 @@ def _game_starts(game_pk: int, date_str: str, p_league: float,
     return out
 
 
+def fit_csw_mapping(starter_ids: set, fit_before: str) -> dict | None:
+    """Fit K-per-PA ~ a + b*called% + c*SwStr% across starters, using ONLY
+    rows strictly before `fit_before` -- so a backtest window starting
+    there is genuinely out-of-sample. Which pitchers appear is taken from
+    the window (identity is not outcome data); every NUMBER in the fit
+    predates the window. Plain OLS by normal equations, no libraries.
+    Returns the frozen coefficient dict, or None when the population is
+    too thin to fit honestly (then the prior stays league and the knob
+    does nothing -- loudly)."""
+    pts = []
+    for sid in starter_ids:
+        try:
+            rows = kmodel.rows_before(
+                parlay.get_player_season_rows(int(sid), True), fit_before)
+        except Exception:
+            continue
+        k = kmodel.per_pa_k_rate(rows, "stand", "L")
+        r = kmodel.per_pa_k_rate(rows, "stand", "R")
+        pa = ((k or {}).get("pa") or 0) + ((r or {}).get("pa") or 0)
+        ks = ((k or {}).get("k") or 0) + ((r or {}).get("k") or 0)
+        cs = kmodel.called_swstr(rows)
+        if pa < 150 or not cs or cs["pitches"] < 500:
+            continue
+        pts.append((cs["called"], cs["swstr"], ks / pa))
+    if len(pts) < 25:
+        log.warning("csw fit: only %d qualifying starters before %s -- "
+                    "NOT fitting; prior stays league", len(pts), fit_before)
+        return None
+    n = len(pts)
+    sx = sum(p[0] for p in pts); sy = sum(p[1] for p in pts)
+    sz = sum(p[2] for p in pts)
+    sxx = sum(p[0] * p[0] for p in pts); syy = sum(p[1] * p[1] for p in pts)
+    sxy = sum(p[0] * p[1] for p in pts)
+    sxz = sum(p[0] * p[2] for p in pts); syz = sum(p[1] * p[2] for p in pts)
+    # solve [[n,sx,sy],[sx,sxx,sxy],[sy,sxy,syy]] * [a,b,c] = [sz,sxz,syz]
+    import copy
+    m = [[n, sx, sy, sz], [sx, sxx, sxy, sxz], [sy, sxy, syy, syz]]
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r_: abs(m[r_][col]))
+        if abs(m[piv][col]) < 1e-12:
+            log.warning("csw fit: singular system -- not fitting")
+            return None
+        m[col], m[piv] = m[piv], m[col]
+        for r_ in range(3):
+            if r_ == col:
+                continue
+            f = m[r_][col] / m[col][col]
+            for c_ in range(col, 4):
+                m[r_][c_] -= f * m[col][c_]
+    a = m[0][3] / m[0][0]; b = m[1][3] / m[1][1]; c = m[2][3] / m[2][2]
+    mean_z = sz / n
+    ss_tot = sum((p[2] - mean_z) ** 2 for p in pts)
+    ss_res = sum((p[2] - (a + b * p[0] + c * p[1])) ** 2 for p in pts)
+    r2 = round(1 - ss_res / ss_tot, 3) if ss_tot > 0 else 0.0
+    coefs = {"a": round(a, 4), "b_called": round(b, 4), "c_swstr": round(c, 4),
+             "n": n, "r2": r2, "fit_before": fit_before}
+    log.info("csw fit: %s", coefs)
+    return coefs
+
+
 def run_k_backtest(days: int, progress=None) -> dict:
     """Walk the last `days` completed days, model every start point-in-time,
     grade P(K > L) across the line ladder vs reality."""
@@ -247,6 +307,29 @@ def run_k_backtest(days: int, progress=None) -> dict:
     end = datetime.now(timezone.utc) - timedelta(hours=4)
     starts = []
     hand_cache: dict = {}
+    # CSW prior gauntlet support: when the env knob is on, fit the mapping
+    # on data BEFORE the window and freeze it for the whole run. Weight 0
+    # (default) skips all of this -- the exact validated path.
+    kmodel.K_CSW_COEFS = None
+    csw_fit = None
+    if kmodel.K_CSW_PRIOR_WEIGHT > 0:
+        window_start = (end - timedelta(days=days)).strftime("%Y-%m-%d")
+        sids: set = set()
+        for i in range(1, days + 1):
+            d = (end - timedelta(days=i)).strftime("%Y-%m-%d")
+            try:
+                for g in backtest._final_games(d):
+                    box = requests.get(
+                        f"{MLB_BASE}/game/{g['gamePk']}/boxscore",
+                        timeout=20).json()
+                    for side in ("home", "away"):
+                        ps = ((box.get("teams") or {}).get(side) or {}).get("pitchers") or []
+                        if ps:
+                            sids.add(ps[0])
+            except Exception:
+                continue
+        csw_fit = fit_csw_mapping(sids, window_start)
+        kmodel.K_CSW_COEFS = csw_fit
     for i in range(1, days + 1):
         date_str = (end - timedelta(days=i)).strftime("%Y-%m-%d")
         try:
