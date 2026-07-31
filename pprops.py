@@ -40,6 +40,7 @@ import requests
 import parlay
 import statcast_api
 import kmodel
+import kboard
 
 log = logging.getLogger("pprops")
 
@@ -272,3 +273,135 @@ def price_line(dist: dict, line: float) -> dict:
     raw = kmodel.prob_over(dist["dist"], line)
     return {"line": line, "p_over": round(raw, 4), "p_under": round(1 - raw, 4),
             "calibrated": False}
+
+
+# ---------------------------------------------------------------------------
+# Verification surface. Same discipline the CSW work used: look at the
+# numbers on a real slate BEFORE anything is backtested or priced. Read
+# only -- no odds credits, no logging, no effect on the K board.
+# ---------------------------------------------------------------------------
+
+def slate_projections(offset: int = 0, markets: tuple = ("hits", "walks")) -> dict:
+    """Every modelable starter on the slate with his projected hits and
+    walks allowed, built exactly like the K board builds strikeouts:
+    posted lineup when it's up, the board's own projection when it isn't,
+    each hitter priced on his real rate vs this hand.
+
+    The league P/PA constant is computed from THIS slate's starters -- a
+    real sample, never an assumed 3.90 -- and only used if enough of them
+    qualify."""
+    offset = 1 if offset == 1 else 0
+    date = parlay.et_date_str(offset)
+    try:
+        rates = league_rates()
+    except Exception as e:
+        return {"error": f"league rates unavailable: {e}", "date": date}
+
+    slate = kboard._slate(date)
+    # pass 1: collect starter rows (also gives us the league P/PA sample)
+    loaded = []
+    for g in slate:
+        orders = kboard._lineup_order(g["game_pk"])
+        orders = orders if isinstance(orders, dict) else {}
+        for side, opp_side in (("home", "away"), ("away", "home")):
+            team, opp = g["teams"][side], g["teams"][opp_side]
+            if not team.get("starter_id"):
+                continue
+            try:
+                hand = parlay.get_starter_hand(team["starter_id"])
+            except Exception:
+                hand = None
+            if hand not in ("L", "R"):
+                continue
+            try:
+                s_rows = parlay.get_player_season_rows(team["starter_id"], True)
+            except Exception:
+                s_rows = []
+            if not s_rows:
+                continue
+            loaded.append({"game": g, "team": team, "opp": opp, "hand": hand,
+                           "rows": s_rows, "orders": orders, "side": side,
+                           "opp_side": opp_side})
+    league_pppa = league_pitches_per_pa([e["rows"] for e in loaded])
+
+    out = []
+    for e in loaded:
+        team, opp, hand = e["team"], e["opp"], e["hand"]
+        order = list((e["orders"].get(e["opp_side"]) or [])[:9])
+        source = "posted"
+        if not order:
+            proxy = kmodel.fetch_recent_lineup(opp.get("id"), hand)
+            if proxy:
+                order, source = proxy["batter_ids"], f"projected ({proxy['date']})"
+            else:
+                source = "team avg"
+        lineup, known = kboard._build_lineup(order)
+        row = {"starter": team.get("starter_name"), "starter_id": team.get("starter_id"),
+               "team": team.get("abbrev"), "opp": opp.get("abbrev"), "hand": hand,
+               "lineup_source": source, "known_slots": known}
+        ppa = pitches_per_pa(e["rows"])
+        row["pppa"] = round(ppa["pppa"], 2) if ppa else None
+        row["workload_factor"] = workload_adjustment(lineup, league_pppa, weight=1.0)
+        for m in markets:
+            d = prop_distribution(m, lineup, e["rows"], hand, rates[m],
+                                  start_game_pks=kmodel.fetch_start_games(team["starter_id"]),
+                                  league_pppa=league_pppa)
+            if not d or d.get("error"):
+                row[m] = None
+                continue
+            row[m] = {"mean": d["mean"], "tbf_mean": d["tbf_mean"],
+                      "over_line": {str(l + 0.5): round(kmodel.prob_over(d["dist"], l + 0.5), 3)
+                                    for l in range(2, 9)}}
+        out.append(row)
+    out.sort(key=lambda r: -((r.get("hits") or {}).get("mean") or -1))
+    return {"date": date, "league_pppa": round(league_pppa, 3) if league_pppa else None,
+            "league_rates": {m: round(r, 4) for m, r in rates.items()},
+            "n": len(out), "starters": out,
+            "note": ("BETA — engine only, never backtested, no calibration curve, "
+                     "nothing logged. Compare the means against your own read "
+                     "before trusting any of it.")}
+
+
+def slate_projections_html(offset: int = 0) -> str:
+    d = slate_projections(offset)
+    if d.get("error"):
+        return f"<p>{d['error']}</p>"
+    rows = []
+    for r in d["starters"]:
+        h, w = r.get("hits"), r.get("walks")
+        if not h and not w:
+            rows.append(f"<tr><td style='text-align:left'>{r['starter']}</td>"
+                        f"<td>{r['team']}</td><td>{r['opp']}</td>"
+                        f"<td colspan='6'><i>no read — house minimums</i></td></tr>")
+            continue
+        lu = ("posted" if r["lineup_source"] == "posted"
+              else f"<span style='color:#e0a12f'>{r['lineup_source']}</span>")
+        rows.append(
+            f"<tr><td style='text-align:left'>{r['starter']}</td><td>{r['team']}</td>"
+            f"<td>{r['opp']}</td><td>{r['hand']}</td>"
+            f"<td><b>{h['mean'] if h else '-'}</b></td>"
+            f"<td>{w['mean'] if w else '-'}</td>"
+            f"<td>{h['tbf_mean'] if h else '-'}</td>"
+            f"<td>{r['pppa'] or '-'}</td>"
+            f"<td>{r['workload_factor']}</td><td>{lu}</td></tr>")
+    return f"""<!doctype html><meta charset="utf-8">
+<title>Pitcher props (BETA) - {d['date']}</title>
+<style>
+ body{{background:#0f1216;color:#e6e9ee;font:14px/1.55 -apple-system,Segoe UI,Inter,sans-serif;
+      padding:18px;max-width:1050px;margin:auto}}
+ h1{{font-size:17px;margin:0 0 2px}} p.note{{color:#8b95a1;font-size:12.5px;margin:2px 0 14px}}
+ table{{border-collapse:collapse;width:100%}}
+ th,td{{padding:5px 8px;text-align:center;border-bottom:1px solid #222831}}
+ th{{color:#8b95a1;font-weight:600;font-size:12px}}
+</style>
+<h1>Pitcher props — {d['date']} — {d['n']} starters</h1>
+<p class="note">{d['note']}<br>
+League per-PA: hits {d['league_rates'].get('hits')} · walks {d['league_rates'].get('walks')} ·
+league P/PA {d['league_pppa'] or 'n/a'} (computed from this slate's starters, not assumed).
+Workload factor is what the opponent-adjustment WOULD do at full weight — it is currently
+OFF in the model.</p>
+<table>
+<tr><th style="text-align:left">Starter</th><th>Tm</th><th>vs</th><th>Hand</th>
+<th>Hits allowed</th><th>Walks</th><th>TBF</th><th>His P/PA</th><th>Workload x</th>
+<th>Lineup</th></tr>
+{''.join(rows)}</table>"""
