@@ -312,7 +312,7 @@ def run_k_backtest(days: int, progress=None) -> dict:
     # (default) skips all of this -- the exact validated path.
     kmodel.K_CSW_COEFS = None
     csw_fit = None
-    if kmodel.K_CSW_PRIOR_WEIGHT > 0:
+    if kmodel.K_CSW_PRIOR_WEIGHT > 0 or kmodel.K_CSW_BLEND_WEIGHT > 0:
         window_start = (end - timedelta(days=days)).strftime("%Y-%m-%d")
         sids: set = set()
         for i in range(1, days + 1):
@@ -328,6 +328,8 @@ def run_k_backtest(days: int, progress=None) -> dict:
                             sids.add(ps[0])
             except Exception:
                 continue
+        log.info("csw: collecting starters for the pre-window fit "
+                 "(%d days scanned)...", days)
         csw_fit = fit_csw_mapping(sids, window_start)
         kmodel.K_CSW_COEFS = csw_fit
     for i in range(1, days + 1):
