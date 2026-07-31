@@ -49,82 +49,14 @@ MIN_USAGE_PCT = 3.0     # ignore pitches he barely throws
 MIN_BATTER_SWINGS = 200  # below this, the hitter's overall rate is itself thin
 
 
-def _swings_whiffs(rows: list[dict]) -> tuple[int, int]:
-    sw = sum(1 for r in rows if r.get("description") in statcast_api.SWING_DESCRIPTIONS)
-    wh = sum(1 for r in rows if r.get("description") in statcast_api.WHIFF_DESCRIPTIONS)
-    return sw, wh
-
-
-def batter_pitch_whiffs(batter_rows: list[dict]) -> dict:
-    """Hitter's whiff-per-swing against every pitch type he's seen, with
-    the swing count that produced it (so thin numbers are visible)."""
-    by_type: dict[str, list] = {}
-    for r in batter_rows:
-        pt = r.get("pitch_type")
-        if pt:
-            by_type.setdefault(pt, []).append(r)
-    out = {}
-    for pt, rows in by_type.items():
-        sw, wh = _swings_whiffs(rows)
-        if sw:
-            out[pt] = {"swings": sw, "whiffs": wh,
-                       "whiff_pct": round(wh / sw * 100, 1)}
-    return out
-
-
-def _shrink(rate: float | None, swings: int, overall: float,
-            k: int = SHRINK_SWINGS) -> float:
-    """Pull a thin per-pitch rate toward the hitter's own overall rate.
-    40 swings moves ~45% of the way; 400 swings moves ~89%. No sample at
-    all -> his overall rate, unchanged."""
-    if rate is None or not swings:
-        return overall
-    return (swings * rate + k * overall) / (swings + k)
-
-
-def arsenal_whiff(starter_rows: list[dict], batter_rows: list[dict],
-                  batter_side: str) -> dict | None:
-    """One hitter vs one pitcher's mix. Returns the usage-weighted expected
-    whiff rate, his overall whiff rate, the gap between them, and every
-    component that produced it."""
-    mix = statcast_api.pitch_mix_breakdown(
-        [r for r in starter_rows if r.get("stand") == batter_side])
-    if not mix:
-        return None
-    b_sw, b_wh = _swings_whiffs(batter_rows)
-    if not b_sw:
-        return None
-    overall = b_wh / b_sw * 100
-    per_pitch = batter_pitch_whiffs(batter_rows)
-
-    parts, weight_sum, weighted = [], 0.0, 0.0
-    for pt, m in mix.items():
-        usage = m.get("usage_pct", 0)
-        if usage < MIN_USAGE_PCT:
-            continue
-        bp = per_pitch.get(pt) or {}
-        shrunk = _shrink(bp.get("whiff_pct"), bp.get("swings", 0), overall)
-        weighted += usage * shrunk
-        weight_sum += usage
-        parts.append({
-            "pitch": pt,
-            "usage_pct": usage,
-            "pitcher_whiff_pct": m.get("whiff_pct"),
-            "batter_whiff_pct": bp.get("whiff_pct"),
-            "batter_swings": bp.get("swings", 0),
-            "shrunk_whiff_pct": round(shrunk, 1),
-        })
-    if not weight_sum:
-        return None
-    expected = weighted / weight_sum
-    return {
-        "expected_whiff_pct": round(expected, 1),
-        "overall_whiff_pct": round(overall, 1),
-        "diff_pts": round(expected - overall, 1),
-        "batter_swings": b_sw,
-        "thin": b_sw < MIN_BATTER_SWINGS,
-        "components": parts,
-    }
+# The math now lives in kmodel (single source of truth) so the page and the
+# model can never disagree. kmatchup keeps the lineup walk + rendering.
+_swings_whiffs = kmodel._swings_whiffs
+batter_pitch_whiffs = kmodel.batter_pitch_whiffs
+arsenal_whiff = kmodel.arsenal_whiff
+SHRINK_SWINGS = kmodel.MATCHUP_SHRINK_SWINGS
+MIN_USAGE_PCT = kmodel.MATCHUP_MIN_USAGE_PCT
+MIN_BATTER_SWINGS = kmodel.MATCHUP_MIN_SWINGS
 
 
 def lineup_matchup(starter_id: int, opp_team_id: int, hand: str,
