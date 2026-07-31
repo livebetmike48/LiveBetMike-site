@@ -28,6 +28,7 @@ July 27 additive changes (defaults reproduce the validated model exactly):
     change; set via env K_MIN_TBF_SAMPLE.
 """
 import os
+import math
 import time
 import logging
 from datetime import datetime, timedelta
@@ -621,6 +622,37 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
                                  "pitches": cs["pitches"]}
 
     mix_cache: dict = {}
+    # ---- matchup pre-pass: ratios, CENTERED across the lineup ----
+    # Why centering is mandatory: the raw ratio compares expected whiff vs
+    # THIS starter's mix against the hitter's OVERALL whiff rate -- and his
+    # overall includes relievers, who throw harder and more breaking stuff
+    # and generate more whiffs. So the raw ratio sits below 1 for nearly
+    # everyone facing a starter, and the layer marks the whole slate down
+    # (measured 7/30: projected K/start fell 4.93 -> 4.81, every bucket
+    # under-predicting). Centering makes the layer answer the question it
+    # is actually for -- WHICH hitters this arsenal beats -- and leaves the
+    # slate's total where the model's own K rates already put it.
+    matchup_ratios: dict = {}
+    if K_MATCHUP_WEIGHT > 0:
+        logs = []
+        for idx, entry in enumerate(lineup[:9]):
+            if not entry:
+                continue
+            m_side = entry.get("side") or "R"
+            if m_side not in mix_cache:
+                mix_cache[m_side] = statcast_api.pitch_mix_breakdown(
+                    [r for r in s_rows if r.get("stand") == m_side])
+            aw = arsenal_whiff(s_rows, rows_before(entry["rows"], before),
+                               m_side, mix=mix_cache[m_side])
+            if aw and not aw["thin"] and aw["overall_whiff_pct"] > 0:
+                r = aw["expected_whiff_pct"] / aw["overall_whiff_pct"]
+                if r > 0:
+                    matchup_ratios[idx] = r
+                    logs.append(math.log(r))
+        if logs:
+            center = math.exp(sum(logs) / len(logs))
+            matchup_ratios = {k: v / center for k, v in matchup_ratios.items()}
+
     slot_probs = []
     slot_inputs = []
     league_fallbacks = 0
@@ -652,18 +684,12 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
                         a_shrunk = (ars["rate"] * b["pa"] + K_SHRINK_PA * p_league) / (b["pa"] + K_SHRINK_PA)
                         b_rate = K_ARSENAL_WEIGHT * a_shrunk + (1 - K_ARSENAL_WEIGHT) * b_rate
                         basis += " +arsenal"
-                if K_MATCHUP_WEIGHT > 0:
-                    if side not in mix_cache:
-                        mix_cache[side] = statcast_api.pitch_mix_breakdown(
-                            [r for r in s_rows if r.get("stand") == side])
-                    aw = arsenal_whiff(s_rows, b_rows, side, mix=mix_cache[side])
-                    if (aw and not aw["thin"] and aw["overall_whiff_pct"] > 0):
-                        ratio = aw["expected_whiff_pct"] / aw["overall_whiff_pct"]
-                        ratio = min(max(ratio, MATCHUP_RATIO_CLAMP[0]),
-                                    MATCHUP_RATIO_CLAMP[1])
-                        b_rate = min(max(b_rate * (1 + K_MATCHUP_WEIGHT * (ratio - 1)),
-                                         0.02), 0.75)
-                        basis += f" +matchup {ratio:.2f}x"
+                if K_MATCHUP_WEIGHT > 0 and (slot - 1) in matchup_ratios:
+                    ratio = min(max(matchup_ratios[slot - 1],
+                                    MATCHUP_RATIO_CLAMP[0]), MATCHUP_RATIO_CLAMP[1])
+                    b_rate = min(max(b_rate * (1 + K_MATCHUP_WEIGHT * (ratio - 1)),
+                                     0.02), 0.75)
+                    basis += f" +matchup {ratio:.2f}x"
                 b_info = {"slot": slot, "name": entry.get("name"), "basis": basis}
             else:
                 league_fallbacks += 1
