@@ -13,6 +13,7 @@ import kboard
 import kplays
 import csw
 import kmatchup
+import pprops
 import projections
 import pitchers as pitchers_mod
 
@@ -68,6 +69,25 @@ def api_lab():
 def api_kboard(d: int = 0):
     try:
         return kboard.get_board(d)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/pprops")
+def page_pprops(d: int = 0):
+    """Pitcher props verification page (BETA, engine only — never
+    backtested, nothing logged). Temporary like /csw: delete pprops.py and
+    these two routes together if it doesn't earn its place."""
+    try:
+        return HTMLResponse(pprops.slate_projections_html(d))
+    except Exception as e:
+        return HTMLResponse(f"<p>error: {e}</p>")
+
+
+@app.get("/api/pprops")
+def api_pprops(d: int = 0):
+    try:
+        return pprops.slate_projections(d)
     except Exception as e:
         return {"error": str(e)}
 
