@@ -72,6 +72,16 @@ def api_kboard(d: int = 0):
         return {"error": str(e)}
 
 
+@app.get("/api/lineups")
+def api_lineups(d: int = 0):
+    """Today's (d=0) or tomorrow's (d=1) lineups -- posted where they're up,
+    projected where they aren't. Read-only, no odds credits."""
+    try:
+        return kboard.projected_lineups(d)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/kplayers")
 def api_kplayers():
     try:
