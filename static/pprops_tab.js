@@ -98,6 +98,7 @@
       "<th title='from the live K model — same number as the K Board, calibration curve and all'>Ks</th>" +
       "<th>Hits</th><th>Walks</th><th>TBF</th>" +
       "<th title='his own pitches per plate appearance'>P/PA</th>" +
+      "<th title=\"Savant's official index_hits park factor, applied to hits only — walks aren't a dimensions event\">Park</th>" +
       "<th title='what the opponent workload adjustment WOULD apply at full weight — currently OFF in the model'>Workload ×</th>" +
       "<th>Lineup</th></tr></thead><tbody>";
     rows.forEach(function (s) {
@@ -115,6 +116,7 @@
         "<td>" + (s.walks ? s.walks.mean : "–") + "</td>" +
         "<td>" + (s.hits ? s.hits.tbf_mean : "–") + "</td>" +
         "<td>" + (s.pppa || "–") + "</td>" +
+        "<td>" + (s.park_hits || "–") + "</td>" +
         "<td style='color:" + wcol + "'>" + wf + "</td>" +
         "<td>" + lu + "</td></tr>";
     });
