@@ -51,6 +51,13 @@ P_SHRINK_PA = int(os.getenv("P_SHRINK_PA", "60"))
 P_MIN_BATTER_PA = int(os.getenv("P_MIN_BATTER_PA", "40"))
 P_MIN_STARTER_TBF = int(os.getenv("P_MIN_STARTER_TBF", "60"))
 P_MIN_STARTS = int(os.getenv("P_MIN_STARTS", "3"))
+# NOTE (July 31, retracted the same day it was added): a short workload
+# distribution is NOT automatically a bug. An OPENER really does face
+# three or four batters, and 3.3 TBF is the honest projection for him --
+# refusing it deletes an accurate read. The Griffin Jax failure was a
+# different thing entirely: a reliever being priced as a STARTER, so a
+# relief-length workload met a line set for a starter's. The workload
+# distribution is the prediction; when it says "opener", believe it.
 # Opponent workload adjustment: 0 = OFF (exact validated workload mixture,
 # opponent-blind, same as the K model). 1 = full. Earns its weight in the
 # Lab like every other knob -- default 0 until then.
@@ -64,6 +71,17 @@ MARKETS = {
     "walks": {"events": statcast_api.BB_EVENTS, "label": "walks allowed",
               "stat_key": "baseOnBalls"},
 }
+
+# Strikeouts are NOT in MARKETS on purpose. The K model is further along
+# than this engine -- calibration curve fitted from 2,935 graded
+# predictions, park factor, team-rate slots for unknown lineups, a
+# validated forward log -- so pricing K here with the generic engine
+# would put a SECOND, worse strikeout number on the same site. Instead
+# the props view CALLS kmodel directly (k_projection below), so the K
+# column and the K Board are the same number by construction. One model,
+# shown in two places -- which is the endpoint Mike wants anyway: every
+# prop in one spot, with K keeping its own clean section until the rest
+# catch up.
 
 
 # ---------- league rates (same source + cadence as kmodel.league_k_rate) ----------
@@ -266,6 +284,25 @@ def prop_distribution(market: str, lineup: list, starter_rows: list[dict],
     }
 
 
+def k_projection(lineup: list, starter_rows: list[dict], starter_hand: str,
+                 start_game_pks: set | None = None,
+                 park_k_factor: float | None = None,
+                 unknown_slot_rate: float | None = None) -> dict | None:
+    """Strikeouts, straight from the live K model -- same call the K Board
+    makes, same knobs, same fitted calibration curve. Never a reimplementation."""
+    kd = kmodel.k_distribution(lineup, starter_rows, starter_hand,
+                               kmodel.league_k_rate(),
+                               before=None, park_k_factor=park_k_factor,
+                               unknown_slot_rate=unknown_slot_rate,
+                               start_game_pks=start_game_pks)
+    if not kd:
+        return None
+    return {"mean": kd["mean_k"], "tbf_mean": kd["tbf_mean"],
+            "calibrated": True, "source": "K model (live)",
+            "over_line": {str(l + 0.5): kmodel.price_line(kd, l + 0.5)["p_over"]
+                          for l in range(2, 10)}}
+
+
 def price_line(dist: dict, line: float) -> dict:
     """Model read on a posted line, straight off the distribution shape.
     No calibration curve yet -- each market earns its own in the Lab, and
@@ -341,7 +378,17 @@ def slate_projections(offset: int = 0, markets: tuple = ("hits", "walks")) -> di
                "lineup_source": source, "known_slots": known}
         ppa = pitches_per_pa(e["rows"])
         row["pppa"] = round(ppa["pppa"], 2) if ppa else None
-        row["workload_factor"] = workload_adjustment(lineup, league_pppa, weight=1.0)
+        try:
+            row["strikeouts"] = k_projection(
+                lineup, e["rows"], hand,
+                start_game_pks=kmodel.fetch_start_games(team["starter_id"]),
+                park_k_factor=kboard._park_k((e["game"] or {}).get("venue")))
+        except Exception as exc:
+            log.warning("pprops: K projection failed for %s: %s",
+                        team.get("starter_name"), exc)
+            row["strikeouts"] = None
+        row["workload_factor"] = round(
+            workload_adjustment(lineup, league_pppa, weight=1.0), 3)
         for m in markets:
             d = prop_distribution(m, lineup, e["rows"], hand, rates[m],
                                   start_game_pks=kmodel.fetch_start_games(team["starter_id"]),
@@ -379,6 +426,7 @@ def slate_projections_html(offset: int = 0) -> str:
         rows.append(
             f"<tr><td style='text-align:left'>{r['starter']}</td><td>{r['team']}</td>"
             f"<td>{r['opp']}</td><td>{r['hand']}</td>"
+            f"<td>{(r.get('strikeouts') or {}).get('mean', '-')}</td>"
             f"<td><b>{h['mean'] if h else '-'}</b></td>"
             f"<td>{w['mean'] if w else '-'}</td>"
             f"<td>{h['tbf_mean'] if h else '-'}</td>"
@@ -402,6 +450,6 @@ Workload factor is what the opponent-adjustment WOULD do at full weight — it i
 OFF in the model.</p>
 <table>
 <tr><th style="text-align:left">Starter</th><th>Tm</th><th>vs</th><th>Hand</th>
-<th>Hits allowed</th><th>Walks</th><th>TBF</th><th>His P/PA</th><th>Workload x</th>
-<th>Lineup</th></tr>
+<th>Ks</th><th>Hits allowed</th><th>Walks</th><th>TBF</th><th>His P/PA</th>
+<th>Workload x</th><th>Lineup</th></tr>
 {''.join(rows)}</table>"""
