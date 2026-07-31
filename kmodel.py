@@ -79,6 +79,99 @@ K_CSW_PRIOR_WEIGHT = float(os.getenv("K_CSW_PRIOR_WEIGHT", "0"))
 # moved the estimate ~0.003; at blend 0.3 it moves ~0.010, at 0.5 ~0.015.
 # Same fitted mapping, same receipts, same default-0 safety.
 K_CSW_BLEND_WEIGHT = float(os.getenv("K_CSW_BLEND_WEIGHT", "0"))
+
+# ---- arsenal matchup, HITTER side (July 30; env knob, default 0) ----
+# The one thing this model genuinely does not know: WHICH pitches beat a
+# hitter. It knows his overall K rate vs hand (a direct measurement, and a
+# good one) but nothing about the shape underneath it. Two hitters with the
+# same K rate can be a slider problem and a fastball problem, and only one
+# of them should scare you against a slider-heavy arm.
+#
+# The adjustment: expected whiff vs THIS arsenal / his overall whiff, a
+# ratio built from his own per-pitch-type whiff rates (each shrunk toward
+# his overall by swing count) weighted by the pitcher's real usage to that
+# side. Ratio 1.10 = this mix misses his bat 10% more than average pitching
+# does -> nudge his K rate up 10% at full weight. Clamped, dampened by the
+# knob, and NEVER built from head-to-head (batter-vs-this-pitcher samples
+# are the classic noise trap).
+K_MATCHUP_WEIGHT = float(os.getenv("K_MATCHUP_WEIGHT", "0"))
+MATCHUP_SHRINK_SWINGS = 50    # swings at which a pitch type gets half its own rate
+MATCHUP_MIN_USAGE_PCT = 3.0   # ignore pitches he barely throws
+# Hitter needs a usable OVERALL swing sample (all pitch types combined --
+# a regular has ~800 by late July, so this only excludes bench/call-up
+# bats whose anchor rate is itself noisy). Per-pitch-type thinness is NOT
+# floored: shrinkage handles it. Env-tunable so the floor can be swept
+# after the weight is settled -- one knob per run, in order.
+MATCHUP_MIN_SWINGS = int(os.getenv("K_MATCHUP_MIN_SWINGS", "150"))
+MATCHUP_RATIO_CLAMP = (0.75, 1.35)
+
+
+def _swings_whiffs(rows: list[dict]) -> tuple[int, int]:
+    sw = sum(1 for r in rows if r.get("description") in statcast_api.SWING_DESCRIPTIONS)
+    wh = sum(1 for r in rows if r.get("description") in statcast_api.WHIFF_DESCRIPTIONS)
+    return sw, wh
+
+
+def batter_pitch_whiffs(batter_rows: list[dict]) -> dict:
+    """Hitter's whiff-per-swing against each pitch type, with the swing
+    count that produced it so thin numbers stay visible."""
+    by_type: dict[str, list] = {}
+    for r in batter_rows:
+        pt = r.get("pitch_type")
+        if pt:
+            by_type.setdefault(pt, []).append(r)
+    out = {}
+    for pt, rows in by_type.items():
+        sw, wh = _swings_whiffs(rows)
+        if sw:
+            out[pt] = {"swings": sw, "whiffs": wh, "whiff_pct": round(wh / sw * 100, 1)}
+    return out
+
+
+def _shrink_whiff(rate: float | None, swings: int, overall: float) -> float:
+    if rate is None or not swings:
+        return overall
+    k = MATCHUP_SHRINK_SWINGS
+    return (swings * rate + k * overall) / (swings + k)
+
+
+def arsenal_whiff(starter_rows: list[dict], batter_rows: list[dict],
+                  batter_side: str, mix: dict | None = None) -> dict | None:
+    """One hitter vs one pitcher's mix. Single source of truth -- kmatchup's
+    page renders exactly this, so display and model can never drift."""
+    if mix is None:
+        mix = statcast_api.pitch_mix_breakdown(
+            [r for r in starter_rows if r.get("stand") == batter_side])
+    if not mix:
+        return None
+    b_sw, b_wh = _swings_whiffs(batter_rows)
+    if not b_sw:
+        return None
+    overall = b_wh / b_sw * 100
+    per_pitch = batter_pitch_whiffs(batter_rows)
+    parts, weight_sum, weighted = [], 0.0, 0.0
+    for pt, m in mix.items():
+        usage = m.get("usage_pct", 0)
+        if usage < MATCHUP_MIN_USAGE_PCT:
+            continue
+        bp = per_pitch.get(pt) or {}
+        shrunk_w = _shrink_whiff(bp.get("whiff_pct"), bp.get("swings", 0), overall)
+        weighted += usage * shrunk_w
+        weight_sum += usage
+        parts.append({"pitch": pt, "usage_pct": usage,
+                      "pitcher_whiff_pct": m.get("whiff_pct"),
+                      "batter_whiff_pct": bp.get("whiff_pct"),
+                      "batter_swings": bp.get("swings", 0),
+                      "shrunk_whiff_pct": round(shrunk_w, 1)})
+    if not weight_sum:
+        return None
+    expected = weighted / weight_sum
+    return {"expected_whiff_pct": round(expected, 1),
+            "overall_whiff_pct": round(overall, 1),
+            "diff_pts": round(expected - overall, 1),
+            "batter_swings": b_sw,
+            "thin": b_sw < MATCHUP_MIN_SWINGS,
+            "components": parts}
 K_CSW_COEFS: dict | None = None   # {a, b_called, c_swstr, n, r2, fit_before}
 
 # CSW's whiff half: swinging strikes ONLY -- foul tips excluded. This is
@@ -527,6 +620,7 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
                                  "implied_k": round(implied, 4),
                                  "pitches": cs["pitches"]}
 
+    mix_cache: dict = {}
     slot_probs = []
     slot_inputs = []
     league_fallbacks = 0
@@ -558,6 +652,18 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
                         a_shrunk = (ars["rate"] * b["pa"] + K_SHRINK_PA * p_league) / (b["pa"] + K_SHRINK_PA)
                         b_rate = K_ARSENAL_WEIGHT * a_shrunk + (1 - K_ARSENAL_WEIGHT) * b_rate
                         basis += " +arsenal"
+                if K_MATCHUP_WEIGHT > 0:
+                    if side not in mix_cache:
+                        mix_cache[side] = statcast_api.pitch_mix_breakdown(
+                            [r for r in s_rows if r.get("stand") == side])
+                    aw = arsenal_whiff(s_rows, b_rows, side, mix=mix_cache[side])
+                    if (aw and not aw["thin"] and aw["overall_whiff_pct"] > 0):
+                        ratio = aw["expected_whiff_pct"] / aw["overall_whiff_pct"]
+                        ratio = min(max(ratio, MATCHUP_RATIO_CLAMP[0]),
+                                    MATCHUP_RATIO_CLAMP[1])
+                        b_rate = min(max(b_rate * (1 + K_MATCHUP_WEIGHT * (ratio - 1)),
+                                         0.02), 0.75)
+                        basis += f" +matchup {ratio:.2f}x"
                 b_info = {"slot": slot, "name": entry.get("name"), "basis": basis}
             else:
                 league_fallbacks += 1
@@ -592,6 +698,7 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
             "league_k_rate": round(p_league, 4),
             "starter_hand": starter_hand,
             "shrink_pa": K_SHRINK_PA,
+            "matchup_weight": K_MATCHUP_WEIGHT or None,
             "csw_prior": ({"prior_weight": K_CSW_PRIOR_WEIGHT,
                            "blend_weight": K_CSW_BLEND_WEIGHT, **csw_receipt}
                           if csw_receipt else None),
