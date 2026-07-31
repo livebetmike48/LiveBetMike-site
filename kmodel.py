@@ -70,6 +70,15 @@ K_MIN_TBF_SAMPLE = int(os.getenv("K_MIN_TBF_SAMPLE", "0"))
 # K_CSW_COEFS stays None until kbacktest fits and freezes it, so setting
 # the weight WITHOUT a fitted mapping changes nothing (live-board safe).
 K_CSW_PRIOR_WEIGHT = float(os.getenv("K_CSW_PRIOR_WEIGHT", "0"))
+
+# The STRONGER form (July 30, after the prior tested flat): blend the
+# CSW-implied rate directly INTO the starter's per-side rate estimate,
+# partly replacing his observed outcomes rather than nudging what those
+# outcomes shrink toward. This is the real hypothesis -- that pitch
+# process measures true K talent better than results do. The prior knob
+# moved the estimate ~0.003; at blend 0.3 it moves ~0.010, at 0.5 ~0.015.
+# Same fitted mapping, same receipts, same default-0 safety.
+K_CSW_BLEND_WEIGHT = float(os.getenv("K_CSW_BLEND_WEIGHT", "0"))
 K_CSW_COEFS: dict | None = None   # {a, b_called, c_swstr, n, r2, fit_before}
 
 # CSW's whiff half: swinging strikes ONLY -- foul tips excluded. This is
@@ -499,8 +508,9 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
     # Inactive (exact validated math) unless the weight is on AND a fitted
     # mapping is loaded AND his per-side pitch sample clears the floor.
     csw_targets: dict = {}
+    csw_implied: dict = {}
     csw_receipt: dict = {}
-    if K_CSW_PRIOR_WEIGHT > 0 and K_CSW_COEFS:
+    if (K_CSW_PRIOR_WEIGHT > 0 or K_CSW_BLEND_WEIGHT > 0) and K_CSW_COEFS:
         for side in ("L", "R"):
             cs = called_swstr([r for r in s_rows if r.get("stand") == side])
             if not cs or cs["pitches"] < 300:
@@ -508,8 +518,10 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
             implied = csw_implied_k(cs["called"], cs["swstr"])
             if implied is None:
                 continue
-            csw_targets[side] = (K_CSW_PRIOR_WEIGHT * implied
-                                 + (1 - K_CSW_PRIOR_WEIGHT) * p_league)
+            csw_implied[side] = implied
+            if K_CSW_PRIOR_WEIGHT > 0:
+                csw_targets[side] = (K_CSW_PRIOR_WEIGHT * implied
+                                     + (1 - K_CSW_PRIOR_WEIGHT) * p_league)
             csw_receipt[side] = {"called": round(cs["called"], 4),
                                  "swstr": round(cs["swstr"], 4),
                                  "implied_k": round(implied, 4),
@@ -524,6 +536,11 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
         if not s or s["pa"] < K_MIN_STARTER_TBF:
             return None  # starter sample vs this side too thin -- refuse
         s_rate = shrunk(s["k"], s["pa"], csw_targets.get(side, p_league))
+        if K_CSW_BLEND_WEIGHT > 0 and side in csw_implied:
+            # Direct blend: pitch process partly REPLACES observed outcomes
+            # as the estimate of this starter's true per-side K rate.
+            s_rate = (K_CSW_BLEND_WEIGHT * csw_implied[side]
+                      + (1 - K_CSW_BLEND_WEIGHT) * s_rate)
 
         b_rate = fallback_rate
         b_info = {"slot": slot, "name": None, "basis": fb_unknown}
@@ -575,7 +592,8 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
             "league_k_rate": round(p_league, 4),
             "starter_hand": starter_hand,
             "shrink_pa": K_SHRINK_PA,
-            "csw_prior": ({"weight": K_CSW_PRIOR_WEIGHT, **csw_receipt}
+            "csw_prior": ({"prior_weight": K_CSW_PRIOR_WEIGHT,
+                           "blend_weight": K_CSW_BLEND_WEIGHT, **csw_receipt}
                           if csw_receipt else None),
             "park_k_factor": round(park_k_factor, 3) if park_k_factor else None,
             "league_fallback_slots": league_fallbacks,
