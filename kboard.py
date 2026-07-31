@@ -730,6 +730,74 @@ def players_list() -> list[dict]:
     return _players_cache["players"]
 
 
+def projected_lineups(offset: int = 0) -> dict:
+    """Every team on the slate with the nine hitters they'll send up.
+
+    Nothing new is computed here -- the board already resolves both of
+    these on every build; this just surfaces them in one place so they can
+    be read at a glance and loaded into the sim in a click:
+      posted    = today's REAL batting order from the boxscore
+      projected = that team's most recent real order vs this starter hand
+                  (kmodel.fetch_recent_lineup -- what the board prices
+                  with until lineups drop), stamped with the date it came
+                  from so it is never passed off as today's
+      none      = no order posted and no recent match found
+
+    Read-only. No odds credits, no model calls, no effect on pricing or
+    on the frozen forward log."""
+    offset = 1 if offset == 1 else 0
+    date = parlay.et_date_str(offset)
+    names = {p["id"]: p["name"] for p in players_list()}
+    games = []
+    for g in _slate(date):
+        orders = _lineup_order(g["game_pk"])
+        orders = orders if isinstance(orders, dict) else {}
+        entry = {"game_pk": g.get("game_pk"), "venue": g.get("venue"),
+                 "state": g.get("state"), "teams": []}
+        for side, opp_side in (("home", "away"), ("away", "home")):
+            bat = g["teams"][side]      # the hitting team
+            opp = g["teams"][opp_side]  # whose starter they face
+            hand = None
+            if opp.get("starter_id"):
+                try:
+                    hand = parlay.get_starter_hand(opp["starter_id"])
+                except Exception:
+                    hand = None
+            order = list((orders.get(side) or [])[:9])
+            source, from_date = "posted", None
+            if not order:
+                source = "none"
+                if hand in ("L", "R") and bat.get("id"):
+                    proxy = kmodel.fetch_recent_lineup(bat["id"], hand)
+                    if proxy:
+                        order = list(proxy["batter_ids"])[:9]
+                        source, from_date = "projected", proxy.get("date")
+            batters = []
+            for pid in order:
+                try:
+                    pid = int(pid)
+                except (TypeError, ValueError):
+                    continue
+                batters.append({"id": pid, "name": names.get(pid, str(pid))})
+            entry["teams"].append({
+                "team": bat.get("abbrev"), "team_id": bat.get("id"),
+                "vs_starter": opp.get("starter_name"),
+                "vs_starter_id": opp.get("starter_id"),
+                "vs_hand": hand,
+                "source": source, "from_date": from_date,
+                "batters": batters,
+            })
+        games.append(entry)
+    posted = sum(1 for g in games for t in g["teams"] if t["source"] == "posted")
+    return {"date": date, "offset": offset,
+            "posted": posted, "teams_total": sum(len(g["teams"]) for g in games),
+            "games": games,
+            "note": ("posted = today's real order from the boxscore; "
+                     "projected = that team's most recent real order vs this "
+                     "hand (the same one the K Board prices with until "
+                     "lineups drop), stamped with the date it came from")}
+
+
 def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0,
                tbf_override: int | None = None) -> dict:
     """What-if: this starter vs an arbitrary 9-man order. Same
