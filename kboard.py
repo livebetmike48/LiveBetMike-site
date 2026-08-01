@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 import parlay
+import statcast_api
 import odds_api
 import kmodel
 
@@ -87,6 +88,15 @@ def _conn():
         lineup_posted INTEGER, logged_ts INTEGER,
         actual_k INTEGER, cleared INTEGER,
         PRIMARY KEY (date, starter_id))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS k_overrides (
+        date TEXT, starter_id INTEGER, pitch_limit INTEGER, tbf_cap INTEGER,
+        exclude INTEGER DEFAULT 0, note TEXT, set_ts INTEGER,
+        PRIMARY KEY (date, starter_id))""")
+    try:
+        conn.execute("ALTER TABLE k_board_log ADD COLUMN excluded INTEGER")
+        conn.execute("ALTER TABLE k_board_log ADD COLUMN excl_note TEXT")
+    except Exception:
+        pass
     try:
         conn.execute("ALTER TABLE k_board_log ADD COLUMN model_ver TEXT")
         # one-time backfill: reads frozen on/after the v2 cutover date were
@@ -117,6 +127,8 @@ def _log_predictions(data: dict):
             s.get("ev_under"),
             1 if s.get("lineup_posted") else 0, int(time.time()),
             K_MODEL_VER,
+            1 if s.get("excluded") else None,
+            s.get("override_note") if s.get("excluded") else None,
         ))
     if not rows:
         return
@@ -124,8 +136,119 @@ def _log_predictions(data: dict):
         c.executemany("""INSERT OR IGNORE INTO k_board_log
             (date, game_pk, starter_id, name, line, p_over, p_over_raw,
              price_over, book_over, ev_over, price_under, book_under, ev_under,
-             lineup_posted, logged_ts, model_ver, actual_k, cleared)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""", rows)
+             lineup_posted, logged_ts, model_ver, excluded, excl_note,
+             actual_k, cleared)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""", rows)
+
+
+def pitches_per_pa(rows: list[dict]) -> float | None:
+    """His OWN pitches per batter faced -- what turns a pitch limit into a
+    batter cap. A 75-pitch limit is a different outing for a 3.5 P/PA
+    strike-thrower than for a 4.3 P/PA grinder, so no league constant."""
+    pa = sum(1 for r in rows
+             if r.get("events") and r.get("events") not in statcast_api.NON_PA_EVENTS)
+    return (len(rows) / pa) if pa and rows else None
+
+
+def set_override(date: str, starter_id: int, pitch_limit: int | None = None,
+                 tbf_cap: int | None = None, exclude: bool = False,
+                 note: str = "") -> dict:
+    """Record a pitch-count / exclusion override for one start.
+
+    Two things it can do, and they're different:
+      pitch_limit or tbf_cap -> CAP the workload. His real start lengths
+        are kept and each one is capped at the limit: a limit truncates
+        the top of the distribution, it does NOT make the outing
+        certain. If he's getting hit he's still pulled at 14 batters, and
+        that downside tail is exactly what decides unders.
+      exclude -> the read is priced and shown but NOT counted in the
+        record. For when the information (a hard limit, a piggyback, a
+        bullpen game) makes the model's workload assumption simply wrong.
+
+    TIMING RULE, and it is the whole reason this is trustworthy: an
+    override may only be set BEFORE first pitch. After that it would be a
+    revision to a frozen read, and the record's value is that nothing is
+    ever revised. Excluded reads are never deleted -- they stay in the
+    log, flagged, and the record reports them as their own line."""
+    if not starter_id:
+        return {"error": "starter_id required"}
+    if pitch_limit and not tbf_cap:
+        try:
+            rows = parlay.get_player_season_rows(int(starter_id), True)
+        except Exception:
+            rows = []
+        ppa = pitches_per_pa(rows)
+        if not ppa:
+            return {"error": "no pitch rows for this starter -- give tbf directly"}
+        tbf_cap = max(3, int(round(pitch_limit / ppa)))
+    if tbf_cap is not None:
+        tbf_cap = max(3, min(45, int(tbf_cap)))
+    with _conn() as c:
+        row = c.execute("SELECT cleared, actual_k FROM k_board_log "
+                        "WHERE date=? AND starter_id=?", (date, starter_id)).fetchone()
+        if row and row[0] is not None:
+            return {"error": "that start is already graded -- overrides are "
+                             "pre-game only, never retroactive"}
+        c.execute("INSERT OR REPLACE INTO k_overrides "
+                  "(date, starter_id, pitch_limit, tbf_cap, exclude, note, set_ts) "
+                  "VALUES (?,?,?,?,?,?,?)",
+                  (date, int(starter_id), pitch_limit, tbf_cap,
+                   1 if exclude else 0, note or "", int(time.time())))
+        if exclude:
+            # a read already frozen today still gets flagged, not deleted
+            c.execute("UPDATE k_board_log SET excluded=1, excl_note=? "
+                      "WHERE date=? AND starter_id=? AND cleared IS NULL",
+                      (note or "manual", date, starter_id))
+    log.info("k override %s %s: limit=%s cap=%s exclude=%s (%s)",
+             date, starter_id, pitch_limit, tbf_cap, exclude, note)
+    return {"ok": True, "date": date, "starter_id": int(starter_id),
+            "pitch_limit": pitch_limit, "tbf_cap": tbf_cap,
+            "exclude": bool(exclude), "note": note}
+
+
+def clear_override(date: str, starter_id: int) -> dict:
+    with _conn() as c:
+        c.execute("DELETE FROM k_overrides WHERE date=? AND starter_id=?",
+                  (date, int(starter_id)))
+        c.execute("UPDATE k_board_log SET excluded=NULL, excl_note=NULL "
+                  "WHERE date=? AND starter_id=? AND cleared IS NULL",
+                  (date, int(starter_id)))
+    return {"ok": True, "cleared": True}
+
+
+def get_overrides(date: str) -> dict:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT starter_id, pitch_limit, tbf_cap, exclude, note, set_ts "
+            "FROM k_overrides WHERE date=?", (date,)).fetchall()
+    return {sid: {"pitch_limit": pl, "tbf_cap": cap, "exclude": bool(ex),
+                  "note": note, "set_ts": ts}
+            for sid, pl, cap, ex, note, ts in rows}
+
+
+def _apply_tbf_cap(kdist: dict, cap: int) -> dict:
+    """Re-mix the SAME per-slot probabilities over capped workload samples.
+    Built from kmodel's own exported pieces (slot_pa_counts +
+    poisson_binomial), so a capped read can never drift from the
+    validated math -- only the workload assumption changes."""
+    samples = [min(t, cap) for t in (kdist.get("tbf_samples") or [])]
+    if not samples:
+        return kdist
+    slot_probs = [s["p_k_per_pa"] for s in kdist["inputs"]["slots"]]
+    weight = 1.0 / len(samples)
+    dist = [0.0] * (max(samples) + 1)
+    for tbf in samples:
+        counts = kmodel.slot_pa_counts(tbf)
+        seq = [slot_probs[i] for i in range(9) for _ in range(counts[i])]
+        pb = kmodel.poisson_binomial(seq)
+        for k, m in enumerate(pb):
+            dist[k] += weight * m
+    out = dict(kdist)
+    out["dist"] = [round(m, 6) for m in dist]
+    out["mean_k"] = round(sum(k * m for k, m in enumerate(dist)), 3)
+    out["tbf_samples"] = samples
+    out["tbf_mean"] = round(sum(samples) / len(samples), 1)
+    return out
 
 
 def _grade_pending(today: str):
@@ -180,14 +303,17 @@ def _result_log_summary() -> dict:
     with _conn() as c:
         rows = c.execute(
             "SELECT p_over, cleared, ev_over, price_over, ev_under, price_under "
-            "FROM k_board_log WHERE cleared IS NOT NULL").fetchall()
+            "FROM k_board_log WHERE cleared IS NOT NULL "
+            "AND (excluded IS NULL OR excluded = 0)").fetchall()
+        n_excluded = c.execute(
+            "SELECT COUNT(*) FROM k_board_log WHERE excluded = 1").fetchone()[0]
         days = c.execute(
             "SELECT COUNT(DISTINCT date) FROM k_board_log WHERE cleared IS NOT NULL"
         ).fetchone()[0]
         pending = c.execute(
             "SELECT COUNT(*) FROM k_board_log WHERE cleared IS NULL").fetchone()[0]
     if not rows:
-        return {"n": 0, "pending": pending}
+        return {"n": 0, "pending": pending, "excluded": n_excluded}
     brier = round(sum((p - h) ** 2 for p, h, *_ in rows) / len(rows), 4)
     base = sum(h for _, h, *_ in rows) / len(rows)
     brier_constant = round(sum((base - h) ** 2 for _, h, *_ in rows) / len(rows), 4)
@@ -203,6 +329,7 @@ def _result_log_summary() -> dict:
             else:
                 units -= 1
     return {"n": len(rows), "days": days, "pending": pending,
+            "excluded": n_excluded,
             "brier_model": brier, "brier_constant": brier_constant,
             "bets": bets, "wins": wins, "units": round(units, 2)}
 
@@ -436,6 +563,7 @@ def _build_board(date: str, progress: dict) -> dict:
     except Exception as e:
         log.warning("k board: odds events skipped: %s", e)
 
+    overrides = get_overrides(date)
     progress["total"] = sum(
         1 for g in slate for side in ("home", "away")
         if g["teams"][side]["starter_id"])
@@ -502,6 +630,14 @@ def _build_board(date: str, progress: dict) -> dict:
                     entry.update({"status": "no read",
                                   "why": "starter sample too thin (house minimums)"})
                     continue
+                ov = overrides.get(team["starter_id"])
+                if ov:
+                    if ov.get("tbf_cap"):
+                        kdist = _apply_tbf_cap(kdist, ov["tbf_cap"])
+                        entry["tbf_cap"] = ov["tbf_cap"]
+                        entry["pitch_limit"] = ov.get("pitch_limit")
+                    entry["excluded"] = bool(ov.get("exclude"))
+                    entry["override_note"] = ov.get("note") or None
                 entry.update({
                     "status": "ok",
                     "mean_k": kdist["mean_k"],
@@ -581,18 +717,25 @@ def log_details(days: int = 1) -> dict:
         rows = c.execute(
             "SELECT date, name, line, p_over, ev_over, price_over, book_over, "
             "ev_under, price_under, book_under, actual_k, cleared, lineup_posted, "
-            "model_ver "
+            "model_ver, excluded, excl_note "
             "FROM k_board_log WHERE date >= ? AND date < ? ORDER BY date, name",
             (cutoff, today)).fetchall()
     out_rows = []
     graded_bets = []
     units = bets = wins = 0
     for (date, name, line, p_over, ev_o, pr_o, bk_o, ev_u, pr_u, bk_u,
-         actual, cleared, lineup, mver) in rows:
+         actual, cleared, lineup, mver, excluded, excl_note) in rows:
         mver = mver or "v1"  # rows logged before versioning = launch model
         row = {"date": date, "starter": name, "line": line,
                "p_over": p_over, "actual_k": actual, "cleared": cleared,
-               "lineup_posted": bool(lineup), "model": mver, "bets": []}
+               "lineup_posted": bool(lineup), "model": mver,
+               "excluded": bool(excluded), "excl_note": excl_note, "bets": []}
+        if excluded:
+            # priced, shown, permanently on the record -- but not counted.
+            # Never deleted: a record you can quietly delete from is worth
+            # nothing, so exclusions live in the open as their own line.
+            out_rows.append(row)
+            continue
         for side, ev, price, book, hit in (
                 ("over", ev_o, pr_o, bk_o, cleared),
                 ("under", ev_u, pr_u, bk_u,
@@ -627,7 +770,9 @@ def log_details(days: int = 1) -> dict:
             wins += 1 if hit else 0
             units += u
         out_rows.append(row)
-    graded_rows = [r for r in out_rows if r["cleared"] is not None]
+    excluded_rows = [r for r in out_rows if r.get("excluded")]
+    graded_rows = [r for r in out_rows
+                   if r["cleared"] is not None and not r.get("excluded")]
     brier = brier_constant = lean_hits = None
     if graded_rows:
         brier = round(sum((r["p_over"] - r["cleared"]) ** 2
@@ -654,6 +799,7 @@ def log_details(days: int = 1) -> dict:
                      "graded": len(e_rows), "brier": e_brier,
                      "breakdown": _breakdown(e_bets)})
     return {"days": days, "rows": out_rows,
+            "excluded": len(excluded_rows),
             "graded": len(graded_rows),
             "pending": sum(1 for r in out_rows if r["cleared"] is None),
             "bets": bets, "wins": wins, "units": round(units, 2),
