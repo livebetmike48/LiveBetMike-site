@@ -93,6 +93,40 @@ def api_pprops(d: int = 0):
         return {"error": str(e)}
 
 
+@app.post("/api/koverride")
+def api_koverride(payload: dict):
+    """Pitch-count cap / exclusion for one start. Token in the BODY like
+    every other write route. Pre-game only -- the route refuses once the
+    start is graded."""
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    try:
+        date = payload.get("date") or ""
+        if not date:
+            import parlay as _p
+            date = _p.et_date_str(int(payload.get("d") or 0))
+        if payload.get("clear"):
+            return kboard.clear_override(date, int(payload.get("starter_id") or 0))
+        return kboard.set_override(
+            date, int(payload.get("starter_id") or 0),
+            pitch_limit=int(payload["pitch_limit"]) if payload.get("pitch_limit") else None,
+            tbf_cap=int(payload["tbf_cap"]) if payload.get("tbf_cap") else None,
+            exclude=bool(payload.get("exclude")),
+            note=str(payload.get("note") or ""))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/koverrides")
+def api_koverrides(d: int = 0):
+    try:
+        import parlay as _p
+        return {"date": _p.et_date_str(d),
+                "overrides": kboard.get_overrides(_p.et_date_str(d))}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/lineups")
 def api_lineups(d: int = 0):
     """Today's (d=0) or tomorrow's (d=1) lineups -- posted where they're up,
@@ -354,7 +388,8 @@ def index():
         if "pprops_tab.js" not in html and "</body>" in html:
             html = html.replace(
                 "</body>",
-                '<script src="/static/pprops_tab.js"></script>\n</body>', 1)
+                '<script src="/static/pprops_tab.js"></script>\n'
+                '<script src="/static/kadmin_tab.js"></script>\n</body>', 1)
         return HTMLResponse(html)
     except Exception as e:
         log.warning("index injection skipped (%s) -- serving file as-is", e)
