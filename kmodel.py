@@ -81,6 +81,20 @@ K_CSW_PRIOR_WEIGHT = float(os.getenv("K_CSW_PRIOR_WEIGHT", "0"))
 # Same fitted mapping, same receipts, same default-0 safety.
 K_CSW_BLEND_WEIGHT = float(os.getenv("K_CSW_BLEND_WEIGHT", "0"))
 
+# ---- CSW DELTA (Aug 3): the stale-rate detector ----
+# The level experiments failed because a starter's own outcomes over
+# 200-400 PA beat any pitch-inferred estimate OF THE SAME THING. This is
+# the different claim: his SEASON rate lags reality when he's changed
+# (new pitch, lost velo), and CSW moves in weeks, not months. So compare
+# his LAST-30-DAYS called%+SwStr% to his season through the same fitted
+# mapping and shift his rate by the DIFFERENCE. Season outcomes still set
+# the level; CSW only says how far current-him has drifted from season-him.
+# Needs fitted coefficients (kbacktest-only), so it cannot fire on the
+# live board. Clamped: a delta is a correction, never a takeover.
+K_CSW_DELTA_WEIGHT = float(os.getenv("K_CSW_DELTA_WEIGHT", "0"))
+CSW_DELTA_MIN_PITCHES = 200   # recent-window floor per side
+CSW_DELTA_CLAMP = 0.04        # max shift of the per-PA rate, either way
+
 # ---- arsenal matchup, HITTER side (July 30; env knob, default 0) ----
 # The one thing this model genuinely does not know: WHICH pitches beat a
 # hitter. It knows his overall K rate vs hand (a direct measurement, and a
@@ -603,7 +617,39 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
     # mapping is loaded AND his per-side pitch sample clears the floor.
     csw_targets: dict = {}
     csw_implied: dict = {}
+    csw_delta: dict = {}
     csw_receipt: dict = {}
+    if K_CSW_DELTA_WEIGHT > 0 and K_CSW_COEFS:
+        cutoff = None
+        dates = [r.get("game_date") for r in s_rows if r.get("game_date")]
+        if dates:
+            from datetime import datetime as _dt, timedelta as _td
+            try:
+                cutoff = (_dt.strptime(max(dates), "%Y-%m-%d")
+                          - _td(days=30)).strftime("%Y-%m-%d")
+            except ValueError:
+                cutoff = None
+        if cutoff:
+            for side in ("L", "R"):
+                side_rows = [r for r in s_rows if r.get("stand") == side]
+                season = called_swstr(side_rows)
+                recent = called_swstr([r for r in side_rows
+                                       if (r.get("game_date") or "") >= cutoff])
+                if (not season or not recent
+                        or recent["pitches"] < CSW_DELTA_MIN_PITCHES):
+                    continue
+                imp_season = csw_implied_k(season["called"], season["swstr"])
+                imp_recent = csw_implied_k(recent["called"], recent["swstr"])
+                if imp_season is None or imp_recent is None:
+                    continue
+                d = imp_recent - imp_season
+                d = max(-CSW_DELTA_CLAMP, min(CSW_DELTA_CLAMP, d))
+                csw_delta[side] = d
+                csw_receipt[side] = {
+                    "delta": round(d, 4),
+                    "recent_pitches": recent["pitches"],
+                    "implied_recent": round(imp_recent, 4),
+                    "implied_season": round(imp_season, 4)}
     if (K_CSW_PRIOR_WEIGHT > 0 or K_CSW_BLEND_WEIGHT > 0) and K_CSW_COEFS:
         for side in ("L", "R"):
             cs = called_swstr([r for r in s_rows if r.get("stand") == side])
@@ -662,6 +708,10 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
         if not s or s["pa"] < K_MIN_STARTER_TBF:
             return None  # starter sample vs this side too thin -- refuse
         s_rate = shrunk(s["k"], s["pa"], csw_targets.get(side, p_league))
+        if K_CSW_DELTA_WEIGHT > 0 and side in csw_delta:
+            # Shift, don't replace: current-him vs season-him, damped.
+            s_rate = min(max(s_rate + K_CSW_DELTA_WEIGHT * csw_delta[side],
+                             0.02), 0.60)
         if K_CSW_BLEND_WEIGHT > 0 and side in csw_implied:
             # Direct blend: pitch process partly REPLACES observed outcomes
             # as the estimate of this starter's true per-side K rate.
@@ -726,7 +776,8 @@ def k_distribution(lineup: list[dict | None], starter_rows: list[dict],
             "shrink_pa": K_SHRINK_PA,
             "matchup_weight": K_MATCHUP_WEIGHT or None,
             "csw_prior": ({"prior_weight": K_CSW_PRIOR_WEIGHT,
-                           "blend_weight": K_CSW_BLEND_WEIGHT, **csw_receipt}
+                           "blend_weight": K_CSW_BLEND_WEIGHT,
+                           "delta_weight": K_CSW_DELTA_WEIGHT, **csw_receipt}
                           if csw_receipt else None),
             "park_k_factor": round(park_k_factor, 3) if park_k_factor else None,
             "league_fallback_slots": league_fallbacks,
