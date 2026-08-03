@@ -41,6 +41,17 @@ log = logging.getLogger("kbacktest")
 import os as _os
 K_LINEUP_MODE = _os.getenv("K_LINEUP_MODE", "actual").strip().lower()
 
+# Bettable-book filter for MARKET tests. The historical fetch stored the
+# FULL two-region ladder (us,us2 -- Fanatics, ESPN Bet, Hard Rock...), so
+# best_price was picking prices at books Mike cannot bet, which makes
+# every all-books ROI optimistic for him specifically. The archive keeps
+# per-book prices, so this filters at ANALYSIS time -- no refetch, free
+# rerun, his true number. Comma-separated book TITLES, case-insensitive
+# (e.g. "fanduel,draftkings,caesars,betmgm"). Unset = all books, which
+# keeps every old receipt reproducible.
+_books_raw = _os.getenv("K_MARKET_BOOKS", "").strip()
+K_MARKET_BOOKS = {b.strip().lower() for b in _books_raw.split(",") if b.strip()} or None
+
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 
 # ---------------- permanent odds archive (pay once, replay free) ----------------
@@ -636,7 +647,13 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
                     p_over = kmodel.calibrate(p_over_raw)
                     prob = p_over if side == "over" else 1 - p_over
                     prob_raw = p_over_raw if side == "over" else 1 - p_over_raw
-                    bp = odds_api.best_price(priced["prices"])
+                    book_prices = priced["prices"]
+                    if K_MARKET_BOOKS:
+                        book_prices = {b: p for b, p in book_prices.items()
+                                       if b.strip().lower() in K_MARKET_BOOKS}
+                        if not book_prices:
+                            continue  # none of HIS books carry this side
+                    bp = odds_api.best_price(book_prices)
                     if not bp:
                         continue
                     # De-vig THIS side against the other side's price at the
@@ -674,6 +691,7 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
               # is K_LINEUP_MODE=proxy -- the same point-in-time projection
               # the live board uses. Stamped so no receipt is ambiguous.
               "lineup_mode": K_LINEUP_MODE,
+              "books": (sorted(K_MARKET_BOOKS) if K_MARKET_BOOKS else "all"),
               "credits_estimate": games_priced * (40 if vs_open else 20) + days,
               "candidates": len(candidates),
               "by_threshold": backtest._simulate_bets(candidates)}
