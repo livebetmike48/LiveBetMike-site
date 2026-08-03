@@ -323,7 +323,8 @@ def run_k_backtest(days: int, progress=None) -> dict:
     # (default) skips all of this -- the exact validated path.
     kmodel.K_CSW_COEFS = None
     csw_fit = None
-    if kmodel.K_CSW_PRIOR_WEIGHT > 0 or kmodel.K_CSW_BLEND_WEIGHT > 0:
+    if (kmodel.K_CSW_PRIOR_WEIGHT > 0 or kmodel.K_CSW_BLEND_WEIGHT > 0
+            or kmodel.K_CSW_DELTA_WEIGHT > 0):
         window_start = (end - timedelta(days=days)).strftime("%Y-%m-%d")
         sids: set = set()
         for i in range(1, days + 1):
