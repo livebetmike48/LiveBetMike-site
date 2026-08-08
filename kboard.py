@@ -1089,7 +1089,8 @@ def projected_lineups(offset: int = 0) -> dict:
 
 
 def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0,
-               tbf_override: int | None = None) -> dict:
+               tbf_override: int | None = None,
+               pitch_limit: int | None = None) -> dict:
     """What-if: this starter vs an arbitrary 9-man order. Same
     k_distribution the backtests validated -- no separate sim math. Blank
     slots price at league exactly like an unposted lineup. Market compare
@@ -1109,6 +1110,14 @@ def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0,
         s_rows = parlay.get_player_season_rows(starter_id, True)
     except Exception:
         s_rows = []
+    ppa = None
+    if pitch_limit and not tbf_override:
+        # Same conversion the Admin override uses: HIS pitches-per-PA, not
+        # a league constant -- 90 pitches is a different outing for a 3.5
+        # P/PA strike-thrower than a 4.3 grinder.
+        ppa = pitches_per_pa(s_rows)
+        if ppa:
+            tbf_override = max(3, min(45, int(round(pitch_limit / ppa))))
     slate_entry = None
     for g in _slate(date):
         for side in ("home", "away"):
@@ -1207,6 +1216,9 @@ def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0,
             "hand": hand, "slate": slate_entry,
             "basis": lineup_basis or ("custom lineup" if batter_ids
                                       else "league-average slots"),
+            "pitch_limit": pitch_limit,
+            "ppa": round(ppa, 2) if ppa else None,
+            "tbf_cap": tbf_override,
             "mean_k": kdist["mean_k"], "tbf_mean": kdist["tbf_mean"],
             "fair_line": _fair_line(kdist),
             "league_fallback_slots": kdist["inputs"]["league_fallback_slots"],
