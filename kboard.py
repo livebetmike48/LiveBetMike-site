@@ -1113,9 +1113,35 @@ def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0,
     for g in _slate(date):
         for side in ("home", "away"):
             if g["teams"][side]["starter_id"] == starter_id:
+                opp_side = "away" if side == "home" else "home"
                 slate_entry = {"game_pk": g["game_pk"], "venue": g.get("venue"),
                                "team": g["teams"][side]["abbrev"],
-                               "opp": g["teams"]["away" if side == "home" else "home"]["abbrev"]}
+                               "opp": g["teams"][opp_side]["abbrev"],
+                               "opp_id": g["teams"][opp_side].get("id"),
+                               "opp_side": opp_side}
+    lineup_basis = None
+    if not batter_ids and slate_entry:
+        # No lineup given -> the board's own resolution order, so a bare
+        # sim faces the REAL opponent instead of a league-average one:
+        # posted order first, else the opponent's most recent real order
+        # vs this hand (the same proxy the board prices with), else fall
+        # through to league slots exactly as before.
+        try:
+            orders = _lineup_order(slate_entry["game_pk"])
+            posted = list(((orders or {}).get(slate_entry["opp_side"]) or [])[:9])
+        except Exception:
+            posted = []
+        if posted:
+            batter_ids = posted
+            lineup_basis = "posted lineup"
+        else:
+            try:
+                proxy = kmodel.fetch_recent_lineup(slate_entry.get("opp_id"), hand)
+            except Exception:
+                proxy = None
+            if proxy:
+                batter_ids = proxy["batter_ids"]
+                lineup_basis = f"projected (last vs {hand}HP, {proxy['date']})"
     lineup = []
     for pid in (batter_ids or [])[:9]:
         if not pid:
@@ -1179,6 +1205,8 @@ def sim_lineup(starter_id: int, batter_ids: list, offset: int = 0,
                 break
     return {"date": date, "starter": names.get(starter_id, str(starter_id)),
             "hand": hand, "slate": slate_entry,
+            "basis": lineup_basis or ("custom lineup" if batter_ids
+                                      else "league-average slots"),
             "mean_k": kdist["mean_k"], "tbf_mean": kdist["tbf_mean"],
             "fair_line": _fair_line(kdist),
             "league_fallback_slots": kdist["inputs"]["league_fallback_slots"],
