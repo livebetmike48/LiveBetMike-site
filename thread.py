@@ -71,6 +71,11 @@ def _last_start_pitches(pid: int, season: int) -> int | None:
     except Exception:
         return None
     splits = ((j.get("stats") or [{}])[0].get("splits")) or []
+    # NEVER trust the API's ordering -- Mike's own bullpen-bot client sorts
+    # gameLog by date for exactly this reason. Unsorted, "the last start"
+    # can silently become some earlier start, scattering wrong pitch
+    # counts across the whole thread.
+    splits = sorted(splits, key=lambda sp: sp.get("date") or "")
     for sp in reversed(splits):
         st = sp.get("stat") or {}
         if st.get("gamesStarted"):
