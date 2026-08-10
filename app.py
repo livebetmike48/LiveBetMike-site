@@ -15,6 +15,7 @@ import csw
 import kmatchup
 import pprops
 import ppbacktest
+import thread as thread_gen
 import projections
 import pitchers as pitchers_mod
 
@@ -217,6 +218,17 @@ def api_klineupsnaps(d: int = 0):
     try:
         import parlay as _p
         return kboard.lineup_snaps(_p.et_date_str(d))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/thread")
+def api_thread(d: int = 1):
+    """The nightly X-thread draft: every team, starter + last-start pitch
+    count + fact-based bullpen report, in Mike's exact layout, chunked
+    under Discord's 2000-char cap. d=1 (default) = tomorrow's slate."""
+    try:
+        return thread_gen.build_thread(max(0, min(2, d)))
     except Exception as e:
         return {"error": str(e)}
 
