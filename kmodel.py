@@ -239,17 +239,21 @@ def calibrate(p: float) -> float:
     return K_CALIB_WEIGHT * corrected + (1 - K_CALIB_WEIGHT) * p
 
 
-_league_cache = {"ts": 0, "p": None}
+_league_cache = {}  # season -> {"ts", "p"}
 
 
-def league_k_rate() -> float:
-    """League per-PA strikeout rate from MLB's real season team totals."""
+def league_k_rate(season: int | None = None) -> float:
+    """League per-PA strikeout rate from MLB's real season team totals.
+    season=None = the current season (live behavior). Past seasons use that
+    year's own totals -- 2024 games are never priced against 2026's league."""
+    season = int(season) if season else int(time.strftime("%Y"))
     now = time.time()
-    if _league_cache["p"] and now - _league_cache["ts"] < 86400:
-        return _league_cache["p"]
+    hit = _league_cache.get(season)
+    if hit and hit["p"] and now - hit["ts"] < 86400:
+        return hit["p"]
     resp = requests.get(
         f"{MLB_BASE}/teams/stats",
-        params={"season": 2026, "group": "hitting", "stats": "season", "sportId": 1},
+        params={"season": season, "group": "hitting", "stats": "season", "sportId": 1},
         timeout=20,
     )
     resp.raise_for_status()
@@ -261,8 +265,8 @@ def league_k_rate() -> float:
     if pa == 0:
         raise RuntimeError("league totals unavailable")
     p = ks / pa
-    _league_cache.update({"ts": now, "p": p})
-    log.info("League K rate: %.4f (%d K / %d PA)", p, ks, pa)
+    _league_cache[season] = {"ts": now, "p": p}
+    log.info("League K rate %s: %.4f (%d K / %d PA)", season, p, ks, pa)
     return p
 
 
@@ -411,6 +415,9 @@ _starts_cache = {"date": None, "pks": {}}
 
 
 def fetch_start_games(starter_id: int, before: str | None = None) -> set | None:
+    """SEASON RULE: the season is derived from `before` when given -- a 2024
+    backtest asking for starts before 2024-06-01 fetches the 2024 game log,
+    never the wall-clock year. Live callers (no `before`) keep today's."""
     """game_pks of games this pitcher STARTED, from MLB's game log
     (gamesStarted per game -- authoritative, no inference). Cached per
     day. `before` filters to starts strictly before that date so the
@@ -420,13 +427,14 @@ def fetch_start_games(starter_id: int, before: str | None = None) -> set | None:
     if not starter_id:
         return None
     today = time.strftime("%Y-%m-%d")
+    season = (before[:4] if before and len(before) >= 4 else today[:4])
+    cache_key = (starter_id, season)
     if _starts_cache["date"] != today:
         _starts_cache.update({"date": today, "pks": {}})
-    if starter_id in _starts_cache["pks"]:
-        entries = _starts_cache["pks"][starter_id]
+    if cache_key in _starts_cache["pks"]:
+        entries = _starts_cache["pks"][cache_key]
     else:
         try:
-            season = today[:4]
             data = requests.get(
                 f"{MLB_BASE}/people/{starter_id}/stats",
                 params={"stats": "gameLog", "group": "pitching",
@@ -452,7 +460,7 @@ def fetch_start_games(starter_id: int, before: str | None = None) -> set | None:
                         except (TypeError, ValueError):
                             continue
                         entries.append((gpk, date or ""))
-            _starts_cache["pks"][starter_id] = entries
+            _starts_cache["pks"][cache_key] = entries
             log.info("start-games %s: %d starts from %d game-log rows",
                      starter_id, len(entries), splits_seen)
             if splits_seen and not entries:
