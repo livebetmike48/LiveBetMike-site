@@ -39,7 +39,8 @@ _cache = {"ts": 0, "data": None}
 _last = {}
 
 
-def _fetch_raw(stat: str, year: int = 2026) -> tuple:
+def _fetch_raw(stat: str, year: int | None = None) -> tuple:
+    year = int(year) if year else int(time.strftime("%Y"))
     """Try each param shape until one returns something CSV-shaped.
     Returns (text, detail) where detail records exactly what happened."""
     attempts = []
@@ -237,10 +238,32 @@ def factor_for(venue_name: str) -> float | None:
 _k_cache = {"ts": 0, "data": None}
 
 
-def k_factors() -> dict:
+_k_year_cache = {}  # season -> {"ts","data"} for historical backtests
+
+
+def k_factors(year: int | None = None) -> dict:
     """Savant strikeout park factors, same endpoint/honesty rules as hits:
-    neutral-on-failure, logged loudly."""
+    neutral-on-failure, logged loudly. year=None = current season (live
+    behavior, its own cache slot untouched); a past year gets that season's
+    own factors, cached per year."""
     now = time.time()
+    if year:
+        year = int(year)
+        hit = _k_year_cache.get(year)
+        if hit and now - hit["ts"] < 86400 * 30:   # historical factors are final
+            return hit["data"]
+        text, _detail = _fetch_raw("index_strikeout", year=year)
+        data = {}
+        if text:
+            data = _parse_k_csv(text)
+            if not data:
+                data, _h = _from_html(text, ("strikeout", "so", "k"))
+        if data:
+            log.info("park K factors %s: %d venues", year, len(data))
+        else:
+            log.warning("park K factors %s unavailable -- park-neutral", year)
+        _k_year_cache[year] = {"ts": now, "data": data}
+        return data
     if _k_cache["data"] is not None and now - _k_cache["ts"] < 86400:
         return _k_cache["data"]
     data = {}
@@ -283,11 +306,12 @@ def _parse_k_csv(text: str) -> dict:
     return out
 
 
-def k_factor_for(venue_name: str) -> float | None:
-    """Strikeout factor for a venue (1.0 neutral). None when unknown."""
+def k_factor_for(venue_name: str, year: int | None = None) -> float | None:
+    """Strikeout factor for a venue (1.0 neutral). None when unknown.
+    year routes to that season's own factors (backtests); None = live."""
     if not venue_name:
         return None
-    data = k_factors()
+    data = k_factors(year)
     if not data:
         return None
     key = _fold(venue_name)
