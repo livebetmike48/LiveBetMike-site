@@ -21,6 +21,7 @@ import requests
 
 import parlay
 import kmodel
+import kseason
 import backtest  # reuse _final_games + _simulate_bets (same repo, same rules)
 import odds_api
 
@@ -129,10 +130,40 @@ def _hist_odds(event_id: str, snapshot: str, market: str):
 LINE_LADDER = (3.5, 4.5, 5.5, 6.5, 7.5)
 
 
-def _park_k(venue: str | None) -> float | None:
+# ---------------------------------------------------------------- seasons
+PROPS_HISTORY_START = "2023-05-03"   # The Odds API has no player props before this
+
+
+def _season_window(days: int, end_date: str | None, market: bool):
+    """Resolve the run window. end_date=None = live behavior (anchor now-4h).
+    A past end_date anchors the walk there instead. One season per run --
+    a window crossing New Year would mix two leagues and is refused."""
+    if end_date:
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+            hour=23, minute=59, tzinfo=timezone.utc)
+    else:
+        end = datetime.now(timezone.utc) - timedelta(hours=4)
+    start = end - timedelta(days=days)
+    if start.year != end.year:
+        raise ValueError(f"window {start.date()}..{end.date()} spans two seasons -- "
+                         f"run one season at a time")
+    if market and start.strftime("%Y-%m-%d") < PROPS_HISTORY_START:
+        raise ValueError(f"player-prop odds history begins {PROPS_HISTORY_START}; "
+                         f"window starts {start.date()}")
+    season = end.year
+    rows = kseason.rows_provider(season)
+    return end, season, rows
+
+
+def _park_k(venue: str | None, season: int | None = None) -> float | None:
     if not venue or parks is None:
         return None
     fn = getattr(parks, "k_factor_for", None)
+    if fn is not None and season is not None:
+        try:
+            return fn(venue, year=season)
+        except TypeError:
+            pass  # older parks.py without the year param -> live factors
     return fn(venue) if fn else None
 
 
@@ -155,7 +186,9 @@ def _majority_side(rows: list[dict], before: str) -> str | None:
 
 
 def _game_starts(game_pk: int, date_str: str, p_league: float,
-                 hand_cache: dict, venue: str | None = None) -> list[dict]:
+                 hand_cache: dict, venue: str | None = None,
+                 rows_fn=parlay.get_player_season_rows,
+                 season: int | None = None) -> list[dict]:
     """For one final game: each starter's point-in-time K distribution +
     his actual strikeouts from the boxscore."""
     box = requests.get(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=20).json()
@@ -176,7 +209,7 @@ def _game_starts(game_pk: int, date_str: str, p_league: float,
         if actual_k is None:
             continue
         try:
-            starter_rows = parlay.get_player_season_rows(starter_id, True)
+            starter_rows = rows_fn(starter_id, True)
         except Exception:
             continue
         if starter_id not in hand_cache:
@@ -194,7 +227,7 @@ def _game_starts(game_pk: int, date_str: str, p_league: float,
             lu = []
             for pid in pids[:9]:
                 try:
-                    b_rows = parlay.get_player_season_rows(pid, False)
+                    b_rows = rows_fn(pid, False)
                 except Exception:
                     lu.append(None)
                     continue
@@ -214,14 +247,14 @@ def _game_starts(game_pk: int, date_str: str, p_league: float,
         actual_lineup = _entries(list(order))
         kdist = kmodel.k_distribution(
             actual_lineup, starter_rows, hand, p_league,
-            before=date_str, park_k_factor=_park_k(venue),
+            before=date_str, park_k_factor=_park_k(venue, season),
             start_game_pks=start_pks)
         if kdist is None:
             continue  # actual-mode refusal -> out of population in ALL modes
         if K_LINEUP_MODE == "league":
             kdist = kmodel.k_distribution(
                 [None] * 9, starter_rows, hand, p_league,
-                before=date_str, park_k_factor=_park_k(venue),
+                before=date_str, park_k_factor=_park_k(venue, season),
                 start_game_pks=start_pks)
         elif K_LINEUP_MODE == "proxy":
             batting_team_id = ((batting_team.get("team") or {}).get("id"))
@@ -230,7 +263,7 @@ def _game_starts(game_pk: int, date_str: str, p_league: float,
             mode_lineup = _entries(proxy["batter_ids"]) if proxy else [None] * 9
             kdist = kmodel.k_distribution(
                 mode_lineup, starter_rows, hand, p_league,
-                before=date_str, park_k_factor=_park_k(venue),
+                before=date_str, park_k_factor=_park_k(venue, season),
                 start_game_pks=start_pks)
         if kdist is None:
             continue
@@ -251,7 +284,8 @@ def _game_starts(game_pk: int, date_str: str, p_league: float,
     return out
 
 
-def fit_csw_mapping(starter_ids: set, fit_before: str) -> dict | None:
+def fit_csw_mapping(starter_ids: set, fit_before: str,
+                    rows_fn=parlay.get_player_season_rows) -> dict | None:
     """Fit K-per-PA ~ a + b*called% + c*SwStr% across starters, using ONLY
     rows strictly before `fit_before` -- so a backtest window starting
     there is genuinely out-of-sample. Which pitchers appear is taken from
@@ -264,7 +298,7 @@ def fit_csw_mapping(starter_ids: set, fit_before: str) -> dict | None:
     for sid in starter_ids:
         try:
             rows = kmodel.rows_before(
-                parlay.get_player_season_rows(int(sid), True), fit_before)
+                rows_fn(int(sid), True), fit_before)
         except Exception:
             continue
         k = kmodel.per_pa_k_rate(rows, "stand", "L")
@@ -311,11 +345,13 @@ def fit_csw_mapping(starter_ids: set, fit_before: str) -> dict | None:
     return coefs
 
 
-def run_k_backtest(days: int, progress=None) -> dict:
-    """Walk the last `days` completed days, model every start point-in-time,
-    grade P(K > L) across the line ladder vs reality."""
-    p_league = kmodel.league_k_rate()
-    end = datetime.now(timezone.utc) - timedelta(hours=4)
+def run_k_backtest(days: int, progress=None, end_date: str | None = None) -> dict:
+    """Walk `days` completed days ending at end_date (None = now, the live
+    behavior), model every start point-in-time, grade P(K > L) vs reality.
+    A past end_date runs entirely inside that season: that year's players,
+    that year's league rate, that year's park factors."""
+    end, season, _rows = _season_window(days, end_date, market=False)
+    p_league = kmodel.league_k_rate(season)
     starts = []
     hand_cache: dict = {}
     # CSW prior gauntlet support: when the env knob is on, fit the mapping
@@ -342,7 +378,7 @@ def run_k_backtest(days: int, progress=None) -> dict:
                 continue
         log.info("csw: collecting starters for the pre-window fit "
                  "(%d days scanned)...", days)
-        csw_fit = fit_csw_mapping(sids, window_start)
+        csw_fit = fit_csw_mapping(sids, window_start, rows_fn=_rows)
         kmodel.K_CSW_COEFS = csw_fit
     for i in range(1, days + 1):
         date_str = (end - timedelta(days=i)).strftime("%Y-%m-%d")
@@ -355,6 +391,7 @@ def run_k_backtest(days: int, progress=None) -> dict:
         for gi, g in enumerate(games, 1):
             try:
                 starts.extend(_game_starts(g["gamePk"], date_str, p_league, hand_cache,
+                                           rows_fn=_rows, season=season,
                                            venue=(g.get("venue") or {}).get("name")))
             except Exception as e:
                 log.warning("k game %s failed: %s", g.get("gamePk"), e)
@@ -410,6 +447,10 @@ def run_k_backtest(days: int, progress=None) -> dict:
         "n": len(preds),
         "starts": len(starts),
         "days": days,
+        "season": season,
+        "end_date": end.strftime("%Y-%m-%d"),
+        "rows_source": ("season-scoped" if season != kseason.current_season()
+                        else "live"),
         "lineup_mode": K_LINEUP_MODE,
         "calibration": calibration,
         "brier_model": model_brier,
@@ -576,7 +617,8 @@ def fit_blend(candidates: list, test_days: int = 30,
             "w_grid": w_grid, "ev_grid": ev_grid}
 
 
-def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> dict:
+def run_k_market_backtest(days: int, progress=None, vs_open: bool = False,
+                          end_date: str | None = None) -> dict:
     """Walk past days: point-in-time K distribution per start, joined to
     the REAL historical pitcher_strikeouts line, flat-betting every edge
     above each threshold. Units don't lie.
@@ -586,10 +628,10 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
     closing snapshot is fetched anyway, reports CLV: how often the close
     moved TOWARD the model's bet. Movement converges on truth far faster
     than units. Roughly doubles credits (two snapshots per game)."""
-    p_league = kmodel.league_k_rate()
+    end, season, _rows = _season_window(days, end_date, market=True)
+    p_league = kmodel.league_k_rate(season)
     for k in _fetch_stats:
         _fetch_stats[k] = 0  # per-run credit receipts
-    end = datetime.now(timezone.utc) - timedelta(hours=4)
     hand_cache: dict = {}
     candidates = []
     games_priced = 0
@@ -609,6 +651,7 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
         for g in games:
             try:
                 starts = _game_starts(g["gamePk"], date_str, p_league, hand_cache,
+                                      rows_fn=_rows, season=season,
                                       venue=(g.get("venue") or {}).get("name"))
             except Exception as e:
                 log.warning("k market game %s failed: %s", g.get("gamePk"), e)
@@ -684,6 +727,9 @@ def run_k_market_backtest(days: int, progress=None, vs_open: bool = False) -> di
                 progress(i, days, games_priced, len(candidates))
 
     report = {"days": days, "games_priced": games_priced,
+              "season": season, "end_date": end.strftime("%Y-%m-%d"),
+              "rows_source": ("season-scoped" if season != kseason.current_season()
+                              else "live"),
               "suspect_excluded": suspect,
               # The mode this run PRICED under. "actual" uses the final
               # boxscore order -- fine vs CLOSING lines (lineups are public
