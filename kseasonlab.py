@@ -165,6 +165,41 @@ def run_season_suite(season: int, market: bool = False,
     return out
 
 
+def run_all_models(season: int, market: bool = False, progress=None) -> dict:
+    """The one-button matrix: every K arm and every props arm on the same
+    season, sequential by necessity (arms share the model's knobs), one
+    comparison table out. First arm warms the season cache; the rest fly."""
+    import ppbacktest
+    out = {"season": season, "k": {}, "props": {}}
+    for arm in ARMS:
+        if progress: progress(f"{season}: K model [{arm}]…")
+        r = run_season_suite(season, market=market, progress=progress, arm=arm)
+        out["k"][arm] = {
+            "oos_brier": (r.get("oos") or {}).get("brier"),
+            "oos_brier_constant": (r.get("oos") or {}).get("brier_constant"),
+            "oos_n": (r.get("oos") or {}).get("predictions"),
+            "units": (r.get("market") or {}).get("units"),
+            "bets": (r.get("market") or {}).get("bets"),
+            "error": r.get("error")}
+    for arm in ppbacktest.PP_ARMS:
+        if progress: progress(f"{season}: props [{arm}]…")
+        r = ppbacktest.run_pp_season_suite_arm(season, arm=arm,
+                                               market_test=market,
+                                               progress=progress)
+        row = {"error": r.get("error")}
+        for mkt in ("hits", "walks"):
+            o = (r.get("oos") or {}).get(mkt) or {}
+            row[mkt] = {"oos_brier": o.get("brier"),
+                        "oos_brier_constant": o.get("brier_const"),
+                        "oos_n": o.get("n")}
+            m0 = ((r.get("market") or {}).get(mkt) or {})
+            row[mkt]["units"] = m0.get("units")
+            row[mkt]["bets"] = m0.get("bets")
+        out["props"][arm] = row
+    _store(season, "all_models", out, "all")
+    return out
+
+
 _state = {"status": "idle", "progress": "", "season": None}
 _lock = threading.Lock()
 _last_result: dict = {}
@@ -172,6 +207,7 @@ _last_result: dict = {}
 
 def start_season_suite(season: int, market: bool = False,
                        arm: str = "v2") -> dict:
+    """arm='all' runs the full matrix (every K arm + every props arm)."""
     """Background start (lab's run pattern) — returns immediately; poll
     season_state(); finished receipts land in _last_result + the DB."""
     with _lock:
@@ -187,8 +223,12 @@ def start_season_suite(season: int, market: bool = False,
     def _work():
         global _last_result
         try:
-            _last_result = run_season_suite(season, market=market,
-                                            progress=_prog, arm=arm)
+            if arm == "all":
+                _last_result = run_all_models(season, market=market,
+                                              progress=_prog)
+            else:
+                _last_result = run_season_suite(season, market=market,
+                                                progress=_prog, arm=arm)
             _state.update({"status": "idle",
                            "progress": f"done — {season}"
                            + (f" ({_last_result['error']})"
@@ -199,6 +239,51 @@ def start_season_suite(season: int, market: bool = False,
 
     threading.Thread(target=_work, daemon=True).start()
     return {"started": True, "season": season, "market": market, "arm": arm}
+
+
+def run_all_suite(season: int, market: bool = False, progress=None) -> dict:
+    """Every model, one season, one click: the three K arms back-to-back
+    (sequential by necessity -- they share the model's knobs -- but arms
+    2-3 fly on the warmed cache), then the props suite (hits + walks).
+    Returns one comparison payload."""
+    out: dict = {"season": season, "all": True, "k": {}, "props": None}
+    for arm in ("v2", "matchup", "cswdelta"):
+        if progress: progress(f"{season}: K arm {arm}…")
+        out["k"][arm] = run_season_suite(season, market=market,
+                                         progress=progress, arm=arm)
+    try:
+        import ppbacktest
+        if progress: progress(f"{season}: props (hits + walks)…")
+        out["props"] = ppbacktest.run_pp_season_suite(
+            season, market_test=market, progress=progress)
+    except Exception as e:
+        log.exception("props leg of all-suite failed")
+        out["props"] = {"error": f"props suite failed: {e}"}
+    return out
+
+
+def start_all_suite(season: int, market: bool = False) -> dict:
+    """Background 'run everything' -- same state/polling as single runs."""
+    with _lock:
+        if _state["status"] == "running":
+            return {"error": f"a season suite is already running "
+                             f"({_state['season']}) — {_state['progress']}"}
+        _state.update({"status": "running", "season": season, "arm": "ALL",
+                       "progress": "starting…"})
+
+    def _work():
+        global _last_result
+        try:
+            _last_result = run_all_suite(
+                season, market=market,
+                progress=lambda m: _state.__setitem__("progress", m))
+            _state.update({"status": "idle", "progress": f"done — {season} (all models)"})
+        except Exception as e:
+            log.exception("all-suite thread")
+            _state.update({"status": "idle", "progress": f"failed: {e}"})
+
+    threading.Thread(target=_work, daemon=True).start()
+    return {"started": True, "season": season, "market": market, "arm": "all"}
 
 
 def season_state() -> dict:
