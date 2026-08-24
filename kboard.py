@@ -32,6 +32,7 @@ import parlay
 import statcast_api
 import odds_api
 import kmodel
+import kseason
 
 try:
     import parks
@@ -72,6 +73,42 @@ EV_BANDS = ((2.0, 5.0), (5.0, 10.0), (10.0, 15.0), (15.0, 20.0), (20.0, None))
 # v1 = launch model (through 2026-07-27). v2 = start-only workload
 # mixture + curve refit from the 2,950-pred filtered run (2026-07-28).
 K_MODEL_VER = os.getenv("K_MODEL_VERSION", "v2")
+
+# ---------- the forward cage: paper variants priced at the SAME frozen
+# moment, same line, same prices as the live read. v2.2 stays the only
+# live/public model; these arms exist purely in the k_cage log so the
+# rest-of-season answers "which model" with receipts. Arms are LOCKED
+# here on purpose -- no mid-stream additions (KCAGE=0 disables).
+KCAGE_ON = os.getenv("KCAGE", "1") != "0"
+CAGE_ARMS = (
+    ("matchup", {"matchup_weight": 1.0}),
+    ("cswdelta", {"csw_delta_weight": 1.0}),
+)
+_cage_coefs = {"date": None, "coefs": None}
+
+
+def _cage_csw_coefs(today: str):
+    """CSW-delta needs the fitted called%/SwStr% -> K-rate mapping, which
+    only the backtest knows how to fit. Fit it ONCE per day, point-in-time
+    (rows strictly before today), population = starters the board has seen
+    in the last 30 days plus today's slate. Zero odds credits. None (thin
+    population / any failure) = the delta arm honestly logs nothing."""
+    if _cage_coefs["date"] == today:
+        return _cage_coefs["coefs"]
+    coefs = None
+    try:
+        import kbacktest  # lazy: keep kboard's boot path independent
+        with _conn() as c:
+            sids = {r[0] for r in c.execute(
+                "SELECT DISTINCT starter_id FROM k_board_log WHERE date >= ?",
+                ((datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d"),))}
+        coefs = kbacktest.fit_csw_mapping(sids, today)
+    except Exception as e:
+        log.warning("cage: csw mapping fit failed: %s", e)
+    _cage_coefs.update({"date": today, "coefs": coefs})
+    log.info("cage: csw coefs for %s: %s", today,
+             "fitted" if coefs else "unavailable (delta arm idle today)")
+    return coefs
 K_MODEL_ERA_LABELS = {"v1": "model v1 — through 7/27",
                       "v2": "model v2 — since 7/28 (start-only workloads)"}
 # The K model prices against the MAIN books only -- lines you can actually
@@ -98,6 +135,14 @@ def _conn():
         lineup_posted INTEGER, logged_ts INTEGER,
         actual_k INTEGER, cleared INTEGER,
         PRIMARY KEY (date, starter_id))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS k_cage (
+        date TEXT, game_pk INTEGER, starter_id INTEGER, name TEXT, arm TEXT,
+        line REAL, p_over REAL,
+        price_over INTEGER, book_over TEXT, ev_over REAL,
+        price_under INTEGER, book_under TEXT, ev_under REAL,
+        lineup_posted INTEGER, excluded INTEGER, logged_ts INTEGER,
+        actual_k INTEGER, cleared INTEGER,
+        PRIMARY KEY (date, starter_id, arm))""")
     conn.execute("""CREATE TABLE IF NOT EXISTS k_lineup_snaps (
         date TEXT, game_pk INTEGER, starter_id INTEGER, name TEXT,
         posted_ts INTEGER, line REAL, price_over INTEGER, book_over TEXT,
@@ -147,6 +192,29 @@ def _log_predictions(data: dict):
             1 if s.get("excluded") else None,
             s.get("override_note") if s.get("excluded") else None,
         ))
+    cage_rows = []
+    for s in data.get("starters", []):
+        for arm, pv in (s.get("_cage") or {}).items():
+            if pv.get("line") is None:
+                continue
+            cage_rows.append((
+                data["date"], s["game_pk"], s["starter_id"], s["starter"], arm,
+                pv["line"], pv["p_over"],
+                (pv.get("over") or {}).get("price"), (pv.get("over") or {}).get("book"),
+                pv.get("ev_over"),
+                (pv.get("under") or {}).get("price"), (pv.get("under") or {}).get("book"),
+                pv.get("ev_under"),
+                1 if s.get("lineup_posted") else 0,
+                1 if s.get("excluded") else None,
+                int(time.time()),
+            ))
+    if cage_rows:
+        with _conn() as c:
+            c.executemany("""INSERT OR IGNORE INTO k_cage
+                (date, game_pk, starter_id, name, arm, line, p_over,
+                 price_over, book_over, ev_over, price_under, book_under, ev_under,
+                 lineup_posted, excluded, logged_ts, actual_k, cleared)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""", cage_rows)
     if not rows:
         return
     with _conn() as c:
@@ -383,7 +451,10 @@ def _grade_pending(today: str):
     with _conn() as c:
         pending = c.execute(
             "SELECT date, game_pk, starter_id, line FROM k_board_log "
-            "WHERE actual_k IS NULL AND date < ?", (today,)).fetchall()
+            "WHERE actual_k IS NULL AND date < ? "
+            "UNION "
+            "SELECT date, game_pk, starter_id, line FROM k_cage "
+            "WHERE actual_k IS NULL AND date < ?", (today, today)).fetchall()
     if not pending:
         return
     finals: dict = {}
@@ -416,11 +487,87 @@ def _grade_pending(today: str):
             continue
         with _conn() as c:
             c.execute("UPDATE k_board_log SET actual_k=?, cleared=? "
-                      "WHERE date=? AND starter_id=?",
+                      "WHERE date=? AND starter_id=? AND actual_k IS NULL",
                       (int(actual), 1 if actual > line else 0, date, starter_id))
+            # cage rows grade against their OWN stored line (same rule)
+            c.execute("UPDATE k_cage SET actual_k=?, "
+                      "cleared=(CASE WHEN ? > line THEN 1 ELSE 0 END) "
+                      "WHERE date=? AND starter_id=? AND actual_k IS NULL",
+                      (int(actual), int(actual), date, starter_id))
         graded += 1
     if graded:
         log.info("k board: graded %d predictions", graded)
+
+
+def cage_summary(days: int = 400) -> dict:
+    """The cage scoreboard: every arm vs the LIVE model on the SAME graded
+    starts (inner join on date+starter), counted-band paper convention
+    (flat 1u, EV_LOG_MIN..EV_LOG_MAX, excluded reads out) plus Brier on
+    every graded read. Apples-to-apples by construction: an arm is only
+    ever compared on starts where both it and the live model froze a read."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=4)
+              - timedelta(days=max(1, min(400, days)))).strftime("%Y-%m-%d")
+
+    def _paper(p_over, ev_o, pr_o, ev_u, pr_u, cleared):
+        """One read -> (brier_term, bet) under the house convention."""
+        b = (p_over - cleared) ** 2
+        best = None
+        for side, ev, pr in (("over", ev_o, pr_o), ("under", ev_u, pr_u)):
+            if ev is None or pr is None:
+                continue
+            if EV_LOG_MIN <= ev <= EV_LOG_MAX and (best is None or ev > best[1]):
+                best = (side, ev, pr)
+        if best is None:
+            return b, None
+        side, ev, pr = best
+        won = (cleared == 1) if side == "over" else (cleared == 0)
+        units = (pr / 100.0 if pr > 0 else 100.0 / abs(pr)) if won else -1.0
+        return b, {"won": won, "units": units, "ev": ev}
+
+    def _stats(reads):
+        out = {"graded": len(reads), "brier": None, "bets": 0, "wins": 0,
+               "units": 0.0, "roi": None}
+        if not reads:
+            return out
+        bsum = 0.0
+        for r in reads:
+            b, bet = _paper(*r)
+            bsum += b
+            if bet:
+                out["bets"] += 1
+                out["wins"] += int(bet["won"])
+                out["units"] += bet["units"]
+        out["brier"] = round(bsum / len(reads), 4)
+        out["units"] = round(out["units"], 2)
+        if out["bets"]:
+            out["roi"] = round(out["units"] / out["bets"] * 100, 1)
+        return out
+
+    with _conn() as c:
+        arms = [r[0] for r in c.execute(
+            "SELECT DISTINCT arm FROM k_cage WHERE date >= ?", (cutoff,))]
+        out = {"days": days, "arms": {}, "note":
+               "each arm vs live on the SAME graded starts; flat 1u, "
+               f"{EV_LOG_MIN:g}-{EV_LOG_MAX:g}% counted band, excluded reads out"}
+        for arm in arms:
+            rows = c.execute(
+                "SELECT k.p_over, k.ev_over, k.price_over, k.ev_under, k.price_under, k.cleared, "
+                "       l.p_over, l.ev_over, l.price_over, l.ev_under, l.price_under, l.cleared "
+                "FROM k_cage k JOIN k_board_log l "
+                "  ON l.date = k.date AND l.starter_id = k.starter_id "
+                "WHERE k.arm = ? AND k.date >= ? "
+                "  AND k.cleared IS NOT NULL AND l.cleared IS NOT NULL "
+                "  AND (k.excluded IS NULL OR k.excluded = 0) "
+                "  AND (l.excluded IS NULL OR l.excluded = 0)",
+                (arm, cutoff)).fetchall()
+            arm_reads = [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows]
+            live_reads = [(r[6], r[7], r[8], r[9], r[10], r[11]) for r in rows]
+            out["arms"][arm] = {"arm": _stats(arm_reads),
+                                "live_on_same_starts": _stats(live_reads)}
+        pend = c.execute("SELECT COUNT(*) FROM k_cage WHERE cleared IS NULL "
+                         "AND date >= ?", (cutoff,)).fetchone()[0]
+        out["pending"] = pend
+    return out
 
 
 def _result_log_summary() -> dict:
@@ -792,6 +939,45 @@ def _build_board(date: str, progress: dict) -> dict:
                 entry.update(_price_starter(
                     events, g["teams"]["home"]["name"], g["teams"]["away"]["name"],
                     team["starter_name"], kdist))
+                # ---- forward cage: price each locked arm on the SAME
+                # inputs (rows, lineup, park, slot rate, start pks, TBF
+                # cap) against the SAME events payload -- identical line
+                # and prices, different model. Never touches the entry
+                # the public board renders.
+                if KCAGE_ON and entry.get("line") is not None:
+                    cage = {}
+                    coefs = _cage_csw_coefs(date)
+                    for arm, kn in CAGE_ARMS:
+                        if arm == "cswdelta" and not coefs:
+                            continue
+                        try:
+                            saved_coefs = kmodel.K_CSW_COEFS
+                            try:
+                                with kseason.knobs(**kn):
+                                    if arm == "cswdelta":
+                                        kmodel.K_CSW_COEFS = coefs
+                                    kd_v = kmodel.k_distribution(
+                                        lineup, s_rows, hand, p_league,
+                                        before=None, park_k_factor=_park_k(g.get("venue")),
+                                        unknown_slot_rate=_team_k_rate(opp.get("id"), hand),
+                                        start_game_pks=kmodel.fetch_start_games(team["starter_id"]))
+                            finally:
+                                kmodel.K_CSW_COEFS = saved_coefs
+                            if kd_v is None:
+                                continue
+                            if ov and ov.get("tbf_cap"):
+                                kd_v = _apply_tbf_cap(kd_v, ov["tbf_cap"])
+                            priced_v = _price_starter(
+                                events, g["teams"]["home"]["name"],
+                                g["teams"]["away"]["name"],
+                                team["starter_name"], kd_v)
+                            if priced_v.get("line") is not None:
+                                cage[arm] = priced_v
+                        except Exception as _ce:
+                            log.warning("cage arm %s failed for %s: %s",
+                                        arm, team["starter_name"], _ce)
+                    if cage:
+                        entry["_cage"] = cage
             except Exception as e:
                 log.warning("k board: %s failed: %s", team["starter_name"], e)
                 entry.update({"status": "no read", "why": "build error (see logs)"})
