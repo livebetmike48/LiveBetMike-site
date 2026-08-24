@@ -30,6 +30,8 @@ import requests
 
 import parlay
 import kmodel
+import kbacktest     # season windows + the shared odds archive (pay once ever)
+import kseason
 import pprops
 import backtest
 
@@ -73,9 +75,12 @@ def _majority_side(b_rows: list, before: str) -> str | None:
 
 
 def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
-                      hand_cache: dict, venue: str | None) -> list[dict]:
+                      hand_cache: dict, venue: str | None,
+                      rows_fn=None,
+                      season: int | None = None) -> list[dict]:
     """Both starters of one final game: point-in-time hits+walks
     distributions and the actual boxscore numbers to grade against."""
+    rows_fn = rows_fn or parlay.get_player_season_rows
     box = requests.get(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=20).json()
     out = []
     for side, opp in (("home", "away"), ("away", "home")):
@@ -93,7 +98,7 @@ def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
             continue
         name = ((sp.get("person") or {}).get("fullName")) or str(starter_id)
         try:
-            s_rows = parlay.get_player_season_rows(starter_id, True)
+            s_rows = rows_fn(starter_id, True)
         except Exception:
             continue
         if starter_id not in hand_cache:
@@ -107,7 +112,7 @@ def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
         lineup = []
         for pid in list(order)[:9]:
             try:
-                b_rows = parlay.get_player_season_rows(pid, False)
+                b_rows = rows_fn(pid, False)
             except Exception:
                 lineup.append(None)
                 continue
@@ -122,21 +127,25 @@ def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
             d = pprops.prop_distribution(
                 market, lineup, s_rows, hand, rates[market],
                 before=date_str, start_game_pks=start_pks,
-                park_factor_value=pprops.park_factor(venue, market))
+                park_factor_value=pprops.park_factor(venue, market,
+                                                     year=season))
             if not d or d.get("error"):
                 continue
             entry["markets"][market] = {
                 "dist": d["dist"], "mean": d["mean"], "actual": actuals[market]}
+        entry["starter_id"] = starter_id
         if entry["markets"]:
             out.append(entry)
     return out
 
 
-def run_pp_backtest(days: int, progress=None) -> dict:
+def run_pp_backtest(days: int, progress=None,
+                    end_date: str | None = None) -> dict:
     """Walk the window, price every start point-in-time, grade the ladder.
     Returns per-market Brier + calibration buckets."""
-    rates = pprops.league_rates()
-    end = datetime.now(timezone.utc) - timedelta(hours=4)
+    end, season, rows_fn = kbacktest._season_window(days, end_date,
+                                                    market=False)
+    rates = pprops.league_rates(season)
     hand_cache: dict = {}
     preds = {m: [] for m in LADDERS}   # (p_over, outcome, line)
     starts_priced = 0
@@ -152,7 +161,8 @@ def run_pp_backtest(days: int, progress=None) -> dict:
         for g in games:
             try:
                 starts = _game_prop_starts(g["gamePk"], date_str, rates,
-                                           hand_cache, g.get("venue"))
+                                           hand_cache, g.get("venue"),
+                                           rows_fn=rows_fn, season=season)
             except Exception as e:
                 log.warning("pp backtest: game %s failed: %s", g.get("gamePk"), e)
                 continue
@@ -160,12 +170,18 @@ def run_pp_backtest(days: int, progress=None) -> dict:
                 counted = False
                 for market, md in s["markets"].items():
                     for line in LADDERS[market]:
-                        p = kmodel.prob_over(md["dist"], line)
+                        p = pprops.calibrate(market,
+                                             kmodel.prob_over(md["dist"], line))
                         preds[market].append((p, 1 if md["actual"] > line else 0, line))
                     counted = True
                 if counted:
                     starts_priced += 1
-    report = {"days": days, "starts": starts_priced, "markets": {}}
+    report = {"days": days, "starts": starts_priced,
+              "season": season, "end_date": end.strftime("%Y-%m-%d"),
+              "rows_source": ("season-scoped" if season != kseason.current_season()
+                              else "live"),
+              "calibrated": {m: bool(pprops.P_CALIB.get(m)) for m in LADDERS},
+              "markets": {}}
     for market, rows in preds.items():
         if not rows:
             report["markets"][market] = {"n": 0}
@@ -228,3 +244,253 @@ def history(limit: int = 6) -> dict:
     return {"running": _state["running"], "progress": _state["progress"],
             "runs": [{"ts": ts, "days": d, **json.loads(rep)}
                      for ts, d, rep in rows]}
+
+
+# ------------------------------------------------------------------ fit
+def fit_pp_calibration(market: str, run_report: dict) -> dict:
+    """Within-run curve for ONE market from its raw buckets (>=100 preds,
+    the K Fit's floor). Points land in pprops.P_CALIB as FRACTIONS -- the
+    scale pprops.calibrate consumes. Returns receipts."""
+    mk = (run_report.get("markets") or {}).get(market) or {}
+    pts, used, total = [], 0, 0
+    for b in mk.get("buckets") or []:
+        total += 1
+        if b.get("n", 0) >= 100 and b.get("pred") is not None \
+           and b.get("actual") is not None:
+            pts.append((float(b["pred"]) / 100.0, float(b["actual"]) / 100.0))
+            used += 1
+    pts.sort()
+    pprops.P_CALIB[market] = pts
+    return {"market": market, "buckets_used": used, "buckets_total": total,
+            "points": pts}
+
+
+# ------------------------------------------------------------ market test
+ODDS_MARKETS = {"hits": "pitcher_hits_allowed", "walks": "pitcher_walks"}
+PP_EV_MIN, PP_EV_MAX = 2.0, 20.0     # the K harness's paper convention
+
+
+def _amer_units(price: float) -> float:
+    return price / 100.0 if price > 0 else 100.0 / abs(price)
+
+
+def _imp(price: float) -> float:
+    return 100.0 / (price + 100.0) if price > 0 else -price / (-price + 100.0)
+
+
+def run_pp_market_backtest(days: int, market: str, progress=None,
+                           end_date: str | None = None) -> dict:
+    """Units vs REAL closing lines for one props market, archive-first
+    through the SAME k_odds_archive (market key is part of the key, so
+    hits/walks history shares the pay-once-ever store). Same grading
+    discipline as the K market test: closing snapshot at commence time,
+    per-book best price on the model's side, 2-20%% counted band, flat 1u."""
+    if market not in ODDS_MARKETS:
+        return {"error": f"market must be one of {sorted(ODDS_MARKETS)}"}
+    end, season, rows_fn = kbacktest._season_window(days, end_date, market=True)
+    rates = pprops.league_rates(season)
+    odds_key = ODDS_MARKETS[market]
+    kbacktest._fetch_stats["odds_api"] = 0
+    kbacktest._fetch_stats["odds_hit"] = 0
+    hand_cache: dict = {}
+    bets, no_price = [], 0
+    for i in range(1, days + 1):
+        date_str = (end - timedelta(days=i)).strftime("%Y-%m-%d")
+        if progress:
+            progress(f"{market} day {i}/{days} -- {len(bets)} bets")
+        snapshot = f"{date_str}T23:00:00Z"
+        try:
+            events = kbacktest._hist_events(snapshot)
+        except Exception as e:
+            log.warning("pp market: events failed %s: %s", date_str, e)
+            continue
+        try:
+            games = backtest._final_games(date_str)
+        except Exception:
+            continue
+        gmap = {}
+        for g in games:
+            try:
+                st = _game_prop_starts(g["gamePk"], date_str, rates,
+                                       hand_cache, g.get("venue"),
+                                       rows_fn=rows_fn, season=season)
+            except Exception:
+                continue
+            for s0 in st:
+                gmap[s0["starter"].lower()] = s0
+        if not gmap:
+            continue
+        for ev in events or []:
+            eid = ev.get("id")
+            commence = ev.get("commence_time") or f"{date_str}T23:00:00Z"
+            try:
+                data = kbacktest._hist_odds(eid, commence, odds_key)
+            except Exception:
+                continue
+            books = ((data or {}).get("data") or {}).get("bookmakers") or []
+            quotes: dict = {}
+            for bk in books:
+                for m0 in bk.get("markets") or []:
+                    if m0.get("key") != odds_key:
+                        continue
+                    for o in m0.get("outcomes") or []:
+                        pl = (o.get("description") or "").lower()
+                        pt = o.get("point")
+                        side = o.get("name")
+                        pr = o.get("price")
+                        if pl and pt is not None and side in ("Over", "Under") \
+                           and pr is not None and float(pt) % 1 == 0.5:
+                            quotes.setdefault((pl, float(pt)), {}).setdefault(
+                                side, []).append(float(pr))
+            for (pl, pt), sides in quotes.items():
+                s0 = gmap.get(pl)
+                if not s0 or market not in s0["markets"]:
+                    continue
+                if "Over" not in sides or "Under" not in sides:
+                    continue
+                md = s0["markets"][market]
+                p_over = pprops.calibrate(market,
+                                          kmodel.prob_over(md["dist"], pt))
+                for side, p_side in (("Over", p_over), ("Under", 1 - p_over)):
+                    best = max(sides[side])
+                    ev_pct = (p_side * (1 + _amer_units(best)) - 1) * 100
+                    if not (PP_EV_MIN <= ev_pct <= PP_EV_MAX):
+                        continue
+                    actual = md["actual"]
+                    won = (actual > pt) if side == "Over" else (actual < pt)
+                    bets.append({
+                        "date": date_str, "starter": s0["starter"],
+                        "market": market, "side": side, "line": pt,
+                        "price": best, "ev": round(ev_pct, 1),
+                        "model_p": round(p_side, 4),
+                        "won": int(won),
+                        "units": round(_amer_units(best), 3) if won else -1.0})
+                    break     # one side per line, the model's side
+    if not bets:
+        return {"error": "no bets in window (no priced lines matched starts)",
+                "no_price": no_price, "season": season,
+                "odds_fetches": {"api": kbacktest._fetch_stats["odds_api"],
+                                 "archive": kbacktest._fetch_stats["odds_hit"]}}
+    units = round(sum(b["units"] for b in bets), 2)
+    wins = sum(b["won"] for b in bets)
+    _store_market(market, bets)
+    bands = []
+    for lo, hi in ((2, 5), (5, 10), (10, 15), (15, 20)):
+        sel = [b for b in bets if lo <= b["ev"] < hi or (hi == 20 and b["ev"] == 20)]
+        if sel:
+            bands.append({"band": f"{lo}-{hi}%", "bets": len(sel),
+                          "wins": sum(b["won"] for b in sel),
+                          "units": round(sum(b["units"] for b in sel), 2)})
+    return {"market": market, "season": season,
+            "end_date": end.strftime("%Y-%m-%d"), "days": days,
+            "bets": len(bets), "wins": wins, "units": units,
+            "roi": round(units / len(bets) * 100, 1),
+            "bands": bands,
+            "calibrated": bool(pprops.P_CALIB.get(market)),
+            "odds_fetches": {"api": kbacktest._fetch_stats["odds_api"],
+                             "archive": kbacktest._fetch_stats["odds_hit"]}}
+
+
+def _store_market(market: str, bets: list):
+    with _conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS pp_market_bets (
+            ts REAL, market TEXT, bet TEXT)""")
+        now = time.time()
+        for b in bets:
+            c.execute("INSERT INTO pp_market_bets VALUES (?,?,?)",
+                      (now, market, json.dumps(b)))
+
+
+# ------------------------------------------------------------ season suite
+def run_pp_season_suite(season: int, market_test: bool = False,
+                        progress=None) -> dict:
+    """The K season suite's exact policy, per props market: burn-in raw
+    to May 15 -> within-year curve per market -> OOS to Sep 28 on it ->
+    optional units vs that season's real closing lines."""
+    this_year = int(time.strftime("%Y"))
+    if season >= this_year:
+        return {"error": f"{season} is the live season"}
+    saved = {m: list(pprops.P_CALIB.get(m) or []) for m in LADDERS}
+    out: dict = {"season": season}
+    try:
+        for m in LADDERS:
+            pprops.P_CALIB[m] = []
+        if progress: progress(f"{season}: props burn-in (raw)…")
+        burn = run_pp_backtest(45, progress=progress,
+                               end_date=f"{season}-05-15")
+        out["burn_in"] = {m: {k: (burn["markets"].get(m) or {}).get(k)
+                              for k in ("n", "brier", "brier_const")}
+                          for m in LADDERS}
+        out["fit"] = {m: fit_pp_calibration(m, burn) for m in LADDERS}
+        if progress: progress(f"{season}: props OOS (calibrated)…")
+        oos = run_pp_backtest(130, progress=progress,
+                              end_date=f"{season}-09-28")
+        out["oos"] = oos["markets"]
+        if market_test:
+            for m in LADDERS:
+                if progress: progress(f"{season}: {m} market test…")
+                out.setdefault("market", {})[m] = run_pp_market_backtest(
+                    130, m, progress=progress, end_date=f"{season}-09-28")
+    except ValueError as e:
+        out["error"] = str(e)
+    except Exception:
+        log.exception("pp season suite %s failed", season)
+        out["error"] = "pp season suite failed -- see server log"
+    finally:
+        for m in LADDERS:
+            pprops.P_CALIB[m] = saved[m]
+    with _conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS pp_season_runs (
+            ts REAL, season INTEGER, report TEXT)""")
+        c.execute("INSERT INTO pp_season_runs VALUES (?,?,?)",
+                  (time.time(), season, json.dumps(out)))
+    return out
+
+
+_pp_state = {"status": "idle", "progress": "", "season": None}
+_pp_last: dict = {}
+
+
+def start_pp_season_suite(season: int, market_test: bool = False) -> dict:
+    with _lock:
+        if _pp_state["status"] == "running":
+            return {"error": f"a props season suite is already running "
+                             f"({_pp_state['season']}) -- {_pp_state['progress']}"}
+        _pp_state.update({"status": "running", "season": season,
+                          "progress": "starting…"})
+
+    def _work():
+        global _pp_last
+        try:
+            _pp_last = run_pp_season_suite(
+                season, market_test=market_test,
+                progress=lambda m: _pp_state.__setitem__("progress", m))
+            _pp_state.update({"status": "idle", "progress": f"done -- {season}"})
+        except Exception as e:
+            log.exception("pp season thread")
+            _pp_state.update({"status": "idle", "progress": f"failed: {e}"})
+
+    threading.Thread(target=_work, daemon=True).start()
+    return {"started": True, "season": season, "market": market_test}
+
+
+def pp_season_state() -> dict:
+    hist = []
+    try:
+        with _conn() as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS pp_season_runs (
+                ts REAL, season INTEGER, report TEXT)""")
+            for ts, season, rep in c.execute(
+                    "SELECT ts, season, report FROM pp_season_runs "
+                    "ORDER BY ts DESC LIMIT 20"):
+                try:
+                    r = json.loads(rep)
+                except Exception:
+                    r = {}
+                hist.append({"ts": ts, "season": season,
+                             "error": r.get("error"),
+                             "markets": list((r.get("oos") or {}).keys())})
+    except Exception:
+        pass
+    return {"run": dict(_pp_state), "last_result": _pp_last or None,
+            "history": hist}
