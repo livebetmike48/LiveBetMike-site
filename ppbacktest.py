@@ -447,6 +447,43 @@ def run_pp_season_suite(season: int, market_test: bool = False,
     return out
 
 
+from contextlib import contextmanager
+
+
+@contextmanager
+def pp_knobs(park_weight=None, workload_weight=None):
+    """Temporarily set pprops' variant knobs; ALWAYS restores on exit
+    (kseason.knobs' pattern)."""
+    saved = (pprops.P_PARK_WEIGHT, pprops.P_WORKLOAD_WEIGHT)
+    try:
+        if park_weight is not None:
+            pprops.P_PARK_WEIGHT = float(park_weight)
+        if workload_weight is not None:
+            pprops.P_WORKLOAD_WEIGHT = float(workload_weight)
+        yield
+    finally:
+        pprops.P_PARK_WEIGHT, pprops.P_WORKLOAD_WEIGHT = saved
+
+
+# Per-market variant arms -- hits and walks each race their OWN ideas.
+PP_ARMS = {
+    "base":     {},
+    "park0":    {"park_weight": 0.0},       # the never-settled Coors receipt
+    "workload": {"workload_weight": 1.0},   # patient lineups shorten outings
+}
+
+
+def run_pp_season_suite_arm(season: int, arm: str = "base",
+                            market_test: bool = False, progress=None) -> dict:
+    if arm not in PP_ARMS:
+        return {"error": f"unknown props arm '{arm}'"}
+    with pp_knobs(**PP_ARMS[arm]):
+        out = run_pp_season_suite(season, market_test=market_test,
+                                  progress=progress)
+    out["arm"] = arm
+    return out
+
+
 _pp_state = {"status": "idle", "progress": "", "season": None}
 _pp_last: dict = {}
 
