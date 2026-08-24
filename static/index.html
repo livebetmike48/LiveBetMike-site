@@ -1414,7 +1414,7 @@ load();
   function render(r,box){
     if(!r){box.innerHTML='';return;}
     if(r.error){box.innerHTML='<span style="color:#d7483a">'+r.error+'</span>';return;}
-    var h='<b>'+r.season+'</b> — burn-in: '+fmt(r.burn_in&&r.burn_in.predictions)+' preds, Brier '+fmt(r.burn_in&&r.burn_in.brier)
+    var h='<b>'+r.season+' · '+(r.arm||'v2')+'</b> — burn-in: '+fmt(r.burn_in&&r.burn_in.predictions)+' preds, Brier '+fmt(r.burn_in&&r.burn_in.brier)
       +' · fit: '+fmt(r.fit&&r.fit.buckets_used)+'/'+fmt(r.fit&&r.fit.buckets_total)+' buckets'
       +(r.fit&&r.fit.note?' <i>('+r.fit.note+')</i>':'')
       +'<br><b>OOS</b>: '+fmt(r.oos&&r.oos.predictions)+' preds — Brier <b>'+fmt(r.oos&&r.oos.brier)+'</b>'
@@ -1432,7 +1432,7 @@ load();
         if(POLL&&d.run&&d.run.status!=='running'){clearInterval(POLL);POLL=null;}
         if(out&&d.last_result)render(d.last_result,out);}
       if(hist&&d.runs&&d.runs.length){hist.innerHTML='<b>History:</b> '+d.runs.map(function(r){
-        return r.season+' '+r.phase+(r.brier!=null?' B'+r.brier:'')+(r.units!=null?' '+r.units+'u':'');}).join(' | ');}
+        return r.season+' '+(r.arm||'v2')+' '+r.phase+(r.brier!=null?' B'+r.brier:'')+(r.units!=null?' '+r.units+'u':'');}).join(' | ');}
     }).catch(function(){});}
   function addSection(main){
     var box=document.createElement('div');
@@ -1441,6 +1441,7 @@ load();
       +'<div class="meta" style="margin:0 0 6px">Burn-in (season start → May 15) fits that <b>year\u2019s own</b> calibration curve; May 21 → Sep 28 grades <b>out-of-sample</b> on it. Accuracy runs are free (Savant season cache, first run per year is the slow one). \u201c+ market\u201d prices the OOS span vs real closing lines (~20cr/game first time, archived free after — 2023 props exist from 5/3). Uses the lab token above.</div>'
       +'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
       +'<select id="ks-year"><option>2025</option><option>2024</option><option>2023</option></select>'
+      +'<select id="ks-arm"><option value="v2">v2 (live model)</option><option value="matchup">+ matchup</option><option value="cswdelta">+ CSW delta</option></select>'
       +'<label class="meta" style="cursor:pointer"><input type="checkbox" id="ks-mkt" style="vertical-align:middle"> + market test (credits)</label>'
       +'<button class="btn" id="ks-run">Run season suite</button>'
       +'<span class="meta" id="ks-status">idle</span></div>'
@@ -1452,7 +1453,7 @@ load();
       var tok=(document.getElementById('lab-token')||{}).value||'';
       document.getElementById('ks-status').textContent='starting…';
       fetch('/api/klab/season',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({season:y,market:m,token:tok})})
+        body:JSON.stringify({season:y,market:m,arm:box.querySelector('#ks-arm').value,token:tok})})
         .then(function(x){return x.json();}).then(function(r){
           if(r.error){document.getElementById('ks-status').textContent=r.error;return;}
           if(!POLL)POLL=setInterval(poll,4000);poll();})
