@@ -85,13 +85,17 @@ PARK_CLAMP = (0.85, 1.15)
 PARK_MARKETS = {"hits"}
 
 
-def park_factor(venue: str | None, market: str) -> float | None:
+def park_factor(venue: str | None, market: str,
+                year: int | None = None) -> float | None:
     """Official Savant park factor for a market, or None when unknown --
-    so 'neutral park' and 'no data' never get confused."""
+    so 'neutral park' and 'no data' never get confused. year=None = the
+    current season; a past year uses that season's own factors."""
     if not venue or parks is None or market not in PARK_MARKETS:
         return None
     try:
-        return parks.factor_for(venue)
+        return parks.factor_for(venue, year=year)
+    except TypeError:
+        return parks.factor_for(venue)      # older parks.py, live path
     except Exception as e:
         log.warning("park factor lookup failed for %s: %s", venue, e)
         return None
@@ -121,10 +125,37 @@ MARKETS = {
 _league_cache = {"ts": 0, "rates": None}
 
 
-def league_rates() -> dict:
+_league_year_cache: dict = {}
+
+
+def league_rates(season: int | None = None) -> dict:
     """League per-PA rate for every market, from MLB's real season team
-    totals. Cached a day, exactly like the K model's league rate."""
+    totals. season=None = current (live path, its own cache). A past
+    season uses that YEAR'S totals -- 2024 walks are never priced against
+    2026's league."""
     now = time.time()
+    if season and int(season) != int(time.strftime("%Y")):
+        season = int(season)
+        hit = _league_year_cache.get(season)
+        if hit and now - hit["ts"] < 86400 * 30:
+            return hit["rates"]
+        resp = requests.get(
+            f"{MLB_BASE}/teams/stats",
+            params={"season": season, "group": "hitting",
+                    "stats": "season", "sportId": 1}, timeout=20)
+        resp.raise_for_status()
+        totals: dict = {}
+        pa = 0
+        for split in resp.json()["stats"][0]["splits"]:
+            stat = split.get("stat", {})
+            pa += int(stat.get("plateAppearances", 0))
+            for market, cfg in MARKETS.items():
+                totals[market] = totals.get(market, 0) + int(stat.get(cfg["stat_key"], 0))
+        if pa == 0:
+            raise RuntimeError(f"league totals unavailable for {season}")
+        rates = {m: totals[m] / pa for m in MARKETS}
+        _league_year_cache[season] = {"ts": now, "rates": rates}
+        return rates
     if _league_cache["rates"] and now - _league_cache["ts"] < 86400:
         return _league_cache["rates"]
     resp = requests.get(
@@ -342,13 +373,37 @@ def k_projection(lineup: list, starter_rows: list[dict], starter_hand: str,
                           for l in range(2, 10)}}
 
 
-def price_line(dist: dict, line: float) -> dict:
-    """Model read on a posted line, straight off the distribution shape.
-    No calibration curve yet -- each market earns its own in the Lab, and
-    an unfitted curve would be a lie, not a default."""
+# Per-market calibration curves, fit by ppbacktest from REAL raw runs
+# (>=100-pred buckets, within-year for season work). Empty = raw, honestly
+# flagged. Same piecewise shape as the K model's curve.
+P_CALIB: dict[str, list] = {"hits": [], "walks": []}
+
+
+def calibrate(market: str, p: float) -> float:
+    pts = P_CALIB.get(market) or []
+    if not pts:
+        return p
+    xs = [x for x, _ in pts]
+    ys = [y for _, y in pts]
+    if p <= xs[0]:
+        return max(0.0, min(1.0, ys[0]))
+    if p >= xs[-1]:
+        return max(0.0, min(1.0, ys[-1]))
+    for i in range(1, len(xs)):
+        if p <= xs[i]:
+            t = (p - xs[i-1]) / (xs[i] - xs[i-1]) if xs[i] != xs[i-1] else 0
+            return max(0.0, min(1.0, ys[i-1] + t * (ys[i] - ys[i-1])))
+    return p
+
+
+def price_line(dist: dict, line: float, market: str | None = None) -> dict:
+    """Model read on a posted line. A market WITH a fitted curve gets it
+    applied (calibrated: true); no curve = raw, honestly flagged."""
     raw = kmodel.prob_over(dist["dist"], line)
-    return {"line": line, "p_over": round(raw, 4), "p_under": round(1 - raw, 4),
-            "calibrated": False}
+    p = calibrate(market, raw) if market else raw
+    return {"line": line, "p_over": round(p, 4), "p_under": round(1 - p, 4),
+            "raw_p_over": round(raw, 4),
+            "calibrated": bool(market and P_CALIB.get(market))}
 
 
 # ---------------------------------------------------------------------------
