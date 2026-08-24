@@ -389,6 +389,29 @@ def api_kseasons():
         return {"error": str(e)}
 
 
+@app.post("/api/pplab/season")
+def api_pplab_season(payload: dict):
+    """Props (hits/walks) season suite -- burn-in fits each market's own
+    within-year curve, remainder graded OOS; market_test adds units vs
+    real closing lines (archive-first, shared pay-once store)."""
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    try:
+        return ppbacktest.start_pp_season_suite(
+            int(payload.get("season", 0)),
+            market_test=bool(payload.get("market")))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/ppseasons")
+def api_ppseasons():
+    try:
+        return ppbacktest.pp_season_state()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/api/klab/config")
 def api_klab_config(payload: dict):
     if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
