@@ -374,7 +374,8 @@ def api_klab_season(payload: dict):
         return {"error": "bad token"}
     try:
         return kseasonlab.start_season_suite(int(payload.get("season", 0)),
-                                             market=bool(payload.get("market")))
+                                             market=bool(payload.get("market")),
+                                             arm=str(payload.get("arm", "v2")))
     except Exception as e:
         return {"error": str(e)}
 
