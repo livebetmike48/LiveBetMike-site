@@ -73,7 +73,10 @@ def _fit_points(calibration: list) -> tuple[list, dict]:
         n = b.get("n", 0)
         if n >= MIN_BUCKET_PREDS and b.get("predicted") is not None \
            and b.get("actual") is not None:
-            pts.append((float(b["predicted"]), float(b["actual"])))
+            # bucket receipts are PERCENTS; the curve (kmodel.calibrate)
+            # consumes FRACTIONS -- same /100 the live Fit does (lab.py)
+            pts.append((float(b["predicted"]) / 100.0,
+                        float(b["actual"]) / 100.0))
             used += 1
     pts.sort()
     return pts, {"buckets_used": used, "buckets_total": total,
