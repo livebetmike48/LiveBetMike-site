@@ -27,6 +27,7 @@ from datetime import date
 
 import kmodel
 import kbacktest
+import kseason
 import lab
 
 log = logging.getLogger("kseasonlab")
@@ -37,18 +38,30 @@ OOS_END_MD = "-09-28"      # regular-season close
 OOS_DAYS = 130             # May 21 -> Sep 28 stays inside one season
 MIN_BUCKET_PREDS = 100     # same floor as the live Fit
 
+# The arms — same set the forward cage races nightly. v2 = the live model.
+ARMS = {
+    "v2":       {},
+    "matchup":  {"matchup_weight": 1.0},
+    "cswdelta": {"csw_delta_weight": 1.0},
+}
+
 
 def _init():
     with sqlite3.connect(lab.DB_PATH) as c:
         c.execute("""CREATE TABLE IF NOT EXISTS k_season_runs (
             ts REAL, season INTEGER, phase TEXT, report TEXT)""")
+        try:
+            c.execute("ALTER TABLE k_season_runs ADD COLUMN arm TEXT")
+        except sqlite3.OperationalError:
+            pass
 
 
-def _store(season: int, phase: str, report: dict):
+def _store(season: int, phase: str, report: dict, arm: str = "v2"):
     _init()
     with sqlite3.connect(lab.DB_PATH) as c:
-        c.execute("INSERT INTO k_season_runs VALUES (?,?,?,?)",
-                  (time.time(), season, phase, json.dumps(report)))
+        c.execute("INSERT INTO k_season_runs (ts, season, phase, report, arm) "
+                  "VALUES (?,?,?,?,?)",
+                  (time.time(), season, phase, json.dumps(report), arm))
 
 
 def _fit_points(calibration: list) -> tuple[list, dict]:
@@ -68,8 +81,12 @@ def _fit_points(calibration: list) -> tuple[list, dict]:
 
 
 def run_season_suite(season: int, market: bool = False,
-                     progress=None) -> dict:
-    """Full burn-in -> fit -> OOS (-> market) suite for one past season."""
+                     progress=None, arm: str = "v2") -> dict:
+    """Full burn-in -> fit -> OOS (-> market) suite for one past season,
+    for one ARM (v2 / matchup / cswdelta) — the backward mirror of the
+    forward cage, so every model gets past years AND rest-of-year."""
+    if arm not in ARMS:
+        return {"error": f"unknown arm '{arm}' — one of {sorted(ARMS)}"}
     this_year = date.today().year
     if season >= this_year:
         return {"error": f"{season} is the live season — use the normal Lab "
@@ -79,17 +96,21 @@ def run_season_suite(season: int, market: bool = False,
 
     saved_pts = list(kmodel.K_CALIB_POINTS)
     saved_w = kmodel.K_CALIB_WEIGHT
-    out: dict = {"season": season, "policy": {
+    saved_coefs = kmodel.K_CSW_COEFS
+    out: dict = {"season": season, "arm": arm, "policy": {
         "burn_in_end": f"{season}{BURN_END_MD}", "burn_days": BURN_DAYS,
         "oos_end": f"{season}{OOS_END_MD}", "oos_days": OOS_DAYS,
         "curve": "fit within-year on burn-in, OOS graded on it"}}
     try:
+      with kseason.knobs(**ARMS[arm]):
         # A. burn-in, RAW
         kmodel.K_CALIB_POINTS = []
-        if progress: progress(f"{season}: burn-in raw backtest…")
+        if progress: progress(f"{season} [{arm}]: burn-in raw backtest…")
         burn = kbacktest.run_k_backtest(BURN_DAYS,
                                         end_date=f"{season}{BURN_END_MD}")
-        _store(season, "burn_raw", burn)
+        _store(season, "burn_raw", burn, arm)
+        if burn.get("csw_fit") is not None:
+            out["csw_fit_burn"] = burn.get("csw_fit")
         out["burn_in"] = {"predictions": burn.get("n"),
                           "starts": burn.get("starts"),
                           "brier": burn.get("brier_model"),
@@ -102,13 +123,17 @@ def run_season_suite(season: int, market: bool = False,
         if not pts:
             out["fit"]["note"] = ("no bucket met the floor — OOS runs RAW "
                                   "(honest, not silently curved)")
-        # C. OOS on that curve
+        # C. OOS on that curve. For the cswdelta arm, kbacktest itself
+        # fits the CSW->K mapping point-in-time at each window start
+        # (knob>0 triggers it; receipt lands in the run report).
         kmodel.K_CALIB_POINTS = pts
         kmodel.K_CALIB_WEIGHT = saved_w if pts else 0.0
-        if progress: progress(f"{season}: OOS calibrated backtest…")
+        if progress: progress(f"{season} [{arm}]: OOS calibrated backtest…")
         oos = kbacktest.run_k_backtest(OOS_DAYS,
                                        end_date=f"{season}{OOS_END_MD}")
-        _store(season, "oos", oos)
+        _store(season, "oos", oos, arm)
+        if oos.get("csw_fit") is not None:
+            out["csw_fit_oos"] = oos.get("csw_fit")
         out["oos"] = {"predictions": oos.get("n"),
                       "starts": oos.get("starts"),
                       "brier": oos.get("brier_model"),
@@ -118,10 +143,10 @@ def run_season_suite(season: int, market: bool = False,
                       "rows_source": oos.get("rows_source")}
         # D. market (optional, credits — archive-first makes reruns free)
         if market:
-            if progress: progress(f"{season}: market test vs closing lines…")
+            if progress: progress(f"{season} [{arm}]: market test vs closing lines…")
             mkt = kbacktest.run_k_market_backtest(OOS_DAYS,
                                                   end_date=f"{season}{OOS_END_MD}")
-            _store(season, "market", mkt)
+            _store(season, "market", mkt, arm)
             mkt.pop("_candidates", None)
             out["market"] = {k: v for k, v in mkt.items()
                              if k not in ("sample_bets",)}
@@ -133,6 +158,7 @@ def run_season_suite(season: int, market: bool = False,
     finally:
         kmodel.K_CALIB_POINTS = saved_pts
         kmodel.K_CALIB_WEIGHT = saved_w
+        kmodel.K_CSW_COEFS = saved_coefs
     return out
 
 
@@ -141,14 +167,15 @@ _lock = threading.Lock()
 _last_result: dict = {}
 
 
-def start_season_suite(season: int, market: bool = False) -> dict:
+def start_season_suite(season: int, market: bool = False,
+                       arm: str = "v2") -> dict:
     """Background start (lab's run pattern) — returns immediately; poll
     season_state(); finished receipts land in _last_result + the DB."""
     with _lock:
         if _state["status"] == "running":
             return {"error": f"a season suite is already running "
                              f"({_state['season']}) — {_state['progress']}"}
-        _state.update({"status": "running", "season": season,
+        _state.update({"status": "running", "season": season, "arm": arm,
                        "progress": "starting…"})
 
     def _prog(msg):
@@ -158,7 +185,7 @@ def start_season_suite(season: int, market: bool = False) -> dict:
         global _last_result
         try:
             _last_result = run_season_suite(season, market=market,
-                                            progress=_prog)
+                                            progress=_prog, arm=arm)
             _state.update({"status": "idle",
                            "progress": f"done — {season}"
                            + (f" ({_last_result['error']})"
@@ -168,7 +195,7 @@ def start_season_suite(season: int, market: bool = False) -> dict:
             _state.update({"status": "idle", "progress": f"failed: {e}"})
 
     threading.Thread(target=_work, daemon=True).start()
-    return {"started": True, "season": season, "market": market}
+    return {"started": True, "season": season, "market": market, "arm": arm}
 
 
 def season_state() -> dict:
@@ -179,15 +206,15 @@ def season_history() -> list[dict]:
     """Stored season-suite receipts, newest first, for the Lab UI."""
     _init()
     with sqlite3.connect(lab.DB_PATH) as c:
-        rows = c.execute("SELECT ts, season, phase, report FROM k_season_runs "
-                         "ORDER BY ts DESC LIMIT 60").fetchall()
+        rows = c.execute("SELECT ts, season, phase, report, arm "
+                         "FROM k_season_runs ORDER BY ts DESC LIMIT 60").fetchall()
     out = []
-    for ts, season, phase, rep in rows:
+    for ts, season, phase, rep, arm in rows:
         try:
             r = json.loads(rep)
         except Exception:
             r = {}
-        out.append({"ts": ts, "season": season, "phase": phase,
+        out.append({"ts": ts, "season": season, "phase": phase, "arm": arm or "v2",
                     "brier": r.get("brier_model"), "predictions": r.get("n"),
                     "units": r.get("units"), "roi": r.get("roi")})
     return out
