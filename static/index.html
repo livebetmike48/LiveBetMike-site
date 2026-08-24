@@ -1414,6 +1414,20 @@ load();
   function render(r,box){
     if(!r){box.innerHTML='';return;}
     if(r.error){box.innerHTML='<span style="color:#d7483a">'+r.error+'</span>';return;}
+    if(r.k&&r.props){ // the ALL-MODELS matrix -> one comparison table
+      var h='<b>'+r.season+' — every model, same season, OOS</b>'
+        +'<table style="margin-top:6px;font-size:12px;border-collapse:collapse">'
+        +'<tr><th style="text-align:left;padding:2px 10px 2px 0">Model</th><th style="padding:2px 10px">OOS Brier</th><th style="padding:2px 10px">vs constant</th><th style="padding:2px 10px">preds</th><th style="padding:2px 10px">Units</th></tr>';
+      var karms=Object.keys(r.k);
+      for(var i=0;i<karms.length;i++){var a=karms[i],k=r.k[a];
+        h+='<tr><td style="padding:2px 10px 2px 0">K · '+a+'</td><td style="text-align:center">'+fmt(k.oos_brier)+'</td><td style="text-align:center">'+fmt(k.oos_brier_constant)+'</td><td style="text-align:center">'+fmt(k.oos_n)+'</td><td style="text-align:center">'+(k.units!=null?k.units+'u':'—')+'</td></tr>';}
+      var parms=Object.keys(r.props);
+      for(var j=0;j<parms.length;j++){var pa=parms[j],pr=r.props[pa];
+        var mkts=['hits','walks'];
+        for(var q=0;q<mkts.length;q++){var mk=mkts[q],row=pr[mk]||{};
+          h+='<tr><td style="padding:2px 10px 2px 0">'+mk+' · '+pa+'</td><td style="text-align:center">'+fmt(row.oos_brier)+'</td><td style="text-align:center">'+fmt(row.oos_brier_constant)+'</td><td style="text-align:center">'+fmt(row.oos_n)+'</td><td style="text-align:center">'+(row.units!=null?row.units+'u':'—')+'</td></tr>';}}
+      h+='</table><div class="meta" style="margin-top:4px">lower Brier than "vs constant" = real skill that year · units only when "+ market" was checked</div>';
+      box.innerHTML=h;return;}
     var h='<b>'+r.season+' · '+(r.arm||'v2')+'</b> — burn-in: '+fmt(r.burn_in&&r.burn_in.predictions)+' preds, Brier '+fmt(r.burn_in&&r.burn_in.brier)
       +' · fit: '+fmt(r.fit&&r.fit.buckets_used)+'/'+fmt(r.fit&&r.fit.buckets_total)+' buckets'
       +(r.fit&&r.fit.note?' <i>('+r.fit.note+')</i>':'')
@@ -1441,7 +1455,7 @@ load();
       +'<div class="meta" style="margin:0 0 6px">Burn-in (season start → May 15) fits that <b>year\u2019s own</b> calibration curve; May 21 → Sep 28 grades <b>out-of-sample</b> on it. Accuracy runs are free (Savant season cache, first run per year is the slow one). \u201c+ market\u201d prices the OOS span vs real closing lines (~20cr/game first time, archived free after — 2023 props exist from 5/3). Uses the lab token above.</div>'
       +'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
       +'<select id="ks-year"><option>2025</option><option>2024</option><option>2023</option></select>'
-      +'<select id="ks-arm"><option value="v2">v2 (live model)</option><option value="matchup">+ matchup</option><option value="cswdelta">+ CSW delta</option></select>'
+      +'<select id="ks-arm"><option value="all">ALL MODELS (K + hits + walks)</option><option value="v2">K: v2 (live)</option><option value="matchup">K: + matchup</option><option value="cswdelta">K: + CSW delta</option></select>'
       +'<label class="meta" style="cursor:pointer"><input type="checkbox" id="ks-mkt" style="vertical-align:middle"> + market test (credits)</label>'
       +'<button class="btn" id="ks-run">Run season suite</button>'
       +'<span class="meta" id="ks-status">idle</span></div>'
