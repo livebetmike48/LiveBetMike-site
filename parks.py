@@ -216,12 +216,41 @@ def factors() -> dict:
     return data
 
 
-def factor_for(venue_name: str) -> float | None:
+_hits_year_cache = {}   # season -> {"ts","data"} for historical backtests
+
+
+def hits_factors_year(year: int) -> dict:
+    """Savant hits park factors for a PAST season -- same endpoint and
+    honesty rules as factors(): neutral-on-failure, logged loudly, cached
+    per year (historical factors are final)."""
+    year = int(year)
+    now = time.time()
+    hit = _hits_year_cache.get(year)
+    if hit and now - hit["ts"] < 86400 * 30:
+        return hit["data"]
+    data = {}
+    text, _detail = _fetch_raw("index_hits", year=year)
+    if text:
+        data = _parse_csv(text)
+        if not data:
+            data, _h = _from_html(text, ("hits", "hit", "h"))
+    if data:
+        log.info("park hits factors %s: %d venues", year, len(data))
+    else:
+        log.warning("park hits factors %s unavailable -- park-neutral", year)
+    _hits_year_cache[year] = {"ts": now, "data": data}
+    return data
+
+
+def factor_for(venue_name: str, year: int | None = None) -> float | None:
     """Hits factor for a venue (1.0 neutral). None when unknown so the
-    model can distinguish 'neutral park' from 'no data'."""
+    model can distinguish 'neutral park' from 'no data'. year=None = the
+    current season (live path untouched); a past year uses that season's
+    own factors."""
     if not venue_name:
         return None
-    data = factors()
+    data = hits_factors_year(year) if year and int(year) != int(time.strftime("%Y")) \
+        else factors()
     if not data:
         return None
     key = _fold(venue_name)
