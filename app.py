@@ -10,6 +10,7 @@ import matchups
 import bullpen
 import lab
 import kboard
+import kseasonlab
 import kplays
 import csw
 import kmatchup
@@ -360,6 +361,29 @@ def api_klab_fit(payload: dict):
         return {"error": "bad token"}
     try:
         return lab.fit_k_calibration_now()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/klab/season")
+def api_klab_season(payload: dict):
+    """Season backtest suite: burn-in fits that YEAR'S curve, remainder
+    graded OOS; market=True adds the units test vs real closing lines
+    (archive-first). Long-running — the UI warns."""
+    if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
+        return {"error": "bad token"}
+    try:
+        return kseasonlab.start_season_suite(int(payload.get("season", 0)),
+                                             market=bool(payload.get("market")))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/kseasons")
+def api_kseasons():
+    """Run state + last result + stored receipts (read-only, house pattern)."""
+    try:
+        return kseasonlab.season_state() | {"runs": kseasonlab.season_history()}
     except Exception as e:
         return {"error": str(e)}
 
