@@ -77,9 +77,16 @@ def _majority_side(b_rows: list, before: str) -> str | None:
 def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
                       hand_cache: dict, venue: str | None,
                       rows_fn=None,
-                      season: int | None = None) -> list[dict]:
+                      season: int | None = None,
+                      rejects: dict | None = None) -> list[dict]:
     """Both starters of one final game: point-in-time hits+walks
-    distributions and the actual boxscore numbers to grade against."""
+    distributions and the actual boxscore numbers to grade against.
+    Every skipped starter is COUNTED by cause in `rejects` -- a zero-start
+    run must name its reason instead of shrugging (the Aug-26 lesson:
+    2025 priced nothing, silently)."""
+    def _rej(key):
+        if rejects is not None:
+            rejects[key] = rejects.get(key, 0) + 1
     rows_fn = rows_fn or parlay.get_player_season_rows
     box = requests.get(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=20).json()
     out = []
@@ -89,17 +96,20 @@ def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
         pitchers = pitching.get("pitchers") or []
         order = batting.get("battingOrder") or []
         if not pitchers or not order:
+            _rej("no_lineup_or_pitchers")
             continue
         starter_id = pitchers[0]
         sp = (pitching.get("players") or {}).get(f"ID{starter_id}") or {}
         pstats = ((sp.get("stats") or {}).get("pitching")) or {}
         actuals = {m: pstats.get(BOX_KEYS[m]) for m in LADDERS}
         if any(v is None for v in actuals.values()):
+            _rej("no_boxscore_actuals")
             continue
         name = ((sp.get("person") or {}).get("fullName")) or str(starter_id)
         try:
             s_rows = rows_fn(starter_id, True)
         except Exception:
+            _rej("starter_rows_error")
             continue
         if starter_id not in hand_cache:
             try:
@@ -108,6 +118,7 @@ def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
                 hand_cache[starter_id] = None
         hand = hand_cache[starter_id]
         if hand not in ("L", "R"):
+            _rej("no_hand")
             continue
         lineup = []
         for pid in list(order)[:9]:
@@ -130,12 +141,15 @@ def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
                 park_factor_value=pprops.park_factor(venue, market,
                                                      year=season))
             if not d or d.get("error"):
+                _rej(f"dist_gated_{market}")
                 continue
             entry["markets"][market] = {
                 "dist": d["dist"], "mean": d["mean"], "actual": actuals[market]}
         entry["starter_id"] = starter_id
         if entry["markets"]:
             out.append(entry)
+        else:
+            _rej("no_market_priced")
     return out
 
 
@@ -149,10 +163,17 @@ def run_pp_backtest(days: int, progress=None,
     hand_cache: dict = {}
     preds = {m: [] for m in LADDERS}   # (p_over, outcome, line)
     starts_priced = 0
+    rejects: dict = {}
     for i in range(1, days + 1):
         date_str = (end - timedelta(days=i)).strftime("%Y-%m-%d")
         if progress:
-            progress(f"day {i}/{days} — {starts_priced} starts priced")
+            top = ""
+            if not starts_priced and rejects:
+                k = max(((k, v) for k, v in rejects.items()
+                         if isinstance(v, int)), key=lambda kv: kv[1],
+                        default=None)
+                top = f" (top reject: {k[0]} x{k[1]})" if k else ""
+            progress(f"day {i}/{days} — {starts_priced} starts priced{top}")
         try:
             games = backtest._final_games(date_str)
         except Exception as e:
@@ -161,9 +182,13 @@ def run_pp_backtest(days: int, progress=None,
         for g in games:
             try:
                 starts = _game_prop_starts(g["gamePk"], date_str, rates,
-                                           hand_cache, g.get("venue"),
-                                           rows_fn=rows_fn, season=season)
+                                           hand_cache,
+                                           (g.get("venue") or {}).get("name"),
+                                           rows_fn=rows_fn, season=season,
+                                           rejects=rejects)
             except Exception as e:
+                rejects["game_error"] = rejects.get("game_error", 0) + 1
+                rejects["last_game_error"] = f"{type(e).__name__}: {e}"
                 log.warning("pp backtest: game %s failed: %s", g.get("gamePk"), e)
                 continue
             for s in starts:
@@ -177,6 +202,7 @@ def run_pp_backtest(days: int, progress=None,
                 if counted:
                     starts_priced += 1
     report = {"days": days, "starts": starts_priced,
+              "rejects": rejects,
               "season": season, "end_date": end.strftime("%Y-%m-%d"),
               "rows_source": ("season-scoped" if season != kseason.current_season()
                               else "live"),
@@ -312,7 +338,8 @@ def run_pp_market_backtest(days: int, market: str, progress=None,
         for g in games:
             try:
                 st = _game_prop_starts(g["gamePk"], date_str, rates,
-                                       hand_cache, g.get("venue"),
+                                       hand_cache,
+                                       (g.get("venue") or {}).get("name"),
                                        rows_fn=rows_fn, season=season)
             except Exception:
                 continue
@@ -421,11 +448,15 @@ def run_pp_season_suite(season: int, market_test: bool = False,
         out["burn_in"] = {m: {k: (burn["markets"].get(m) or {}).get(k)
                               for k in ("n", "brier", "brier_const")}
                           for m in LADDERS}
+        out["burn_rejects"] = burn.get("rejects")
+        out["burn_starts"] = burn.get("starts")
         out["fit"] = {m: fit_pp_calibration(m, burn) for m in LADDERS}
         if progress: progress(f"{season}: props OOS (calibrated)…")
         oos = run_pp_backtest(130, progress=progress,
                               end_date=f"{season}-09-28")
         out["oos"] = oos["markets"]
+        out["oos_rejects"] = oos.get("rejects")
+        out["oos_starts"] = oos.get("starts")
         if market_test:
             for m in LADDERS:
                 if progress: progress(f"{season}: {m} market test…")
