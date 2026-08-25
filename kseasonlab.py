@@ -236,6 +236,13 @@ def start_season_suite(season: int, market: bool = False,
         except Exception as e:
             log.exception("season suite thread")
             _state.update({"status": "idle", "progress": f"failed: {e}"})
+        finally:
+            # RAM back to baseline: the suite is the only consumer of
+            # decoded season rows -- the live board never needs them.
+            # Disk cache untouched (Savant still paid exactly once).
+            freed = kseason.clear_cache()
+            log.info("season cache cleared: %s players, ~%sMB freed",
+                     freed["players"], freed["est_mb"])
 
     threading.Thread(target=_work, daemon=True).start()
     return {"started": True, "season": season, "market": market, "arm": arm}
@@ -281,13 +288,20 @@ def start_all_suite(season: int, market: bool = False) -> dict:
         except Exception as e:
             log.exception("all-suite thread")
             _state.update({"status": "idle", "progress": f"failed: {e}"})
+        finally:
+            freed = kseason.clear_cache()
+            log.info("season cache cleared: %s players, ~%sMB freed",
+                     freed["players"], freed["est_mb"])
 
     threading.Thread(target=_work, daemon=True).start()
     return {"started": True, "season": season, "market": market, "arm": "all"}
 
 
 def season_state() -> dict:
-    return {"run": dict(_state), "last_result": _last_result or None}
+    # cache receipts ride the polling payload -- the memory graph's story,
+    # live, instead of a blind spinner while a suite runs
+    return {"run": dict(_state), "last_result": _last_result or None,
+            "cache": kseason.cache_stats()}
 
 
 def season_history() -> list[dict]:
