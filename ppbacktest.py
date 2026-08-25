@@ -78,7 +78,9 @@ def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
                       hand_cache: dict, venue: str | None,
                       rows_fn=None,
                       season: int | None = None,
-                      rejects: dict | None = None) -> list[dict]:
+                      rejects: dict | None = None,
+                      box: dict | None = None,
+                      league_pppa: float | None = None) -> list[dict]:
     """Both starters of one final game: point-in-time hits+walks
     distributions and the actual boxscore numbers to grade against.
     Every skipped starter is COUNTED by cause in `rejects` -- a zero-start
@@ -88,7 +90,8 @@ def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
         if rejects is not None:
             rejects[key] = rejects.get(key, 0) + 1
     rows_fn = rows_fn or parlay.get_player_season_rows
-    box = requests.get(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=20).json()
+    if box is None:
+        box = requests.get(f"{MLB_BASE}/game/{game_pk}/boxscore", timeout=20).json()
     out = []
     for side, opp in (("home", "away"), ("away", "home")):
         pitching = (box.get("teams") or {}).get(side) or {}
@@ -123,7 +126,10 @@ def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
         lineup = []
         for pid in list(order)[:9]:
             try:
-                b_rows = rows_fn(pid, False)
+                # before-filter at the SOURCE: every consumer of these rows
+                # (slot rates, majority side, workload patience) sees only
+                # the past -- the workload leak died here
+                b_rows = kmodel.rows_before(rows_fn(pid, False), date_str)
             except Exception:
                 lineup.append(None)
                 continue
@@ -138,6 +144,7 @@ def _game_prop_starts(game_pk: int, date_str: str, rates: dict,
             d = pprops.prop_distribution(
                 market, lineup, s_rows, hand, rates[market],
                 before=date_str, start_game_pks=start_pks,
+                league_pppa=league_pppa,
                 park_factor_value=pprops.park_factor(venue, market,
                                                      year=season))
             if not d or d.get("error"):
@@ -164,6 +171,7 @@ def run_pp_backtest(days: int, progress=None,
     preds = {m: [] for m in LADDERS}   # (p_over, outcome, line)
     starts_priced = 0
     rejects: dict = {}
+    pppa_days = 0     # days the workload arm actually had league-P/PA fuel
     for i in range(1, days + 1):
         date_str = (end - timedelta(days=i)).strftime("%Y-%m-%d")
         if progress:
@@ -179,13 +187,43 @@ def run_pp_backtest(days: int, progress=None,
         except Exception as e:
             log.warning("pp backtest: schedule failed %s: %s", date_str, e)
             continue
+        day = []
         for g in games:
+            try:
+                bx = requests.get(f"{MLB_BASE}/game/{g['gamePk']}/boxscore",
+                                  timeout=20).json()
+                day.append((g, bx))
+            except Exception as e:
+                rejects["game_error"] = rejects.get("game_error", 0) + 1
+                rejects["last_game_error"] = f"{type(e).__name__}: {e}"
+                log.warning("pp backtest: boxscore %s failed: %s",
+                            g.get("gamePk"), e)
+        pppa = None
+        try:
+            rows_lists = []
+            for g, bx in day:
+                for _side in ("home", "away"):
+                    _ps = (((bx.get("teams") or {}).get(_side) or {})
+                           .get("pitchers")) or []
+                    if _ps:
+                        try:
+                            rows_lists.append(kmodel.rows_before(
+                                rows_fn(_ps[0], True), date_str))
+                        except Exception:
+                            pass
+            pppa = pprops.league_pitches_per_pa(rows_lists)
+        except Exception:
+            pppa = None
+        if pppa is not None:
+            pppa_days += 1
+        for g, bx in day:
             try:
                 starts = _game_prop_starts(g["gamePk"], date_str, rates,
                                            hand_cache,
                                            (g.get("venue") or {}).get("name"),
                                            rows_fn=rows_fn, season=season,
-                                           rejects=rejects)
+                                           rejects=rejects,
+                                           box=bx, league_pppa=pppa)
             except Exception as e:
                 rejects["game_error"] = rejects.get("game_error", 0) + 1
                 rejects["last_game_error"] = f"{type(e).__name__}: {e}"
@@ -202,7 +240,7 @@ def run_pp_backtest(days: int, progress=None,
                 if counted:
                     starts_priced += 1
     report = {"days": days, "starts": starts_priced,
-              "rejects": rejects,
+              "rejects": rejects, "pppa_days": pppa_days,
               "season": season, "end_date": end.strftime("%Y-%m-%d"),
               "rows_source": ("season-scoped" if season != kseason.current_season()
                               else "live"),
@@ -457,6 +495,7 @@ def run_pp_season_suite(season: int, market_test: bool = False,
         out["oos"] = oos["markets"]
         out["oos_rejects"] = oos.get("rejects")
         out["oos_starts"] = oos.get("starts")
+        out["oos_pppa_days"] = oos.get("pppa_days")
         if market_test:
             for m in LADDERS:
                 if progress: progress(f"{season}: {m} market test…")
