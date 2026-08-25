@@ -188,7 +188,8 @@ def run_all_models(season: int, market: bool = False, progress=None) -> dict:
                                                progress=progress)
         row = {"error": r.get("error"),
                "oos_starts": r.get("oos_starts"),
-               "oos_rejects": r.get("oos_rejects")}
+               "oos_rejects": r.get("oos_rejects"),
+               "oos_pppa_days": r.get("oos_pppa_days")}
         for mkt in ("hits", "walks"):
             o = (r.get("oos") or {}).get(mkt) or {}
             row[mkt] = {"oos_brier": o.get("brier"),
