@@ -412,6 +412,26 @@ def api_ppseasons():
         return {"error": str(e)}
 
 
+@app.get("/api/kcage")
+def api_kcage(days: int = 400):
+    """K forward-cage scoreboard: each locked arm vs the LIVE model on the
+    SAME graded starts (read-only results, house pattern -- no token)."""
+    try:
+        return kboard.cage_summary(days)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/ppcage")
+def api_ppcage(days: int = 400):
+    """Props forward-cage scoreboard: hits + walks, per market per arm,
+    flat-1u counted band + Brier, calibrated-vs-raw era split."""
+    try:
+        return kboard.pp_cage_summary(days)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/api/klab/config")
 def api_klab_config(payload: dict):
     if not LAB_TOKEN or payload.get("token") != LAB_TOKEN:
