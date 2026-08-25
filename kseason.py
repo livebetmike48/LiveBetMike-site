@@ -31,6 +31,7 @@ import logging
 import os
 import sqlite3
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 
 import parlay
@@ -56,8 +57,62 @@ def _conn():
     return conn
 
 
-_mem = {}  # (pid, role, season) -> rows, per-process
-fetch_stats = {"savant": 0, "disk": 0, "mem": 0}
+# In-process row cache -- BOUNDED. The original dict here grew without
+# limit: every player-season any suite touched stayed decoded in RAM
+# (~1KB/pitch measured, ~2.8MB per player-season), so a full-season
+# matrix run pinned 1.5-2GB and back-to-back seasons stacked on top --
+# the climbing Railway memory graph. Now an LRU with a byte budget:
+# hot players stay decoded, cold ones fall back to the sqlite disk
+# cache (~130ms to reload one player-season -- seconds per suite, not
+# minutes). KSEASON_MEM_MB sizes it; junk values fall back to the
+# default instead of crashing import (house rule).
+_EST_BYTES_PER_ROW = 1000          # measured: decoded Savant pitch row in RAM
+try:
+    _MEM_MB = max(64, int(os.getenv("KSEASON_MEM_MB", "512")))
+except (TypeError, ValueError):
+    _MEM_MB = 512
+_MEM_MAX_ROWS = _MEM_MB * 1_000_000 // _EST_BYTES_PER_ROW
+
+_mem: OrderedDict = OrderedDict()  # (pid, role, season) -> rows, LRU order
+_mem_rows = 0                      # sum of len(rows) across cached entries
+fetch_stats = {"savant": 0, "disk": 0, "mem": 0, "evict": 0}
+
+
+def _remember(key, rows):
+    """Insert into the LRU and evict oldest entries past the byte budget.
+    Never evicts the entry just inserted (a single oversized player still
+    caches -- the budget bounds the TOTAL, not one player)."""
+    global _mem_rows
+    if key in _mem:
+        _mem.move_to_end(key)
+        return
+    _mem[key] = rows
+    _mem_rows += max(1, len(rows))
+    while _mem_rows > _MEM_MAX_ROWS and len(_mem) > 1:
+        _, old = _mem.popitem(last=False)
+        _mem_rows -= max(1, len(old))
+        fetch_stats["evict"] += 1
+        if fetch_stats["evict"] % 200 == 0:
+            log.info("season cache: %d evictions (budget %dMB holding)",
+                     fetch_stats["evict"], _MEM_MB)
+
+
+def clear_cache() -> dict:
+    """Drop every decoded player-season and return what was freed. Called
+    when a suite finishes so the site process goes back to baseline --
+    the disk cache is untouched (Savant is still paid exactly once)."""
+    global _mem_rows
+    freed = {"players": len(_mem), "est_mb": round(_mem_rows * _EST_BYTES_PER_ROW / 1e6, 1)}
+    _mem.clear()
+    _mem_rows = 0
+    return freed
+
+
+def cache_stats() -> dict:
+    """Live cache receipts for the season-suite UI polling."""
+    return {"players": len(_mem),
+            "est_mb": round(_mem_rows * _EST_BYTES_PER_ROW / 1e6, 1),
+            "budget_mb": _MEM_MB, **fetch_stats}
 
 
 def season_rows(player_id: int, is_pitcher: bool, season: int) -> list[dict]:
@@ -66,6 +121,7 @@ def season_rows(player_id: int, is_pitcher: bool, season: int) -> list[dict]:
     key = (int(player_id), bool(is_pitcher), int(season))
     if key in _mem:
         fetch_stats["mem"] += 1
+        _mem.move_to_end(key)      # LRU: a hit is recency
         return _mem[key]
     conn = _conn()
     try:
@@ -75,7 +131,7 @@ def season_rows(player_id: int, is_pitcher: bool, season: int) -> list[dict]:
         if row is not None:
             rows = json.loads(gzip.decompress(row[0]).decode("utf-8"))
             fetch_stats["disk"] += 1
-            _mem[key] = rows
+            _remember(key, rows)
             return rows
         rows = statcast_api.fetch_statcast(
             key[0], key[1],
@@ -86,7 +142,7 @@ def season_rows(player_id: int, is_pitcher: bool, season: int) -> list[dict]:
             (key[0], int(key[1]), key[2],
              gzip.compress(json.dumps(rows).encode("utf-8")), len(rows), time.time()))
         conn.commit()
-        _mem[key] = rows
+        _remember(key, rows)
         log.info("season rows %s %s %s: %d rows fetched from Savant",
                  key[0], "P" if key[1] else "B", season, len(rows))
         return rows
