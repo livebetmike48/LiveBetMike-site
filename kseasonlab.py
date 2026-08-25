@@ -186,11 +186,13 @@ def run_all_models(season: int, market: bool = False, progress=None) -> dict:
         r = ppbacktest.run_pp_season_suite_arm(season, arm=arm,
                                                market_test=market,
                                                progress=progress)
-        row = {"error": r.get("error")}
+        row = {"error": r.get("error"),
+               "oos_starts": r.get("oos_starts"),
+               "oos_rejects": r.get("oos_rejects")}
         for mkt in ("hits", "walks"):
             o = (r.get("oos") or {}).get(mkt) or {}
             row[mkt] = {"oos_brier": o.get("brier"),
-                        "oos_brier_constant": o.get("brier_const"),
+                        "oos_brier_constant": o.get("brier_constant"),
                         "oos_n": o.get("n")}
             m0 = ((r.get("market") or {}).get(mkt) or {})
             row[mkt]["units"] = m0.get("units")
