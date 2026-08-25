@@ -86,6 +86,19 @@ CAGE_ARMS = (
 )
 _cage_coefs = {"date": None, "coefs": None}
 
+# ---------- the PROPS forward cage: hits + walks get the same forward
+# log the K model has had since July. Every arm the season suites race
+# backward (ppbacktest.PP_ARMS: base / park0 / workload) is priced at
+# the SAME first-read-wins freeze moment on the SAME inputs the board
+# assembled, against the REAL posted line at the main books, graded
+# nightly off the same boxscore pass that grades strikeouts. There is
+# no live/public props model, so "base" IS the reference arm here.
+# Rows carry a calibrated flag: until a fitted per-market curve is
+# loaded at runtime these reads are RAW and stamped as such -- the
+# record splits honestly instead of mixing eras. PPCAGE=0 disables.
+PPCAGE_ON = os.getenv("PPCAGE", "1") != "0"
+PP_ODDS_MARKETS = {"hits": "pitcher_hits_allowed", "walks": "pitcher_walks"}
+
 
 def _cage_csw_coefs(today: str):
     """CSW-delta needs the fitted called%/SwStr% -> K-rate mapping, which
@@ -143,6 +156,15 @@ def _conn():
         lineup_posted INTEGER, excluded INTEGER, logged_ts INTEGER,
         actual_k INTEGER, cleared INTEGER,
         PRIMARY KEY (date, starter_id, arm))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS pp_cage (
+        date TEXT, game_pk INTEGER, starter_id INTEGER, name TEXT,
+        market TEXT, arm TEXT,
+        line REAL, p_over REAL, calibrated INTEGER,
+        price_over INTEGER, book_over TEXT, ev_over REAL,
+        price_under INTEGER, book_under TEXT, ev_under REAL,
+        lineup_posted INTEGER, excluded INTEGER, logged_ts INTEGER,
+        actual INTEGER, cleared INTEGER,
+        PRIMARY KEY (date, starter_id, market, arm))""")
     conn.execute("""CREATE TABLE IF NOT EXISTS k_lineup_snaps (
         date TEXT, game_pk INTEGER, starter_id INTEGER, name TEXT,
         posted_ts INTEGER, line REAL, price_over INTEGER, book_over TEXT,
@@ -208,6 +230,35 @@ def _log_predictions(data: dict):
                 1 if s.get("excluded") else None,
                 int(time.time()),
             ))
+    pp_rows = []
+    for s in data.get("starters", []):
+        for market, blk in (s.get("_pp_cage") or {}).items():
+            q = blk.get("quote") or {}
+            if q.get("line") is None or q.get("ev_skipped"):
+                continue
+            if not q.get("over") and not q.get("under"):
+                continue
+            for arm, rd in (blk.get("arms") or {}).items():
+                pp_rows.append((
+                    data["date"], s["game_pk"], s["starter_id"], s["starter"],
+                    market, arm,
+                    q["line"], rd["p_over"], rd.get("calibrated", 0),
+                    (q.get("over") or {}).get("price"), (q.get("over") or {}).get("book"),
+                    rd.get("ev_over"),
+                    (q.get("under") or {}).get("price"), (q.get("under") or {}).get("book"),
+                    rd.get("ev_under"),
+                    1 if s.get("lineup_posted") else 0,
+                    1 if s.get("excluded") else None,
+                    int(time.time()),
+                ))
+    if pp_rows:
+        with _conn() as c:
+            c.executemany("""INSERT OR IGNORE INTO pp_cage
+                (date, game_pk, starter_id, name, market, arm, line, p_over,
+                 calibrated, price_over, book_over, ev_over,
+                 price_under, book_under, ev_under,
+                 lineup_posted, excluded, logged_ts, actual, cleared)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)""", pp_rows)
     if cage_rows:
         with _conn() as c:
             c.executemany("""INSERT OR IGNORE INTO k_cage
@@ -445,16 +496,132 @@ def _apply_tbf_cap(kdist: dict, cap: int) -> dict:
     return out
 
 
+def _apply_pp_tbf_cap(dist: dict, cap: int) -> dict:
+    """_apply_tbf_cap's props twin -- same re-mix over capped workload
+    samples, keyed to prop_distribution's field names (p_per_pa / mean).
+    Overrides are information about the START, so they apply to every
+    arm equally (the cage's locked rule)."""
+    samples = [min(t, cap) for t in (dist.get("tbf_samples") or [])]
+    if not samples:
+        return dist
+    slot_probs = [s["p_per_pa"] for s in dist["inputs"]["slots"]]
+    weight = 1.0 / len(samples)
+    d = [0.0] * (max(samples) + 1)
+    for tbf in samples:
+        counts = kmodel.slot_pa_counts(tbf)
+        seq = [slot_probs[i] for i in range(9) for _ in range(counts[i])]
+        pb = kmodel.poisson_binomial(seq)
+        for k, m in enumerate(pb):
+            d[k] += weight * m
+    out = dict(dist)
+    out["dist"] = [round(m, 6) for m in d]
+    out["mean"] = round(sum(k * m for k, m in enumerate(d)), 3)
+    out["tbf_samples"] = samples
+    out["tbf_mean"] = round(sum(samples) / len(samples), 1)
+    return out
+
+
+def _pp_quote(events, home_name, away_name, starter_name, market):
+    """The REAL posted line + best price each side for one props market,
+    main books only -- _price_starter's shape without the K model math
+    (each arm prices its own distribution against this one quote)."""
+    out = {"line": None, "over": None, "under": None,
+           "n_books": 0, "ev_skipped": None}
+    ev_match = odds_api.find_event(events, home_name, away_name) if events else None
+    if not ev_match:
+        return out
+    props = odds_api.get_event_props(ev_match.get("id"), PP_ODDS_MARKETS[market],
+                                     bookmakers=KBOARD_BOOKS)
+    if not props:
+        return out
+    over = odds_api.player_prop_prices(props, PP_ODDS_MARKETS[market],
+                                       starter_name, side="over")
+    if not over or over.get("point") is None:
+        return out
+    line = over["point"]
+    out["line"] = line
+    under = odds_api.player_prop_prices(props, PP_ODDS_MARKETS[market],
+                                        starter_name, side="under")
+    if under and under.get("point") != line:
+        under = None  # only pair sides at the same point
+    out["n_books"] = len(over.get("prices") or {})
+    if line != math.floor(line) + 0.5:
+        out["ev_skipped"] = "whole-number line — pushes possible, EV not computed"
+    bp = odds_api.best_price(over.get("prices") or {})
+    if bp:
+        out["over"] = {"book": bp[0], "price": bp[1]}
+    bp = odds_api.best_price((under or {}).get("prices") or {})
+    if bp:
+        out["under"] = {"book": bp[0], "price": bp[1]}
+    return out
+
+
+def _pp_cage_reads(events, g, team, lineup, s_rows, hand,
+                   pp_rates, pp_pppa, ov):
+    """Every props arm priced on the board's OWN assembled inputs against
+    the real posted line. Returns {market: {"quote": .., "arms": {..}}} or
+    {} -- never raises past its caller's warning net."""
+    import pprops
+    import ppbacktest
+    out = {}
+    start_pks = kmodel.fetch_start_games(team["starter_id"])
+    for market in PP_ODDS_MARKETS:
+        quote = _pp_quote(events, g["teams"]["home"]["name"],
+                          g["teams"]["away"]["name"],
+                          team["starter_name"], market)
+        if quote.get("line") is None:
+            continue
+        park_val = pprops.park_factor(g.get("venue"), market)  # walks -> None by design
+        arms = {}
+        for arm, kn in ppbacktest.PP_ARMS.items():
+            try:
+                with ppbacktest.pp_knobs(**kn):
+                    dist = pprops.prop_distribution(
+                        market, lineup, s_rows, hand, pp_rates[market],
+                        before=None, unknown_slot_rate=None,
+                        start_game_pks=start_pks,
+                        league_pppa=pp_pppa,
+                        park_factor_value=park_val)
+                if not dist or dist.get("error"):
+                    continue
+                if ov and ov.get("tbf_cap"):
+                    dist = _apply_pp_tbf_cap(dist, ov["tbf_cap"])
+                priced = pprops.price_line(dist, quote["line"], market=market)
+                read = {"p_over": priced["p_over"],
+                        "calibrated": 1 if priced.get("calibrated") else 0,
+                        "mean": dist.get("mean"),
+                        "ev_over": None, "ev_under": None}
+                if not quote["ev_skipped"]:
+                    if quote.get("over"):
+                        read["ev_over"] = round(
+                            (priced["p_over"] * odds_api.american_to_decimal(
+                                quote["over"]["price"]) - 1) * 100, 1)
+                    if quote.get("under"):
+                        read["ev_under"] = round(
+                            (priced["p_under"] * odds_api.american_to_decimal(
+                                quote["under"]["price"]) - 1) * 100, 1)
+                arms[arm] = read
+            except Exception as _ae:
+                log.warning("pp cage arm %s/%s failed for %s: %s",
+                            market, arm, team["starter_name"], _ae)
+        if arms:
+            out[market] = {"quote": quote, "arms": arms}
+    return out
+
+
 def _grade_pending(today: str):
     """Grade every logged prediction from finished past days against the
     real boxscore. Only Final games grade; everything else waits."""
     with _conn() as c:
         pending = c.execute(
-            "SELECT date, game_pk, starter_id, line FROM k_board_log "
-            "WHERE actual_k IS NULL AND date < ? "
-            "UNION "
-            "SELECT date, game_pk, starter_id, line FROM k_cage "
-            "WHERE actual_k IS NULL AND date < ?", (today, today)).fetchall()
+            "SELECT DISTINCT date, game_pk, starter_id FROM ("
+            " SELECT date, game_pk, starter_id FROM k_board_log "
+            "  WHERE actual_k IS NULL AND date < ? "
+            " UNION SELECT date, game_pk, starter_id FROM k_cage "
+            "  WHERE actual_k IS NULL AND date < ? "
+            " UNION SELECT date, game_pk, starter_id FROM pp_cage "
+            "  WHERE actual IS NULL AND date < ?)",
+            (today, today, today)).fetchall()
     if not pending:
         return
     finals: dict = {}
@@ -469,7 +636,7 @@ def _grade_pending(today: str):
         except Exception as e:
             log.warning("k grade: schedule failed for %s: %s", date, e)
     graded = 0
-    for date, game_pk, starter_id, line in pending:
+    for date, game_pk, starter_id in pending:
         if not finals.get(game_pk):
             continue
         try:
@@ -477,26 +644,121 @@ def _grade_pending(today: str):
         except Exception as e:
             log.warning("k grade: boxscore %s failed: %s", game_pk, e)
             continue
-        actual = None
+        stats = None
         for side in ("home", "away"):
             sp = (((box.get("teams") or {}).get(side) or {}).get("players") or {}).get(f"ID{starter_id}")
             if sp:
-                actual = (((sp.get("stats") or {}).get("pitching")) or {}).get("strikeOuts")
+                stats = ((sp.get("stats") or {}).get("pitching")) or {}
                 break
-        if actual is None:
+        if stats is None:
             continue
+        actual = stats.get("strikeOuts")
+        # hits + walks ride the SAME boxscore fetch -- zero extra calls
+        pp_actual = {"hits": stats.get("hits"), "walks": stats.get("baseOnBalls")}
         with _conn() as c:
-            c.execute("UPDATE k_board_log SET actual_k=?, cleared=? "
-                      "WHERE date=? AND starter_id=? AND actual_k IS NULL",
-                      (int(actual), 1 if actual > line else 0, date, starter_id))
-            # cage rows grade against their OWN stored line (same rule)
-            c.execute("UPDATE k_cage SET actual_k=?, "
-                      "cleared=(CASE WHEN ? > line THEN 1 ELSE 0 END) "
-                      "WHERE date=? AND starter_id=? AND actual_k IS NULL",
-                      (int(actual), int(actual), date, starter_id))
-        graded += 1
+            if actual is not None:
+                # every row grades against its OWN stored line (same rule
+                # everywhere; the board's per-row line makes this identical
+                # to the old python-side comparison)
+                c.execute("UPDATE k_board_log SET actual_k=?, "
+                          "cleared=(CASE WHEN ? > line THEN 1 ELSE 0 END) "
+                          "WHERE date=? AND starter_id=? AND actual_k IS NULL",
+                          (int(actual), int(actual), date, starter_id))
+                c.execute("UPDATE k_cage SET actual_k=?, "
+                          "cleared=(CASE WHEN ? > line THEN 1 ELSE 0 END) "
+                          "WHERE date=? AND starter_id=? AND actual_k IS NULL",
+                          (int(actual), int(actual), date, starter_id))
+            for market, val in pp_actual.items():
+                if val is None:
+                    continue
+                c.execute("UPDATE pp_cage SET actual=?, "
+                          "cleared=(CASE WHEN ? > line THEN 1 ELSE 0 END) "
+                          "WHERE date=? AND starter_id=? AND market=? "
+                          "AND actual IS NULL",
+                          (int(val), int(val), date, starter_id, market))
+        if actual is not None or any(v is not None for v in pp_actual.values()):
+            graded += 1
     if graded:
-        log.info("k board: graded %d predictions", graded)
+        log.info("k board: graded %d starters (K + props)", graded)
+
+
+def _paper_read(p_over, ev_o, pr_o, ev_u, pr_u, cleared):
+    """One read -> (brier_term, bet) under the house convention: flat 1u
+    on the best side inside the counted band. ONE implementation for the
+    K cage and the props cage -- the records stay comparable because the
+    math literally cannot drift."""
+    b = (p_over - cleared) ** 2
+    best = None
+    for side, ev, pr in (("over", ev_o, pr_o), ("under", ev_u, pr_u)):
+        if ev is None or pr is None:
+            continue
+        if EV_LOG_MIN <= ev <= EV_LOG_MAX and (best is None or ev > best[1]):
+            best = (side, ev, pr)
+    if best is None:
+        return b, None
+    side, ev, pr = best
+    won = (cleared == 1) if side == "over" else (cleared == 0)
+    units = (pr / 100.0 if pr > 0 else 100.0 / abs(pr)) if won else -1.0
+    return b, {"won": won, "units": units, "ev": ev}
+
+
+def _reads_stats(reads):
+    out = {"graded": len(reads), "brier": None, "bets": 0, "wins": 0,
+           "units": 0.0, "roi": None}
+    if not reads:
+        return out
+    bsum = 0.0
+    for r in reads:
+        b, bet = _paper_read(*r)
+        bsum += b
+        if bet:
+            out["bets"] += 1
+            out["wins"] += int(bet["won"])
+            out["units"] += bet["units"]
+    out["brier"] = round(bsum / len(reads), 4)
+    out["units"] = round(out["units"], 2)
+    if out["bets"]:
+        out["roi"] = round(out["units"] / out["bets"] * 100, 1)
+    return out
+
+
+def pp_cage_summary(days: int = 400) -> dict:
+    """The props forward record: per market, per arm -- Brier on every
+    graded read + flat-1u counted-band units, the exact convention the K
+    forward log uses (shared _paper_read). Arms freeze at the same moment
+    on the same starts by construction, so per-arm records are directly
+    comparable; calibrated-vs-raw reads are counted separately so a
+    curve landing mid-season starts a visible new era, never a silent
+    blend."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=4)
+              - timedelta(days=max(1, min(400, days)))).strftime("%Y-%m-%d")
+    out = {"days": days, "markets": {}, "note":
+           f"flat 1u, {EV_LOG_MIN:g}-{EV_LOG_MAX:g}% counted band, excluded "
+           "reads out; no live props model — 'base' is the reference arm; "
+           "calibrated=0 reads are the raw era, stamped per row"}
+    with _conn() as c:
+        for market in PP_ODDS_MARKETS:
+            arms = {}
+            arm_names = [r[0] for r in c.execute(
+                "SELECT DISTINCT arm FROM pp_cage WHERE market=? AND date >= ?",
+                (market, cutoff))]
+            for arm in arm_names:
+                rows = c.execute(
+                    "SELECT p_over, ev_over, price_over, ev_under, price_under, "
+                    "       cleared, calibrated "
+                    "FROM pp_cage WHERE market=? AND arm=? AND date >= ? "
+                    "  AND cleared IS NOT NULL "
+                    "  AND (excluded IS NULL OR excluded = 0)",
+                    (market, arm, cutoff)).fetchall()
+                st = _reads_stats([r[:6] for r in rows])
+                st["calibrated_reads"] = sum(1 for r in rows if r[6])
+                st["raw_reads"] = st["graded"] - st["calibrated_reads"]
+                arms[arm] = st
+            pend = c.execute(
+                "SELECT COUNT(*) FROM pp_cage WHERE market=? AND cleared IS NULL "
+                "AND date >= ?", (market, cutoff)).fetchone()[0]
+            out["markets"][market] = {"arms": arms, "pending": pend}
+    return out
 
 
 def cage_summary(days: int = 400) -> dict:
@@ -507,42 +769,7 @@ def cage_summary(days: int = 400) -> dict:
     ever compared on starts where both it and the live model froze a read."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=4)
               - timedelta(days=max(1, min(400, days)))).strftime("%Y-%m-%d")
-
-    def _paper(p_over, ev_o, pr_o, ev_u, pr_u, cleared):
-        """One read -> (brier_term, bet) under the house convention."""
-        b = (p_over - cleared) ** 2
-        best = None
-        for side, ev, pr in (("over", ev_o, pr_o), ("under", ev_u, pr_u)):
-            if ev is None or pr is None:
-                continue
-            if EV_LOG_MIN <= ev <= EV_LOG_MAX and (best is None or ev > best[1]):
-                best = (side, ev, pr)
-        if best is None:
-            return b, None
-        side, ev, pr = best
-        won = (cleared == 1) if side == "over" else (cleared == 0)
-        units = (pr / 100.0 if pr > 0 else 100.0 / abs(pr)) if won else -1.0
-        return b, {"won": won, "units": units, "ev": ev}
-
-    def _stats(reads):
-        out = {"graded": len(reads), "brier": None, "bets": 0, "wins": 0,
-               "units": 0.0, "roi": None}
-        if not reads:
-            return out
-        bsum = 0.0
-        for r in reads:
-            b, bet = _paper(*r)
-            bsum += b
-            if bet:
-                out["bets"] += 1
-                out["wins"] += int(bet["won"])
-                out["units"] += bet["units"]
-        out["brier"] = round(bsum / len(reads), 4)
-        out["units"] = round(out["units"], 2)
-        if out["bets"]:
-            out["roi"] = round(out["units"] / out["bets"] * 100, 1)
-        return out
-
+    _stats = _reads_stats   # shared house convention (see _paper_read)
     with _conn() as c:
         arms = [r[0] for r in c.execute(
             "SELECT DISTINCT arm FROM k_cage WHERE date >= ?", (cutoff,))]
@@ -837,6 +1064,31 @@ def _build_board(date: str, progress: dict) -> dict:
         log.warning("k board: odds events skipped: %s", e)
 
     overrides = get_overrides(date)
+    # ---- props cage inputs, once per build: league per-PA hit/walk rates
+    # + THIS slate's league P/PA (the workload arm's fuel -- computed from
+    # >=5 real starters or honestly None, never an assumed constant; None
+    # means the workload arm reads identical to base that day, logged).
+    pp_on, pp_rates, pp_pppa = PPCAGE_ON, None, None
+    if pp_on:
+        try:
+            import pprops
+            pp_rates = pprops.league_rates()
+            rows_lists = []
+            for _g in slate:
+                for _side in ("home", "away"):
+                    _sid = _g["teams"][_side]["starter_id"]
+                    if _sid:
+                        try:
+                            rows_lists.append(parlay.get_player_season_rows(_sid, True))
+                        except Exception:
+                            pass
+            pp_pppa = pprops.league_pitches_per_pa(rows_lists)
+            if pp_pppa is None:
+                log.info("pp cage: league P/PA unavailable (<5 qualifying "
+                         "starters) — workload arm = base today")
+        except Exception as e:
+            log.warning("pp cage idle today — league inputs failed: %s", e)
+            pp_on = False
     # Lineup-post tracker: the one edge the season test quantified (~4% vs
     # stale openers) is lineup INFORMATION. Retro-testing is impossible --
     # nobody archives when a lineup posted -- so we log it forward: the
@@ -978,6 +1230,20 @@ def _build_board(date: str, progress: dict) -> dict:
                                         arm, team["starter_name"], _ce)
                     if cage:
                         entry["_cage"] = cage
+                # ---- props forward cage: hits + walks arms priced on the
+                # SAME assembled inputs (rows, lineup, hand, park venue,
+                # start pks, TBF cap) against the REAL posted line. Runs
+                # whether or not a K line exists -- the props markets are
+                # their own record. Inherits the live-game guard above.
+                if pp_on and pp_rates:
+                    try:
+                        pp = _pp_cage_reads(events, g, team, lineup, s_rows,
+                                            hand, pp_rates, pp_pppa, ov)
+                        if pp:
+                            entry["_pp_cage"] = pp
+                    except Exception as _pe:
+                        log.warning("pp cage failed for %s: %s",
+                                    team["starter_name"], _pe)
             except Exception as e:
                 log.warning("k board: %s failed: %s", team["starter_name"], e)
                 entry.update({"status": "no read", "why": "build error (see logs)"})
