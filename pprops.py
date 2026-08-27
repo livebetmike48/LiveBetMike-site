@@ -93,12 +93,27 @@ def park_factor(venue: str | None, market: str,
     if not venue or parks is None or market not in PARK_MARKETS:
         return None
     try:
-        return parks.factor_for(venue, year=year)
+        f = parks.factor_for(venue, year=year)
     except TypeError:
-        return parks.factor_for(venue)      # older parks.py, live path
+        f = parks.factor_for(venue)         # older parks.py, live path
     except Exception as e:
         log.warning("park factor lookup failed for %s: %s", venue, e)
         return None
+    # SANITY CLAMP (the 2023 lesson): a real MLB park factor lives well
+    # inside [0.7, 1.3]. Anything outside is broken upstream data -- the
+    # 2023 Savant pull poisoned every park-ON hits read to a 0.35 Brier
+    # while park0 sailed at 0.18. Bad data prices park-NEUTRAL and says
+    # so in the log; it never silently multiplies into the model again.
+    try:
+        f = float(f)
+    except (TypeError, ValueError):
+        return None
+    if not (0.7 <= f <= 1.3):
+        log.warning("park factor REJECTED for %s (%s, year=%s): %.3f "
+                    "outside [0.7, 1.3] — pricing park-neutral", venue,
+                    market, year, f)
+        return None
+    return f
 
 # Markets: an event set is the ONLY thing that distinguishes them.
 MARKETS = {
