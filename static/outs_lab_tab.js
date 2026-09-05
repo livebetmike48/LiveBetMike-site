@@ -1,287 +1,361 @@
-/* Outs Lab tab — the play-by-play dataset behind the outs model.
- *
- * Self-registering like pprops_tab.js: adds its own tab button and wraps
- * showView, so index.html is untouched (app.py injects the script tag).
- * Delete the script tag and this file together and the site is as it was.
- *
- * Talks to outs_lab.py:  GET /api/outs-lab            state + coverage
- *                        GET /api/outs-lab/report     grids for a season set
- *                        POST /api/outs-lab/run       fetch seasons (token)
- * Zero odds credits. Zero model. Every cell is a count of real starts.
- */
+/* Outs Lab tab -- self-registering, index.html is never edited.
+   REPLACES the earlier outs_lab_tab.js. Adds the interactive query card:
+   pick a stat, type ANY line and ANY batters-faced, get the empirical
+   clear rate + fair odds + CI with the binomial closed form alongside.
+   The fixed "15 outs in 17 BF" headline is gone -- the card is the page.
+   Pattern identical to pprops_tab.js: append a tab button, wrap
+   window.showView, delegate every other view to the original. Plain
+   strings only (no template literals). Delete this file + its script
+   tag and the site is exactly as before. */
 (function () {
-  var TAB_ID = "tab-outslab";
-  var STAT = "outs";
-  var REPORT = null;
-  var COV = [];
-  var CHECKED = null;          // Set of seasons ticked; null = all
-  var POLL = null;
-  var TOKEN_MEM = "";
+  "use strict";
 
-  function addTab() {
-    var tabs = document.querySelector(".tabs");
-    if (!tabs || document.getElementById(TAB_ID)) return;
-    var btn = document.createElement("button");
-    btn.className = "tab";
-    btn.id = TAB_ID;
-    btn.textContent = "Outs Lab";
-    btn.onclick = function () { showView("outslab"); };
-    tabs.appendChild(btn);
-  }
-
-  var _showView = window.showView;
-  window.showView = function (v) {
-    if (v === "outslab") {
-      VIEW = "outslab";
-      ["board", "bullpen", "model", "kboard", "pitchers", "lab", "pprops"].forEach(function (t) {
-        var el = document.getElementById("tab-" + t);
-        if (el) el.classList.remove("active");
-      });
-      var me = document.getElementById(TAB_ID);
-      if (me) me.classList.add("active");
-      renderOutsLab();
-      return;
-    }
-    var me2 = document.getElementById(TAB_ID);
-    if (me2) me2.classList.remove("active");
-    if (POLL) { clearInterval(POLL); POLL = null; }
-    return _showView.apply(this, arguments);
+  var VIEW = "outslab";
+  var S = {
+    active: false, poll: null, cov: [], report: null, stat: "outs",
+    qstat: "outs", qline: "18.5", qbf: "26",
+    checked: null,            // Set of season numbers, null until coverage
+    cell: null, ladder: null, err: ""
   };
 
-  // Same token convention as the Model Lab: a password box, remembered
-  // for the session. If the Lab tab already has one filled in, reuse it.
-  function token() {
-    var el = document.getElementById("outslab-token");
-    if (el && el.value) TOKEN_MEM = el.value;
-    if (!TOKEN_MEM && typeof LAB_TOKEN_MEM !== "undefined" && LAB_TOKEN_MEM) TOKEN_MEM = LAB_TOKEN_MEM;
-    return TOKEN_MEM;
+  function tok() {
+    var box = document.getElementById("olb-token");
+    var v = box ? box.value.trim() : "";
+    if (v) window.LAB_TOKEN_MEM = v;
+    return v || window.LAB_TOKEN_MEM || "";
   }
 
-  var pct = function (x) { return x == null ? "–" : (100 * x).toFixed(1) + "%"; };
-  var esc = function (s) { return String(s).replace(/</g, "&lt;"); };
+  function pct(x) { return (x === null || x === undefined) ? "\u2014" : (100 * x).toFixed(1) + "%"; }
+  function esc(x) { return String(x).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
 
-  window.renderOutsLab = async function renderOutsLab() {
-    var main = document.getElementById("main");
-    main.innerHTML = "<div class='state'>Loading the outs dataset…<div class='bar'><i></i></div></div>";
-    var s;
-    try { s = await (await fetch("/api/outs-lab")).json(); }
-    catch (e) {
-      main.innerHTML = "<div class='state'>Server busy — retrying…</div>";
-      setTimeout(function () { if (VIEW === "outslab") renderOutsLab(); }, 8000);
-      return;
-    }
-    if (VIEW !== "outslab") return;
-    COV = s.coverage || [];
-    if (CHECKED === null) CHECKED = new Set(COV.map(function (c) { return c.season; }));
-    main.innerHTML = "";
-
-    var hdr = document.createElement("div");
-    hdr.className = "gamehdr";
-    hdr.textContent = "Outs Lab — how often starters clear a line at each batters-faced level";
-    main.appendChild(hdr);
-
-    var note = document.createElement("div");
-    note.className = "meta";
-    note.style.cssText = "margin:2px 0 6px";
-    note.innerHTML = "MLB play-by-play only. <b>No lines, no model, zero odds credits.</b> Every cell is a count of real starts: " +
-      "among starts that faced at least <i>n</i> batters, how many had cleared the line after batter <i>n</i>. " +
-      "Binomial with the pooled per-batter rate sits under each cell — where they match, the closed form holds; where they don't, it doesn't.";
-    main.appendChild(note);
-
-    // ---- 1. fetch controls
-    var ctl = document.createElement("div");
-    ctl.className = "winrow";
-    ctl.style.flexWrap = "wrap";
-    var defaultYrs = COV.length ? "" : "2021,2022,2023,2024,2025";
-    ctl.innerHTML =
-      '<input id="outslab-years" placeholder="seasons e.g. 2021,2022,2023" value="' + defaultYrs + '" ' +
-        'style="background:var(--panel-2);color:var(--white);border:1.5px solid var(--line);border-radius:6px;padding:6px 10px;font-family:\'IBM Plex Mono\',monospace;font-size:12px;width:230px">' +
-      '<input id="outslab-token" type="password" placeholder="lab token" value="' + esc(TOKEN_MEM) + '" ' +
-        'style="background:var(--panel-2);color:var(--white);border:1.5px solid var(--line);border-radius:6px;padding:6px 10px;font-family:\'IBM Plex Mono\',monospace;font-size:12px;width:120px">' +
-      '<button class="winbtn" onclick="OUTSLAB_FETCH()">Fetch seasons</button>' +
-      '<span class="meta" id="outslab-status">' + statusText(s.state) + '</span>';
-    main.appendChild(ctl);
-    var help = document.createElement("div");
-    help.className = "meta";
-    help.style.cssText = "margin:4px 0 0";
-    help.textContent = "Free and resumable — games already stored are skipped, so re-run a season any time. ~12–15 min per season.";
-    main.appendChild(help);
-
-    // ---- coverage
-    var covBox = document.createElement("div");
-    covBox.className = "board";
-    covBox.style.cssText = "margin-top:10px;max-width:560px";
-    if (!COV.length) {
-      covBox.innerHTML = "<div class='meta' style='padding:12px 14px'>Dataset empty — fetch a season above.</div>";
-    } else {
-      var ch = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Season</th><th>Games</th><th>Starts</th><th>First</th><th>Last</th></tr></thead><tbody>";
-      COV.forEach(function (c) {
-        ch += "<tr><td class='name' style='cursor:default'>" + c.season + "</td><td>" + c.games + "</td><td>" + c.starts +
-          "</td><td>" + c.first + "</td><td>" + c.last + "</td></tr>";
-      });
-      covBox.innerHTML = ch + "</tbody></table>";
-    }
-    main.appendChild(covBox);
-
-    if (!COV.length) { if (s.state && s.state.running) startPoll(); return; }
-
-    // ---- 2. query controls
-    var q = document.createElement("div");
-    q.className = "winrow";
-    q.style.flexWrap = "wrap";
-    var qh = "";
-    COV.forEach(function (c) {
-      qh += '<label class="meta" style="margin-left:0;cursor:pointer"><input type="checkbox" value="' + c.season + '" ' +
-        (CHECKED.has(c.season) ? "checked" : "") + ' onchange="OUTSLAB_TOGGLE(' + c.season + ',this.checked)"> ' + c.season + '</label>';
-    });
-    qh += '<button class="winbtn" onclick="OUTSLAB_QUERY()">Query</button>';
-    q.innerHTML = qh;
-    main.appendChild(q);
-
-    var out = document.createElement("div");
-    out.id = "outslab-out";
-    main.appendChild(out);
-
-    if (s.state && s.state.running) startPoll();
-    if (!REPORT) await OUTSLAB_QUERY(); else renderReport();
-  };
-
-  function statusText(st) {
-    if (!st) return "";
-    if (st.running) return "⏳ " + (st.progress || "starting…");
-    if (st.error) return "✖ " + st.error;
-    return st.progress ? st.progress : "idle";
+  function yrsPicked() {
+    if (!S.checked) return [];
+    var out = []; S.checked.forEach(function (y) { out.push(y); });
+    return out.sort();
   }
 
-  function startPoll() {
-    if (POLL) clearInterval(POLL);
-    POLL = setInterval(async function () {
-      if (VIEW !== "outslab") { clearInterval(POLL); POLL = null; return; }
-      var s;
-      try { s = await (await fetch("/api/outs-lab")).json(); } catch (e) { return; }
-      var el = document.getElementById("outslab-status");
-      if (el) el.textContent = statusText(s.state);
-      if (!s.state.running) {
-        clearInterval(POLL); POLL = null;
-        CHECKED = null; REPORT = null;
-        renderOutsLab();              // refresh coverage + grids
+  // ------------------------------------------------------------- fetches
+  function refresh(then) {
+    fetch("/api/outs-lab").then(function (r) { return r.json(); }).then(function (s) {
+      if (!S.active) return;
+      S.state = s.state || {};
+      S.cov = s.coverage || [];
+      if (S.checked === null && S.cov.length) {
+        S.checked = new Set();
+        S.cov.forEach(function (c) { S.checked.add(c.season); });
       }
-    }, 2000);
+      paintProgress();
+      paintCov();
+      paintYears();
+      if (!S.state.running && S.poll) { clearInterval(S.poll); S.poll = null; loadAll(); }
+      if (then) then();
+    }).catch(function (e) { S.err = String(e); paintProgress(); });
   }
 
-  window.OUTSLAB_FETCH = async function () {
-    var yrs = (document.getElementById("outslab-years").value || "")
-      .split(",").map(function (x) { return parseInt(x.trim(), 10); }).filter(Boolean);
-    var el = document.getElementById("outslab-status");
-    if (!yrs.length) { el.textContent = "type at least one season"; return; }
-    var r = await fetch("/api/outs-lab/run", {method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({token: token(), seasons: yrs})});
-    var j = await r.json();
-    el.textContent = j.error ? "✖ " + j.error : (j.reason ? j.reason : "⏳ starting " + yrs.join(", ") + "…");
-    if (j.started) startPoll();
-  };
-
-  window.OUTSLAB_TOGGLE = function (yr, on) { if (on) CHECKED.add(yr); else CHECKED.delete(yr); };
-
-  window.OUTSLAB_QUERY = async function () {
-    var yrs = Array.from(CHECKED).sort();
-    var out = document.getElementById("outslab-out");
-    if (!out) return;
-    if (!yrs.length) { out.innerHTML = "<div class='meta'>pick at least one season</div>"; return; }
-    out.innerHTML = "<div class='state' style='padding:20px 0'>Counting…<div class='bar'><i></i></div></div>";
-    try { REPORT = await (await fetch("/api/outs-lab/report?seasons=" + yrs.join(","))).json(); }
-    catch (e) { out.innerHTML = "<div class='meta'>server busy</div>"; return; }
-    renderReport();
-  };
-
-  window.OUTSLAB_STAT = function (k) { STAT = k; renderReport(); };
-
-  function renderReport() {
-    var out = document.getElementById("outslab-out");
-    if (!out) return;
-    var r = REPORT;
-    if (!r || r.error) { out.innerHTML = "<div class='meta'>" + (r ? esc(r.error) : "no report") + "</div>"; return; }
-    var h = r.headline, g = r.grids[STAT];
-    var html = "";
-
-    html += "<div class='board' style='margin-top:12px;max-width:760px'><div style='padding:12px 14px'>" +
-      "<div class='meta' style='margin:0'>seasons " + esc(r.label) + " · " + r.starts + " starts · " + r.tbf + " batters faced</div>" +
-      "<div style='margin-top:6px'>" + h.question + "</div>" +
-      "<div style='font-size:26px;font-weight:700;color:var(--blue);font-family:\"IBM Plex Mono\",monospace'>" + pct(h.empirical) +
-      " <span class='meta'>(" + h.fair + " · n=" + h.starts + " starts that faced ≥17)</span></div>" +
-      "<div class='meta' style='margin:4px 0 0'>closed form: " + pct(h.closed_form_outs_rate) + " using outs/BF · " +
-      pct(h.closed_form_retire_rate) + " using retire rate</div>" +
-      "<div class='meta' style='margin:2px 0 0'>league outs/BF <b>" + r.outs_per_bf + "</b> · retire rate <b>" + r.retire_rate +
-      "</b> · extra outs/BF (DP/CS/pickoff) <b>" + r.extra_outs_per_bf + "</b></div></div></div>";
-
-    if (r.unknown_events && Object.keys(r.unknown_events).length)
-      html += "<div class='meta' style='color:#e0a12f;margin-top:6px'>⚠️ unknown StatsAPI eventTypes counted as PA: " + esc(JSON.stringify(r.unknown_events)) + "</div>";
-
-    // stat tabs
-    html += "<div class='winrow'>";
-    Object.keys(r.grids).forEach(function (k) {
-      html += '<button class="winbtn ' + (k === STAT ? "active" : "") + '" onclick="OUTSLAB_STAT(\'' + k + '\')">' + esc(r.grids[k].label) + '</button>';
+  function startFetch() {
+    var box = document.getElementById("olb-fetchyrs");
+    var yrs = (box ? box.value : "").split(",").map(function (x) { return +x.trim(); }).filter(Boolean);
+    fetch("/api/outs-lab/run", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: tok(), seasons: yrs })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (j.error || j.reason) {
+        var p = document.getElementById("olb-prog");
+        if (p) p.textContent = j.error || j.reason;
+        if (j.error === "bad token") return;   // don't poll a refused run
+      }
+      if (S.poll) clearInterval(S.poll);
+      S.poll = setInterval(refresh, 1500);
+      refresh();
     });
-    html += "<span class='meta'>per-BF rate " + g.per_bf_rate + " · rows 17–23 highlighted</span></div>";
+  }
 
-    // the grid
-    html += "<div class='board' style='margin-top:8px'><table><thead><tr><th style='text-align:left;padding-left:14px'>Batters faced</th><th>Starts</th>";
-    g.lines.forEach(function (l) { html += "<th>" + l + "</th>"; });
-    html += "</tr></thead><tbody>";
-    g.rows.forEach(function (x) {
-      var focus = x.n >= 17 && x.n <= 23;
-      html += "<tr" + (focus ? " style='background:#141a22'" : "") + "><td class='name' style='cursor:default'>" + x.n + "</td><td>" + x.starts + "</td>";
-      g.lines.forEach(function (l) {
-        html += "<td><b>" + pct(x[l]) + "</b><br><span style='color:var(--gray);font-size:11px'>" + pct(x["binom_" + l]) + "</span></td>";
-      });
-      html += "</tr>";
+  function loadAll() { loadReport(); loadCell(); }
+
+  function loadReport() {
+    var yrs = yrsPicked();
+    if (!yrs.length) { S.report = null; paintGrids(); return; }
+    fetch("/api/outs-lab/report?seasons=" + yrs.join(",")).then(function (r) { return r.json(); }).then(function (rep) {
+      if (!S.active) return;
+      S.report = rep; paintGrids();
     });
-    html += "</tbody></table></div>";
-    html += "<div class='meta' style='margin-top:6px'>top number = empirical share of starts that had cleared the line after batter <i>n</i>; grey = binomial(n, per-BF rate). " +
-      "Starts count is the same across a row: everyone who faced at least <i>n</i>.</div>";
+  }
 
-    if (STAT === "outs") {
-      html += "<div class='board' style='margin-top:14px'><table><thead><tr><th style='text-align:left;padding-left:14px' colspan='10'>14.5 outs — detail with 95% CI and dispersion vs binomial</th></tr>" +
-        "<tr><th style='text-align:left;padding-left:14px'>n</th><th>Starts</th><th>Empirical</th><th>95% CI</th><th>Fair</th><th>Binom (outs/BF)</th><th>Binom (retire)</th><th>Mean outs</th><th>Expected</th><th>Dispersion</th></tr></thead><tbody>";
-      r.ladder.forEach(function (x) {
-        html += "<tr" + (x.focus ? " style='background:#141a22'" : "") + "><td class='name' style='cursor:default'>" + x.n + "</td><td>" + x.starts + "</td><td><b>" + pct(x.empirical) +
-          "</b></td><td>" + pct(x.ci95[0]) + "–" + pct(x.ci95[1]) + "</td><td>" + x.fair + "</td><td>" + pct(x.pred_outs_rate) + "</td><td>" + pct(x.pred_retire_rate) +
-          "</td><td>" + x.mean_outs_after + "</td><td>" + x.expected_outs_after + "</td><td>" + (x.dispersion == null ? "–" : x.dispersion) + "</td></tr>";
-      });
-      html += "</tbody></table></div>";
+  function loadCell() {
+    var yrs = yrsPicked();
+    if (!yrs.length) { S.cell = null; S.ladder = null; paintCard(); return; }
+    var q = "stat=" + encodeURIComponent(S.qstat) + "&line=" + encodeURIComponent(S.qline) +
+      "&bf=" + encodeURIComponent(S.qbf) + "&seasons=" + yrs.join(",");
+    fetch("/api/outs-lab/cell?" + q).then(function (r) { return r.json(); }).then(function (c) {
+      if (!S.active) return;
+      S.cell = c; paintCard();
+      if (c && !c.error) {
+        fetch("/api/outs-lab/ladder?stat=" + encodeURIComponent(S.qstat) +
+          "&line=" + encodeURIComponent(S.qline) + "&seasons=" + yrs.join(",")
+        ).then(function (r) { return r.json(); }).then(function (l) {
+          if (!S.active) return;
+          S.ladder = l; paintLadder();
+        });
+      } else { S.ladder = null; paintLadder(); }
+    });
+  }
 
-      html += "<div style='display:flex;gap:14px;flex-wrap:wrap;margin-top:14px'>";
-      html += "<div class='board' style='flex:1;min-width:300px'><table><thead><tr><th style='text-align:left;padding-left:14px' colspan='4'>Extra outs by base state</th></tr>" +
-        "<tr><th style='text-align:left;padding-left:14px'>Runners on</th><th>PA</th><th>Extra outs / PA</th><th>Reach rate</th></tr></thead><tbody>";
-      r.base_state.forEach(function (x) {
-        html += "<tr><td class='name' style='cursor:default'>" + x.runners_on + "</td><td>" + x.pa + "</td><td>" + x.extra_outs_per_pa + "</td><td>" + pct(x.reach_rate) + "</td></tr>";
-      });
-      html += "</tbody></table></div>";
-      html += "<div class='board' style='flex:1;min-width:300px'><table><thead><tr><th style='text-align:left;padding-left:14px' colspan='5'>Out rates by how the start went (TBF ≥ 12)</th></tr>" +
-        "<tr><th style='text-align:left;padding-left:14px'>Reach-rate bucket</th><th>Starts</th><th>Outs/BF</th><th>Retire</th><th>Extra/BF</th></tr></thead><tbody>";
-      r.traffic.forEach(function (x) {
-        html += "<tr><td class='name' style='cursor:default'>" + x.reach_rate_bucket + "</td><td>" + x.starts + "</td><td>" + x.outs_per_bf + "</td><td>" + x.retire_rate + "</td><td>" + x.extra_outs_per_bf + "</td></tr>";
-      });
-      html += "</tbody></table></div>";
-      html += "<div class='board' style='flex:1;min-width:220px'><table><thead><tr><th style='text-align:left;padding-left:14px' colspan='3'>Reach rate by time through order</th></tr>" +
-        "<tr><th style='text-align:left;padding-left:14px'>TTO</th><th>PA</th><th>Reach</th></tr></thead><tbody>";
-      r.tto.forEach(function (x) {
-        html += "<tr><td class='name' style='cursor:default'>" + x.tto + "</td><td>" + x.pa + "</td><td>" + pct(x.reach_rate) + "</td></tr>";
-      });
-      html += "</tbody></table></div>";
-      html += "<div class='board' style='flex:1;min-width:220px'><table><thead><tr><th style='text-align:left;padding-left:14px' colspan='3'>Contrast: conditioned on FINAL TBF (hook-polluted)</th></tr>" +
-        "<tr><th style='text-align:left;padding-left:14px'>Final TBF</th><th>Starts</th><th>P(15+)</th></tr></thead><tbody>";
-      r.final_tbf_view.forEach(function (x) {
-        html += "<tr><td class='name' style='cursor:default'>" + x.n + "</td><td>" + x.starts + "</td><td>" + pct(x.p15) + "</td></tr>";
-      });
-      html += "</tbody></table></div></div>";
+  // -------------------------------------------------------------- paint
+  function paintProgress() {
+    var p = document.getElementById("olb-prog");
+    if (!p) return;
+    var st = S.state || {};
+    p.textContent = (st.running ? "running: " : "") + (st.progress || "idle") +
+      (st.error ? " \u2014 " + st.error : "") + (S.err ? " \u2014 " + S.err : "");
+    var m = /game (\d+)\/(\d+)/.exec(st.progress || "");
+    var fill = document.getElementById("olb-fill");
+    if (fill) fill.style.width = m ? Math.round(100 * m[1] / m[2]) + "%" : (st.running ? "2%" : "0%");
+  }
+
+  function paintCov() {
+    var el = document.getElementById("olb-cov");
+    if (!el) return;
+    if (!S.cov.length) { el.innerHTML = '<div class="meta">dataset empty \u2014 fetch a season</div>'; return; }
+    var h = "<table><tr><th>season</th><th>games</th><th>starts</th><th>first</th><th>last</th></tr>";
+    S.cov.forEach(function (c) {
+      h += "<tr><td>" + c.season + "</td><td>" + c.games + "</td><td>" + c.starts +
+        "</td><td>" + esc(c.first) + "</td><td>" + esc(c.last) + "</td></tr>";
+    });
+    el.innerHTML = h + "</table>";
+  }
+
+  function paintYears() {
+    var el = document.getElementById("olb-yrs");
+    if (!el) return;
+    var h = "";
+    S.cov.forEach(function (c) {
+      var on = S.checked && S.checked.has(c.season);
+      h += '<label style="margin-right:10px;white-space:nowrap"><input type="checkbox" data-yr="' +
+        c.season + '"' + (on ? " checked" : "") + "> " + c.season + "</label>";
+    });
+    el.innerHTML = h;
+    var boxes = el.querySelectorAll("input[data-yr]");
+    for (var i = 0; i < boxes.length; i++) {
+      boxes[i].onchange = function () {
+        var y = +this.getAttribute("data-yr");
+        if (this.checked) S.checked.add(y); else S.checked.delete(y);
+        loadAll();
+      };
     }
-    out.innerHTML = html;
+  }
+
+  function paintCard() {
+    var el = document.getElementById("olb-card");
+    if (!el) return;
+    var c = S.cell;
+    if (!c) { el.innerHTML = '<div class="meta">pick at least one season</div>'; return; }
+    if (c.error) { el.innerHTML = '<div class="olb-hl" style="color:#f28b82">' + esc(c.error) + "</div>"; return; }
+    var gap = ((c.empirical - c.binomial) * 100).toFixed(1);
+    var h = '<div class="olb-hl">' +
+      "<div>P(over " + c.line + " " + esc(c.label).toLowerCase() + " within the first " + c.bf +
+      " batters faced) \u2014 needs " + c.need + "+</div>" +
+      '<span class="olb-big">' + pct(c.empirical) + "</span> " +
+      '<span class="meta">fair ' + esc(c.fair) + " \u00b7 " + c.hit + " of " + c.starts +
+      " starts that faced \u2265" + c.bf + " \u00b7 95% CI " + pct(c.ci95[0]) + "\u2013" + pct(c.ci95[1]) + "</span>" +
+      '<div class="meta">closed form (binomial, pooled ' + c.per_bf_rate + "/BF): " + pct(c.binomial) +
+      " \u2014 empirical runs <b>" + (gap > 0 ? "+" : "") + gap + " pts</b> vs iid math</div>" +
+      (c.note ? '<div style="color:#f0b26b">' + esc(c.note) + "</div>" : "") +
+      '<div class="meta">seasons ' + c.seasons.join(", ") + "</div></div>";
+    el.innerHTML = h;
+  }
+
+  function paintLadder() {
+    var el = document.getElementById("olb-ladder");
+    if (!el) return;
+    var l = S.ladder;
+    if (!l || l.error || !l.rows) { el.innerHTML = ""; return; }
+    var h = "<h3>Over " + l.line + " " + esc(l.label).toLowerCase() +
+      " at every batters-faced checkpoint</h3>" +
+      '<div style="overflow-x:auto"><table><tr><th>n BF</th><th>starts</th><th>empirical</th><th>95% CI</th><th>fair</th><th>binomial</th></tr>';
+    l.rows.forEach(function (x) {
+      var hot = x.n === +S.qbf ? ' style="background:#161a24"' : "";
+      h += "<tr" + hot + "><td>" + x.n + "</td><td>" + x.starts + "</td><td><b>" + pct(x.empirical) +
+        "</b></td><td>" + pct(x.ci95[0]) + "\u2013" + pct(x.ci95[1]) + "</td><td>" + esc(x.fair) +
+        "</td><td>" + pct(x.binomial) + "</td></tr>";
+    });
+    el.innerHTML = h + "</table></div>";
+  }
+
+  function paintGrids() {
+    var tabs = document.getElementById("olb-stats");
+    var out = document.getElementById("olb-out");
+    if (!tabs || !out) return;
+    var r = S.report;
+    if (!r || r.error || !r.grids) {
+      tabs.innerHTML = "";
+      out.innerHTML = '<div class="meta">' + esc(r && r.error ? r.error : "no report yet") + "</div>";
+      return;
+    }
+    var th = "";
+    Object.keys(r.grids).forEach(function (k) {
+      th += '<button class="olb-tab' + (k === S.stat ? " on" : "") + '" data-st="' + k + '">' +
+        esc(r.grids[k].label) + "</button> ";
+    });
+    tabs.innerHTML = th;
+    var btns = tabs.querySelectorAll("button[data-st]");
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].onclick = function () { S.stat = this.getAttribute("data-st"); paintGrids(); };
+    }
+    var g = r.grids[S.stat];
+    var h = '<div class="meta">seasons ' + esc(r.label) + " \u00b7 " + r.starts + " starts \u00b7 " + r.tbf +
+      " BF \u00b7 league outs/BF " + r.outs_per_bf + " \u00b7 retire rate " + r.retire_rate +
+      " \u00b7 extra outs/BF " + r.extra_outs_per_bf + "</div>";
+    if (r.unknown_events && Object.keys(r.unknown_events).length) {
+      h += '<div style="color:#f0b26b">unknown eventTypes counted as PA: ' +
+        esc(JSON.stringify(r.unknown_events)) + "</div>";
+    }
+    h += "<h3>" + esc(g.label) + ": P(over line | first n batters) \u2014 empirical, binomial(" +
+      g.per_bf_rate + '/BF) underneath</h3><div style="overflow-x:auto"><table><tr><th>n BF</th><th>starts</th>';
+    g.lines.forEach(function (l) { h += "<th>" + l + "</th>"; });
+    h += "</tr>";
+    g.rows.forEach(function (x) {
+      h += "<tr" + (x.n >= 17 && x.n <= 23 ? ' style="background:#161a24"' : "") + "><td>" + x.n +
+        "</td><td>" + x.starts + "</td>";
+      g.lines.forEach(function (l) {
+        h += "<td><b>" + pct(x[l]) + '</b><br><span class="meta">' + pct(x["binom_" + l]) + "</span></td>";
+      });
+      h += "</tr>";
+    });
+    h += "</table></div>";
+    if (S.stat === "outs") {
+      h += "<h3>Extra outs by base state (DP / CS / pickoff per PA)</h3><table><tr><th>runners on</th><th>PA</th><th>extra outs / PA</th><th>reach rate</th></tr>";
+      (r.base_state || []).forEach(function (x) {
+        h += "<tr><td>" + x.runners_on + "</td><td>" + x.pa + "</td><td>" + x.extra_outs_per_pa +
+          "</td><td>" + pct(x.reach_rate) + "</td></tr>";
+      });
+      h += "</table><h3>Out rates by how the start went (TBF \u2265 12)</h3><table><tr><th>reach-rate bucket</th><th>starts</th><th>outs/BF</th><th>retire</th><th>extra/BF</th></tr>";
+      (r.traffic || []).forEach(function (x) {
+        h += "<tr><td>" + esc(x.reach_rate_bucket) + "</td><td>" + x.starts + "</td><td>" + x.outs_per_bf +
+          "</td><td>" + x.retire_rate + "</td><td>" + x.extra_outs_per_bf + "</td></tr>";
+      });
+      h += "</table><h3>Reach rate by time through the order</h3><table><tr><th>TTO</th><th>PA</th><th>reach rate</th></tr>";
+      (r.tto || []).forEach(function (x) {
+        h += "<tr><td>" + x.tto + "</td><td>" + x.pa + "</td><td>" + pct(x.reach_rate) + "</td></tr>";
+      });
+      h += "</table><h3>For contrast: P(15+ outs) conditioned on FINAL TBF = n (hook-polluted)</h3><table><tr><th>final TBF</th><th>starts</th><th>P(15+)</th></tr>";
+      (r.final_tbf_view || []).forEach(function (x) {
+        h += "<tr><td>" + x.n + "</td><td>" + x.starts + "</td><td>" + pct(x.p15) + "</td></tr>";
+      });
+      h += "</table>";
+    }
+    out.innerHTML = h;
+  }
+
+  // -------------------------------------------------------------- shell
+  function shell() {
+    var mem = window.LAB_TOKEN_MEM || "";
+    return '' +
+      '<style>' +
+      '#olb .olb-hl{background:#161a24;border:1px solid #2a3040;border-radius:8px;padding:10px 12px;margin:10px 0}' +
+      '#olb .olb-big{font-size:22px;font-weight:700;margin-right:6px}' +
+      '#olb .olb-bar{height:6px;background:#1e2430;border-radius:3px;margin:8px 0}' +
+      '#olb .olb-bar>div{height:100%;background:#2b6cb0;border-radius:3px;width:0}' +
+      '#olb #olb-prog{font-family:ui-monospace,monospace;font-size:12px;min-height:16px}' +
+      '#olb .olb-tab{background:#1e2430;color:#fff;border:0;border-radius:6px;padding:7px 11px;cursor:pointer}' +
+      '#olb .olb-tab.on{background:#2b6cb0}' +
+      '#olb h3{font-size:14px;margin:16px 0 6px;color:#9aa}' +
+      '#olb input,#olb select{background:#181b22;color:#eee;border:1px solid #333;border-radius:6px;padding:6px;font-size:14px}' +
+      '#olb table{border-collapse:collapse;font-size:13px;margin-top:4px}' +
+      '#olb th,#olb td{padding:5px 6px;text-align:right;border-bottom:1px solid #22262e;white-space:nowrap}' +
+      '#olb th{color:#9aa;font-weight:600}#olb td:first-child,#olb th:first-child{text-align:left}' +
+      '#olb .olb-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}' +
+      '</style>' +
+      '<div id="olb" class="board">' +
+      '<h2>Outs Lab</h2>' +
+      '<div class="meta">MLB play-by-play only \u2014 free, no lines, no model. Every number is a count of real starts.</div>' +
+      '<h3>1. Fetch seasons into the dataset</h3>' +
+      '<div class="olb-row"><input id="olb-token" type="password" placeholder="lab token" style="width:110px" value="' + esc(mem) + '">' +
+      '<input id="olb-fetchyrs" style="width:200px" value="2021,2022,2023,2024,2025,2026">' +
+      '<button class="olb-tab on" id="olb-fetchbtn">Fetch</button>' +
+      '<span class="meta">resumable \u2014 stored games are skipped</span></div>' +
+      '<div id="olb-prog">idle</div><div class="olb-bar"><div id="olb-fill"></div></div>' +
+      '<div id="olb-cov"></div>' +
+      '<h3>2. Ask the dataset anything</h3>' +
+      '<div class="olb-row" id="olb-yrs"></div>' +
+      '<div class="olb-row">' +
+      '<select id="olb-qstat"><option value="outs">Outs</option><option value="hits">Hits allowed</option>' +
+      '<option value="walks">Walks</option><option value="ks">Strikeouts</option></select>' +
+      '<label>line <input id="olb-qline" style="width:64px" value="' + esc(S.qline) + '"></label>' +
+      '<label>batters faced <input id="olb-qbf" style="width:56px" value="' + esc(S.qbf) + '"></label>' +
+      '<button class="olb-tab on" id="olb-askbtn">Ask</button>' +
+      '</div>' +
+      '<div id="olb-card"></div><div id="olb-ladder"></div>' +
+      '<h3>Full grids \u2014 every posted line at every BF</h3>' +
+      '<div class="olb-row" id="olb-stats"></div>' +
+      '<div id="olb-out"></div>' +
+      '</div>';
+  }
+
+  function wire() {
+    document.getElementById("olb-fetchbtn").onclick = startFetch;
+    var ask = function () {
+      S.qstat = document.getElementById("olb-qstat").value;
+      S.qline = document.getElementById("olb-qline").value;
+      S.qbf = document.getElementById("olb-qbf").value;
+      loadCell();
+    };
+    document.getElementById("olb-askbtn").onclick = ask;
+    document.getElementById("olb-qstat").onchange = ask;
+    document.getElementById("olb-qline").onchange = ask;
+    document.getElementById("olb-qbf").onchange = ask;
+    document.getElementById("olb-qstat").value = S.qstat;
+  }
+
+  function show() {
+    var main = document.getElementById("main");
+    if (!main) return;
+    S.active = true;
+    main.innerHTML = shell();
+    wire();
+    refresh(loadAll);
+  }
+
+  function hide() {
+    S.active = false;
+    if (S.poll) { clearInterval(S.poll); S.poll = null; }
+  }
+
+  function markButtons(on) {
+    var mine = document.getElementById("olb-tab-btn");
+    if (!mine) return;
+    var sibs = mine.parentNode ? mine.parentNode.querySelectorAll("button") : [];
+    for (var i = 0; i < sibs.length; i++) {
+      if (sibs[i] === mine) continue;
+      if (on) { sibs[i].classList.remove("active"); sibs[i].classList.remove("on"); }
+    }
+    if (on) { mine.classList.add("active"); mine.classList.add("on"); }
+    else { mine.classList.remove("active"); mine.classList.remove("on"); }
+  }
+
+  function install() {
+    var tabs = document.querySelector(".tabs");
+    if (!tabs || document.getElementById("olb-tab-btn")) return;
+    var btn = document.createElement("button");
+    btn.id = "olb-tab-btn";
+    btn.textContent = "Outs Lab";
+    var ref = tabs.querySelector("button");
+    if (ref) btn.className = ref.className.replace(/\bactive\b/, "").replace(/\bon\b/, "").trim();
+    tabs.appendChild(btn);
+    var orig = window.showView;
+    btn.onclick = function () {
+      if (typeof window.showView === "function") window.showView(VIEW);
+    };
+    window.showView = function (v) {
+      if (v === VIEW) { markButtons(true); show(); return; }
+      hide();
+      markButtons(false);
+      if (typeof orig === "function") return orig(v);
+    };
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", addTab);
+    document.addEventListener("DOMContentLoaded", install);
   } else {
-    addTab();
+    install();
   }
 })();
