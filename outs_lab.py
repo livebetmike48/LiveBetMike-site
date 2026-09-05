@@ -55,6 +55,9 @@ STATS = {
 HIT_EVENTS = {"single", "double", "triple", "home_run"}
 WALK_EVENTS = {"walk", "intent_walk"}
 K_EVENTS = {"strikeout", "strikeout_double_play", "strikeout_triple_play"}
+# stat name -> the per-batter cumulative column it reads
+CUM_KEY = {"outs": "cum", "hits": "cum_hits", "walks": "cum_walks",
+           "ks": "cum_ks"}
 
 # Trim the play-by-play payload to what we read. StatsAPI's `fields`
 # filter is a flat list of field names applied at any depth.
@@ -180,6 +183,27 @@ def load_starts(seasons: list[int]) -> list[dict]:
                     "outs": r[6], "extra_outs": r[7]})
         out.append(rec)
     return out
+
+
+# Interactive queries hit the same season set repeatedly -- cache the
+# parsed starts briefly so each card query isn't a fresh 28K-row JSON
+# parse. Invalidation is time-based only; a fetch that lands mid-window
+# shows up within 5 minutes, which is fine for a research tab.
+_starts_cache: dict = {}
+_STARTS_TTL = 300
+
+
+def cached_starts(seasons: list[int]) -> list[dict]:
+    key = tuple(sorted(set(seasons)))
+    hit = _starts_cache.get(key)
+    if hit and time.time() - hit[0] < _STARTS_TTL:
+        return hit[1]
+    starts = load_starts(list(key))
+    _starts_cache[key] = (time.time(), starts)
+    while len(_starts_cache) > 12:       # keep the cache tiny
+        oldest = min(_starts_cache, key=lambda k: _starts_cache[k][0])
+        _starts_cache.pop(oldest, None)
+    return starts
 
 
 def state() -> dict:
@@ -348,6 +372,91 @@ def _wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (round(ctr - half, 4), round(ctr + half, 4))
 
 
+def _over_threshold(line: float) -> int:
+    """Count needed to clear the line. Over 14.5 -> 15; over an integer
+    line (push possible) -> strictly more, so over 18 -> 19."""
+    return int(math.floor(line)) + 1
+
+
+def line_cell(stat: str, line: float, bf: int,
+              seasons: list[int]) -> dict:
+    """The interactive answer: among stored starts that faced at least
+    `bf` batters, how often was `stat` already over `line` at that point.
+    Empirical first, pooled-rate binomial alongside as the iid check."""
+    if stat not in STATS:
+        return {"error": f"unknown stat '{stat}' -- one of {list(STATS)}"}
+    try:
+        line = float(line)
+        bf = int(bf)
+    except (TypeError, ValueError):
+        return {"error": "line and bf must be numbers"}
+    if not 0 < line < 40:
+        return {"error": "line out of range"}
+    if not 5 <= bf <= 32:
+        return {"error": "batters faced must be 5-32"}
+    starts = cached_starts(seasons)
+    if not starts:
+        return {"error": f"no stored starts for {seasons} -- fetch first"}
+    key = CUM_KEY[stat]
+    k = _over_threshold(line)
+    tbf_tot = sum(s["tbf"] for s in starts)
+    stat_tot = sum(s[key][-1] for s in starts if s.get(key))
+    rate = stat_tot / tbf_tot if tbf_tot else 0.0
+    elig = [s for s in starts if s["tbf"] >= bf and s.get(key)]
+    n = len(elig)
+    if n < 20:
+        return {"error": f"only {n} stored starts faced ≥{bf} batters "
+                         f"in {sorted(set(seasons))} -- too thin to trust"}
+    hit = sum(1 for s in elig if s[key][bf - 1] >= k)
+    emp = hit / n
+    lo, hi = _wilson(hit, n)
+    return {
+        "stat": stat, "label": STATS[stat]["label"], "line": line,
+        "bf": bf, "need": k, "seasons": sorted(set(seasons)),
+        "starts": n, "hit": hit,
+        "empirical": round(emp, 4), "ci95": [lo, hi],
+        "fair": american(emp),
+        "binomial": round(binom_tail(bf, k, rate), 4),
+        "per_bf_rate": round(rate, 4),
+        "note": ("integer line: over = strictly more (pushes exist)"
+                 if line == int(line) else ""),
+    }
+
+
+def line_ladder(stat: str, line: float, seasons: list[int]) -> dict:
+    """The queried line at EVERY batters-faced checkpoint -- the fixed
+    14.5 detail table, generalized to whatever line was asked about."""
+    if stat not in STATS:
+        return {"error": f"unknown stat '{stat}' -- one of {list(STATS)}"}
+    try:
+        line = float(line)
+    except (TypeError, ValueError):
+        return {"error": "line must be a number"}
+    starts = cached_starts(seasons)
+    if not starts:
+        return {"error": f"no stored starts for {seasons} -- fetch first"}
+    key = CUM_KEY[stat]
+    k = _over_threshold(line)
+    tbf_tot = sum(s["tbf"] for s in starts)
+    stat_tot = sum(s[key][-1] for s in starts if s.get(key))
+    rate = stat_tot / tbf_tot if tbf_tot else 0.0
+    rows = []
+    for n in N_RANGE:
+        elig = [s for s in starts if s["tbf"] >= n and s.get(key)]
+        if len(elig) < 20:
+            continue
+        hits = sum(1 for s in elig if s[key][n - 1] >= k)
+        emp = hits / len(elig)
+        lo, hi = _wilson(hits, len(elig))
+        rows.append({"n": n, "starts": len(elig), "hit": hits,
+                     "empirical": round(emp, 4), "ci95": [lo, hi],
+                     "fair": american(emp),
+                     "binomial": round(binom_tail(n, k, rate), 4)})
+    return {"stat": stat, "label": STATS[stat]["label"], "line": line,
+            "need": k, "seasons": sorted(set(seasons)),
+            "per_bf_rate": round(rate, 4), "rows": rows}
+
+
 def build_report(starts: list[dict], label: str, meta: dict) -> dict:
     """All the tables, from parsed starts only. Pure -- testable offline."""
     n_starts = len(starts)
@@ -394,15 +503,13 @@ def build_report(starts: list[dict], label: str, meta: dict) -> dict:
     # The lookup table an outs model reads: project TBF, read the price.
     # League-wide shape; a pitcher's own rate slots in later. Binomial
     # with the pooled per-BF rate sits under each cell as the iid check.
-    cum_key = {"outs": "cum", "hits": "cum_hits", "walks": "cum_walks",
-               "ks": "cum_ks"}
     rates = {}
-    for st, key in cum_key.items():
+    for st, key in CUM_KEY.items():
         tot = sum(s[key][-1] for s in starts if s.get(key))
         rates[st] = round(tot / tbf_tot, 4) if tbf_tot else 0.0
     grids = {}
     for st, spec in STATS.items():
-        key = cum_key[st]
+        key = CUM_KEY[st]
         rows = []
         for n in N_RANGE:
             elig = [s for s in starts if s["tbf"] >= n and s.get(key)]
@@ -614,7 +721,7 @@ h1{font-size:18px;margin:0 0 4px}h2{font-size:14px;margin:18px 0 6px;color:#9aa}
 .sub{color:#8a8f98;font-size:12px}
 button{background:#2b6cb0;color:#fff;border:0;border-radius:6px;padding:8px 12px;font-size:14px;cursor:pointer}
 button.tab{background:#1e2430}button.tab.on{background:#2b6cb0}
-input{background:#181b22;color:#eee;border:1px solid #333;border-radius:6px;padding:7px;font-size:14px}
+input,select{background:#181b22;color:#eee;border:1px solid #333;border-radius:6px;padding:7px;font-size:14px}
 table{border-collapse:collapse;width:100%;font-size:13px;margin-top:4px}
 th,td{padding:5px 6px;text-align:right;border-bottom:1px solid #22262e;white-space:nowrap}
 th{color:#9aa;font-weight:600}td:first-child,th:first-child{text-align:left}
@@ -623,19 +730,28 @@ tr.focus td{background:#161a24}
 .bar>div{height:100%;background:#2b6cb0;border-radius:3px;width:0}
 #prog{color:#cfd3da;font-family:ui-monospace,monospace;font-size:12px;min-height:16px}
 .hl{background:#161a24;border:1px solid #2a3040;border-radius:8px;padding:10px 12px;margin:10px 0}
-.hl b{font-size:20px}.warn{color:#f0b26b}
+.hl b{font-size:22px}.warn{color:#f0b26b}.err{color:#f28b82}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
 .scroll{overflow-x:auto}label{margin-right:8px;white-space:nowrap}
 </style></head><body>
 <h1>Outs Lab</h1>
-<div class="sub">MLB play-by-play only — free, no lines, no model. Every cell is a count of real starts.</div>
+<div class="sub">MLB play-by-play only — free, no lines, no model. Every number is a count of real starts.</div>
 <h2>1. Fetch seasons into the dataset</h2>
 <div class="row"><input id="fetchyrs" style="width:220px" value="2021,2022,2023,2024,2025"> <button onclick="go()">Fetch</button>
 <span class="sub">comma-separated; resumable, already-stored games are skipped</span></div>
 <div id="prog">idle</div><div class="bar"><div id="fill"></div></div>
 <div id="cov"></div>
-<h2>2. Query any season set</h2>
+<h2>2. Ask the dataset anything</h2>
 <div class="row" id="yrs"></div>
+<div class="row">
+<select id="qstat" onchange="ask()"><option value="outs">Outs</option><option value="hits">Hits allowed</option><option value="walks">Walks</option><option value="ks">Strikeouts</option></select>
+<label>line <input id="qline" style="width:70px" value="18.5" onchange="ask()"></label>
+<label>batters faced <input id="qbf" style="width:60px" value="26" onchange="ask()"></label>
+<button onclick="ask()">Ask</button>
+</div>
+<div id="card"></div>
+<div id="ladder"></div>
+<h2>Full grids — every posted line at every BF</h2>
 <div class="row" id="stats"></div>
 <div id="out"></div>
 <script>
@@ -653,7 +769,7 @@ async function refresh(){
  $('#fill').style.width=m?Math.round(100*m[1]/m[2])+'%':(s.state.running?'2%':'0%');
  const wasRunning=!!poll; if(!s.state.running&&poll){clearInterval(poll);poll=null;}
  cov=s.coverage||[]; renderCov(); renderYrs();
- if(!report||(wasRunning&&!s.state.running))query();
+ if(!report||(wasRunning&&!s.state.running)){query();ask();}
 }
 function renderCov(){
  if(!cov.length){$('#cov').innerHTML='<p class="sub">dataset empty — fetch a season</p>';return;}
@@ -663,11 +779,30 @@ function renderCov(){
 }
 function renderYrs(){
  const have=new Set([...document.querySelectorAll('#yrs input')].map(i=>+i.value));
- for(const c of cov)if(!have.has(c.season))$('#yrs').insertAdjacentHTML('beforeend',`<label><input type="checkbox" value="${c.season}" checked onchange="query()"> ${c.season}</label>`);
- if(cov.length&&!$('#yrs button'))$('#yrs').insertAdjacentHTML('beforeend','<button onclick="query()">Query</button>');
+ for(const c of cov)if(!have.has(c.season))$('#yrs').insertAdjacentHTML('beforeend',`<label><input type="checkbox" value="${c.season}" checked onchange="query();ask()"> ${c.season}</label>`);
+}
+function yrsPicked(){return [...document.querySelectorAll('#yrs input:checked')].map(i=>i.value);}
+const pct=x=>x==null?'—':(100*x).toFixed(1)+'%';
+async function ask(){
+ const yrs=yrsPicked(); if(!yrs.length){$('#card').innerHTML='<p class="sub">pick at least one season</p>';return;}
+ const q=`stat=${$('#qstat').value}&line=${encodeURIComponent($('#qline').value)}&bf=${encodeURIComponent($('#qbf').value)}&seasons=${yrs.join(',')}`;
+ const c=await (await fetch('/api/outs-lab/cell?'+q)).json();
+ if(c.error){$('#card').innerHTML=`<div class="hl err">${c.error}</div>`;$('#ladder').innerHTML='';return;}
+ const gap=((c.empirical-c.binomial)*100).toFixed(1);
+ $('#card').innerHTML=`<div class="hl">
+  <div>P(over ${c.line} ${c.label.toLowerCase()} within the first ${c.bf} batters faced) — needs ${c.need}+</div>
+  <b>${pct(c.empirical)}</b> <span class="sub">fair ${c.fair} · ${c.hit} of ${c.starts} starts that faced ≥${c.bf} · 95% CI ${pct(c.ci95[0])}–${pct(c.ci95[1])}</span>
+  <div class="sub">closed form (binomial, pooled ${c.per_bf_rate}/BF): ${pct(c.binomial)} — empirical runs <b style="font-size:13px">${gap>0?'+':''}${gap} pts</b> vs iid math</div>
+  ${c.note?`<div class="warn">${c.note}</div>`:''}
+  <div class="sub">seasons ${c.seasons.join(', ')}</div></div>`;
+ const l=await (await fetch(`/api/outs-lab/ladder?stat=${$('#qstat').value}&line=${encodeURIComponent($('#qline').value)}&seasons=${yrs.join(',')}`)).json();
+ if(l.error||!l.rows){$('#ladder').innerHTML='';return;}
+ let h=`<h2>Over ${l.line} ${l.label.toLowerCase()} at every batters-faced checkpoint</h2><div class="scroll"><table><tr><th>n BF</th><th>starts</th><th>empirical</th><th>95% CI</th><th>fair</th><th>binomial</th></tr>`;
+ for(const x of l.rows)h+=`<tr class="${x.n==+$('#qbf').value?'focus':''}"><td>${x.n}</td><td>${x.starts}</td><td><b>${pct(x.empirical)}</b></td><td>${pct(x.ci95[0])}–${pct(x.ci95[1])}</td><td>${x.fair}</td><td>${pct(x.binomial)}</td></tr>`;
+ $('#ladder').innerHTML=h+'</table></div>';
 }
 async function query(){
- const yrs=[...document.querySelectorAll('#yrs input:checked')].map(i=>i.value);
+ const yrs=yrsPicked();
  if(!yrs.length){$('#out').innerHTML='<p class="sub">pick at least one season</p>';return;}
  report=await (await fetch('/api/outs-lab/report?seasons='+yrs.join(','))).json();
  renderStats(); render();
@@ -676,16 +811,12 @@ function renderStats(){
  if(!report||!report.grids)return;
  $('#stats').innerHTML=Object.entries(report.grids).map(([k,g])=>`<button class="tab ${k===stat?'on':''}" onclick="stat='${k}';renderStats();render()">${g.label}</button>`).join('');
 }
-const pct=x=>x==null?'—':(100*x).toFixed(1)+'%';
 function render(){
  const r=report; if(!r||r.error){$('#out').innerHTML=`<p class="sub">${r?r.error:'no report'}</p>`;return;}
- const h=r.headline, g=r.grids[stat];
- let html=`<div class="hl"><div class="sub">seasons ${r.label} · ${r.starts} starts · ${r.tbf} BF</div>
- <div>${h.question}</div><b>${pct(h.empirical)}</b> <span class="sub">(${h.fair}, n=${h.starts} starts that faced ≥17)</span>
- <div class="sub">closed form: ${pct(h.closed_form_outs_rate)} using outs/BF · ${pct(h.closed_form_retire_rate)} using retire rate</div>
- <div class="sub">league outs/BF <b style="font-size:14px">${r.outs_per_bf}</b> · retire rate <b style="font-size:14px">${r.retire_rate}</b> · extra outs/BF ${r.extra_outs_per_bf}</div></div>`;
+ const g=r.grids[stat];
+ let html=`<div class="sub">seasons ${r.label} · ${r.starts} starts · ${r.tbf} BF · league outs/BF ${r.outs_per_bf} · retire rate ${r.retire_rate} · extra outs/BF ${r.extra_outs_per_bf}</div>`;
  if(Object.keys(r.unknown_events||{}).length)html+=`<div class="warn">unknown eventTypes counted as PA: ${JSON.stringify(r.unknown_events)}</div>`;
- html+=`<h2>${g.label}: P(over line | first n batters faced) — empirical, binomial(${g.per_bf_rate}/BF) underneath</h2><div class="scroll"><table><tr><th>n BF</th><th>starts</th>`;
+ html+=`<h2>${g.label}: P(over line | first n batters) — empirical, binomial(${g.per_bf_rate}/BF) underneath</h2><div class="scroll"><table><tr><th>n BF</th><th>starts</th>`;
  for(const l of g.lines)html+=`<th>${l}</th>`;
  html+=`</tr>`;
  for(const x of g.rows){html+=`<tr class="${x.n>=17&&x.n<=23?'focus':''}"><td>${x.n}</td><td>${x.starts}</td>`;
@@ -693,9 +824,6 @@ function render(){
   html+=`</tr>`;}
  html+=`</table></div>`;
  if(stat==='outs'){
- html+=`<h2>14.5 detail — with 95% CI and dispersion vs binomial</h2><div class="scroll"><table><tr><th>n</th><th>starts</th><th>empirical</th><th>95% CI</th><th>fair</th><th>binom(outs/BF)</th><th>binom(retire)</th><th>mean outs</th><th>expected</th><th>dispersion</th></tr>`;
- for(const x of r.ladder)html+=`<tr class="${x.focus?'focus':''}"><td>${x.n}</td><td>${x.starts}</td><td><b>${pct(x.empirical)}</b></td><td>${pct(x.ci95[0])}–${pct(x.ci95[1])}</td><td>${x.fair}</td><td>${pct(x.pred_outs_rate)}</td><td>${pct(x.pred_retire_rate)}</td><td>${x.mean_outs_after}</td><td>${x.expected_outs_after}</td><td>${x.dispersion??'—'}</td></tr>`;
- html+=`</table></div>`;
  html+=`<h2>Extra outs by base state (DP / CS / pickoff per PA)</h2><table><tr><th>runners on</th><th>PA</th><th>extra outs / PA</th><th>reach rate</th></tr>`;
  for(const x of r.base_state)html+=`<tr><td>${x.runners_on}</td><td>${x.pa}</td><td>${x.extra_outs_per_pa}</td><td>${pct(x.reach_rate)}</td></tr>`;
  html+=`</table><h2>Out rates by how the start went (TBF ≥ 12)</h2><table><tr><th>reach-rate bucket</th><th>starts</th><th>outs/BF</th><th>retire</th><th>extra/BF</th></tr>`;
@@ -733,6 +861,30 @@ def register(app):
             if not yrs:
                 yrs = [c["season"] for c in coverage()]
             return report_for(yrs)
+        except Exception as e:
+            return {"error": str(e)}
+
+    @app.get("/api/outs-lab/cell")
+    def outs_lab_cell(stat: str = "outs", line: float = 14.5,
+                      bf: int = 21, seasons: str = ""):
+        """One interactive answer: ?stat=outs&line=18.5&bf=26&seasons=…"""
+        try:
+            yrs = [int(x) for x in seasons.split(",") if x.strip()]
+            if not yrs:
+                yrs = [c["season"] for c in coverage()]
+            return line_cell(stat, line, bf, yrs)
+        except Exception as e:
+            return {"error": str(e)}
+
+    @app.get("/api/outs-lab/ladder")
+    def outs_lab_ladder(stat: str = "outs", line: float = 14.5,
+                        seasons: str = ""):
+        """The queried line at every BF checkpoint, empirical + binomial."""
+        try:
+            yrs = [int(x) for x in seasons.split(",") if x.strip()]
+            if not yrs:
+                yrs = [c["season"] for c in coverage()]
+            return line_ladder(stat, line, yrs)
         except Exception as e:
             return {"error": str(e)}
 
