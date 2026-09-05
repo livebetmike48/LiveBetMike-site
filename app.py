@@ -567,7 +567,8 @@ def index():
                 "</body>",
                 '<script src="/static/pprops_tab.js"></script>\n'
                 '<script src="/static/kadmin_tab.js"></script>\n'
-                '<script src="/static/labdays.js"></script>\n</body>', 1)
+                '<script src="/static/labdays.js"></script>\n'
+                '<script src="/static/outs_lab_tab.js"></script>\n</body>', 1)
         return HTMLResponse(html)
     except Exception as e:
         log.warning("index injection skipped (%s) -- serving file as-is", e)
