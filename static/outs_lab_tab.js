@@ -70,7 +70,7 @@
     });
   }
 
-  function loadAll() { loadReport(); loadCell(); }
+  function loadAll() { loadReport(); loadCell(); loadVtbf(); }
 
   function loadReport() {
     var yrs = yrsPicked();
@@ -98,6 +98,72 @@
         });
       } else { S.ladder = null; paintLadder(); }
     });
+  }
+
+  function startVtbf() {
+    var box = document.getElementById("olb-vyrs");
+    var yrs = (box ? box.value : "").split(",").map(function (x) { return +x.trim(); }).filter(Boolean);
+    fetch("/api/outs-lab/vtbf/run", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: tok(), seasons: yrs })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (j.error || j.reason) {
+        var p = document.getElementById("olb-prog");
+        if (p) p.textContent = j.error || j.reason;
+        if (j.error === "bad token") return;
+      }
+      if (S.poll) clearInterval(S.poll);
+      S.poll = setInterval(refresh, 1500);
+      refresh();
+    });
+  }
+
+  function loadVtbf() {
+    fetch("/api/outs-lab/vtbf").then(function (r) { return r.json(); }).then(function (v) {
+      if (!S.active) return;
+      S.vtbf = v.runs || []; paintVtbf();
+    });
+  }
+
+  function vtbfRow(name, s) {
+    if (!s || !s.bets) return "<tr><td>" + name + '</td><td colspan="5" class="meta">no bets</td></tr>';
+    return "<tr><td>" + name + "</td><td>" + s.bets + "</td><td>" + esc(s.record) +
+      "</td><td><b>" + (s.units > 0 ? "+" : "") + s.units + "u</b></td><td>" + s.roi_pct +
+      "%</td><td>" + s.brier + (s.market_brier ? ' <span class="meta">mkt ' + s.market_brier + "</span>" : "") + "</td></tr>";
+  }
+
+  function paintVtbf() {
+    var el = document.getElementById("olb-vout");
+    if (!el) return;
+    var runs = S.vtbf || [];
+    if (!runs.length) { el.innerHTML = '<div class="meta">no runs yet</div>'; return; }
+    var h = "", seen = {};
+    runs.forEach(function (run) {
+      if (seen[run.season]) return;
+      seen[run.season] = 1;
+      var r = run.report;
+      h += "<h3>" + r.season + " \u2014 " + r.starts_priced + " starts priced over " +
+        r.days_walked + " days \u00b7 grid " + (r.grid_seasons || []).join("/") +
+        " (" + r.grid_starts + " starts) \u00b7 TBF ratio " + r.tbf_ratio + "</h3>";
+      ["league", "pitcher"].forEach(function (arm) {
+        h += '<div class="meta" style="margin-top:6px"><b>' + arm + " arm</b>" +
+          (arm === "pitcher" ? " (own trailing rate slotted in)" : "") + "</div>";
+        h += '<div style="overflow-x:auto"><table><tr><th>market</th><th>bets</th><th>W-L</th><th>units</th><th>ROI</th><th>Brier</th></tr>';
+        var a = r.arms[arm];
+        h += vtbfRow("outs \u26a0\ufe0f circular", a.outs) + vtbfRow("hits", a.hits) +
+          vtbfRow("walks", a.walks) + vtbfRow("TOTAL", a.total);
+        h += "</table></div>";
+      });
+      var sk = [];
+      Object.keys(r.skips || {}).forEach(function (k) { sk.push(k + " \u00d7" + r.skips[k]); });
+      h += '<div class="meta">skips: ' + (sk.join(" \u00b7 ") || "none") + "</div>";
+      h += '<div class="meta">suspect >20% excluded: ' + r.suspect_excluded +
+        " \u00b7 pitcher-rate missing: " + r.pitcher_rate_missing +
+        " \u00b7 credits: api " + ((r.odds_fetches || {}).odds_api || 0) +
+        " / archive " + ((r.odds_fetches || {}).odds_hit || 0) + "</div>";
+      h += '<div class="meta">' + esc(r.policy) + " \u00b7 " + esc(r.note) + "</div>";
+    });
+    el.innerHTML = h;
   }
 
   // -------------------------------------------------------------- paint
@@ -288,11 +354,18 @@
       '<h3>Full grids \u2014 every posted line at every BF</h3>' +
       '<div class="olb-row" id="olb-stats"></div>' +
       '<div id="olb-out"></div>' +
+      '<h3>3. Vegas-TBF market backtest (uses Odds API credits)</h3>' +
+      '<div class="meta">implied TBF = outs + hits + walks lines \u00d7 real TBF ratio \u2192 empirical grid \u2192 flat 1u vs closing prices. No outs line = start skipped (the gate). Grid from prior seasons only.</div>' +
+      '<div class="olb-row"><input id="olb-vyrs" style="width:190px" value="2023,2024,2025,2026">' +
+      '<button class="olb-tab on" id="olb-vrunbtn">Run</button>' +
+      '<span class="meta">archive-first \u2014 a season re-run costs ~0 credits</span></div>' +
+      '<div id="olb-vout"></div>' +
       '</div>';
   }
 
   function wire() {
     document.getElementById("olb-fetchbtn").onclick = startFetch;
+    document.getElementById("olb-vrunbtn").onclick = startVtbf;
     var ask = function () {
       S.qstat = document.getElementById("olb-qstat").value;
       S.qline = document.getElementById("olb-qline").value;
