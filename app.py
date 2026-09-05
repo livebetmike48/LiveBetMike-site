@@ -16,6 +16,7 @@ import csw
 import kmatchup
 import pprops
 import ppbacktest
+import outs_lab
 import thread as thread_gen
 import projections
 import pitchers as pitchers_mod
@@ -49,6 +50,7 @@ log = logging.getLogger("app")
 app = FastAPI(title="Matchup Board")
 
 kplays.start()  # K play auto-poster: OFF unless DISCORD_KPLAYS_WEBHOOK is set
+outs_lab.register(app)  # /outs-lab + /api/outs-lab (play-by-play outs ladder test)
 
 
 def _days(payload: dict, default: int, allowed: tuple):
