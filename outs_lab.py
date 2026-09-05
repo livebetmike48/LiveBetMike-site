@@ -41,7 +41,8 @@ log = logging.getLogger("outs_lab")
 DB_PATH = os.getenv("DB_PATH", "matchups.db")
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 WORKERS = int(os.getenv("OUTS_LAB_WORKERS", "4"))
-TARGET_OUTS = 15                    # the 14.5 line
+TARGET_OUTS = 15                    # the 14.5 line (headline row)
+OUTS_LINES = (12.5, 14.5, 15.5, 17.5, 18.5, 20.5)   # every line books post
 N_RANGE = tuple(range(15, 28))      # batters-faced checkpoints
 FOCUS = (17, 18, 19, 20, 21, 22, 23)   # Mike's asked-for band
 
@@ -308,6 +309,23 @@ def build_report(starts: list[dict], label: str, meta: dict) -> dict:
             "focus": n in FOCUS,
         })
 
+    # ---- the conversion grid: P(outs > line | first n batters), every line
+    # this is the lookup table an outs model reads: project TBF, read off
+    # the price. League-wide shape; a pitcher's own rate slots in later.
+    grid = []
+    for n in N_RANGE:
+        elig = [s for s in starts if s["tbf"] >= n]
+        if len(elig) < 20:
+            continue
+        after = [s["cum"][n - 1] for s in elig]
+        row = {"n": n, "starts": len(elig)}
+        for line in OUTS_LINES:
+            k = math.ceil(line)
+            hits = sum(1 for a in after if a >= k)
+            row[str(line)] = round(hits / len(elig), 4)
+            row[f"binom_{line}"] = round(binom_tail(n, k, r_outs), 4)
+        grid.append(row)
+
     # ---- selection view: condition on FINAL tbf == n (the hook-polluted one)
     final_view = []
     for n in N_RANGE:
@@ -374,6 +392,7 @@ def build_report(starts: list[dict], label: str, meta: dict) -> dict:
         "retire_rate": round(r_retire, 4),
         "extra_outs_per_bf": round(extra_tot / tbf_tot, 4) if tbf_tot else None,
         "ladder": ladder,
+        "grid": grid, "grid_lines": list(OUTS_LINES),
         "final_tbf_view": final_view,
         "base_state": base_state,
         "traffic": traffic_rows,
@@ -540,6 +559,13 @@ function render(run){
  if(Object.keys(r.unknown_events||{}).length)html+=`<div class="warn">unknown eventTypes counted as PA: ${JSON.stringify(r.unknown_events)}</div>`;
  html+=`<h2>P(15+ outs after first n batters) — starts that faced ≥ n</h2><div class="scroll"><table><tr><th>n</th><th>starts</th><th>empirical</th><th>95% CI</th><th>fair</th><th>binom(outs/BF)</th><th>binom(retire)</th><th>mean outs</th><th>expected</th><th>dispersion</th></tr>`;
  for(const x of r.ladder)html+=`<tr class="${x.focus?'focus':''}"><td>${x.n}</td><td>${x.starts}</td><td><b>${pct(x.empirical)}</b></td><td>${pct(x.ci95[0])}–${pct(x.ci95[1])}</td><td>${x.fair}</td><td>${pct(x.pred_outs_rate)}</td><td>${pct(x.pred_retire_rate)}</td><td>${x.mean_outs_after}</td><td>${x.expected_outs_after}</td><td>${x.dispersion??'—'}</td></tr>`;
+ html+=`</table></div>`;
+ html+=`<h2>Conversion grid — P(over line | first n batters), empirical / binomial</h2><div class="scroll"><table><tr><th>n</th><th>starts</th>`;
+ for(const l of r.grid_lines)html+=`<th>${l}</th>`;
+ html+=`</tr>`;
+ for(const x of r.grid){html+=`<tr class="${x.n>=17&&x.n<=23?'focus':''}"><td>${x.n}</td><td>${x.starts}</td>`;
+  for(const l of r.grid_lines)html+=`<td><b>${pct(x[l])}</b><br><span class="sub">${pct(x['binom_'+l])}</span></td>`;
+  html+=`</tr>`;}
  html+=`</table></div>`;
  html+=`<h2>Extra outs by base state (DP / CS / pickoff per PA)</h2><table><tr><th>runners on</th><th>PA</th><th>extra outs / PA</th><th>reach rate</th></tr>`;
  for(const x of r.base_state)html+=`<tr><td>${x.runners_on}</td><td>${x.pa}</td><td>${x.extra_outs_per_pa}</td><td>${pct(x.reach_rate)}</td></tr>`;
