@@ -160,3 +160,208 @@ if __name__ == "__main__":
     import sys
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ===================== Vegas-implied-TBF backtest tests =====================
+import sys
+import types
+
+
+def _payload(market, name, point, over_price=-110, under_price=-110,
+             book="DraftKings"):
+    return {"bookmakers": [{"title": book, "markets": [{
+        "key": market, "outcomes": [
+            {"name": "Over", "description": name, "point": point,
+             "price": over_price},
+            {"name": "Under", "description": name, "point": point,
+             "price": under_price}]}]}]}
+
+
+def _seed_two_seasons():
+    """Prior season 2021 (grid fuel) + test season 2024 (one game)."""
+    outs_lab._starts_cache.clear()
+    with outs_lab._conn() as c:
+        for t in ("outs_lab_starts", "outs_lab_games", "vtbf_runs",
+                  "vtbf_bets"):
+            c.execute(f"DELETE FROM {t}")
+    clean_cum = [min(j + 1, 27) for j in range(27)]
+    rough_cum = [round((j + 1) * 10 / 17) for j in range(17)] + \
+                [10 + round((j + 1) * 8 / 10) for j in range(10)]
+    rough_hits = [min(j // 3 + 1, 9) for j in range(27)]
+    for i in range(30):
+        outs_lab._save_game(2021, {"gamePk": 100 + i, "date": "2021-06-01"},
+                            [_mk_start(i, "top", list(clean_cum))])
+    for i in range(10):
+        outs_lab._save_game(2021, {"gamePk": 200 + i, "date": "2021-06-02"},
+                            [_mk_start(40 + i, "top", list(rough_cum),
+                                       hits=list(rough_hits))])
+    # 2024: one game, two starters -- pitcher 999 (priced), 998 (no outs line)
+    s1 = _mk_start(0, "top", list(clean_cum))
+    s1["pitcher_id"] = 999
+    s2 = _mk_start(0, "bottom", list(clean_cum))
+    s2["pitcher_id"] = 998
+    outs_lab._save_game(2024, {"gamePk": 9001, "date": "2024-06-01"}, [s1, s2])
+    # a second 2024 game with NO outs market at all
+    s3 = _mk_start(0, "top", list(clean_cum))
+    s3["pitcher_id"] = 997
+    outs_lab._save_game(2024, {"gamePk": 9002, "date": "2024-06-01"}, [s3])
+
+
+def _fake_kbacktest(odds_by_market_event, calls):
+    m = types.ModuleType("kbacktest")
+    m._fetch_stats = {"events_api": 0, "events_hit": 0,
+                      "odds_api": 0, "odds_hit": 0}
+    m.K_MARKET_BOOKS = None
+
+    def _hist_events(snapshot):
+        m._fetch_stats["events_hit"] += 1
+        return [{"id": "ev1", "commence_time": "2024-06-01T23:10:00Z",
+                 "home_team": "St. Louis Cardinals",
+                 "away_team": "Pittsburgh Pirates"},
+                {"id": "ev2", "commence_time": "2024-06-01T23:10:00Z",
+                 "home_team": "New York Mets",
+                 "away_team": "Atlanta Braves"}]
+
+    def _hist_odds(event_id, snapshot, market):
+        calls.append((event_id, market))
+        m._fetch_stats["odds_api"] += 1
+        return odds_by_market_event.get((event_id, market))
+    m._hist_events = _hist_events
+    m._hist_odds = _hist_odds
+    return m
+
+
+def _vtbf_env(monkeypatch, odds_map, calls):
+    monkeypatch.setitem(sys.modules, "kbacktest",
+                        _fake_kbacktest(odds_map, calls))
+    monkeypatch.setattr(outs_lab, "VTBF_GRID_MIN_STARTS", 10)
+    monkeypatch.setattr(outs_lab, "_day_games", lambda d: {
+        9001: {"home": "St. Louis Cardinals", "away": "Pittsburgh Pirates"},
+        9002: {"home": "New York Mets", "away": "Atlanta Braves"}})
+    monkeypatch.setattr(outs_lab, "_pitcher_names", lambda ids: outs_lab._names)
+    outs_lab._names.clear()
+    outs_lab._names.update({999: "Kyle Test", 998: "Rich Nolines",
+                            997: "No Market Guy"})
+
+
+def test_vtbf_grid_math():
+    _seed_two_seasons()
+    import pytest as _pt
+    with _pt.MonkeyPatch.context() as mp:
+        mp.setattr(outs_lab, "VTBF_GRID_MIN_STARTS", 10)
+        g = outs_lab.VtbfGrid([2021])
+        # league outs rate: (30*27 + 10*18) / (40*27) = 990/1080
+        assert abs(g.rates["outs"] - 990 / 1080) < 1e-9
+        # O+H+BB: clean 27, rough 18+9+0=27 -> ratio exactly 1.0
+        assert g.tbf_ratio == 1.0
+        # p at integer n and interpolated between equal neighbours
+        assert g.p("outs", 14.5, 20) == 0.75
+        assert g.p("outs", 14.5, 20.5) == 0.75
+        b20 = outs_lab.binom_tail(20, 15, g.rates["outs"])
+        b21 = outs_lab.binom_tail(21, 15, g.rates["outs"])
+        assert abs(g.binom("outs", 14.5, 20.5, g.rates["outs"])
+                   - (b20 + b21) / 2) < 1e-9
+
+
+def test_pitcher_history_is_point_in_time():
+    _seed_two_seasons()
+    idx = outs_lab.pitcher_history([2021, 2024])
+    import pytest as _pt
+    with _pt.MonkeyPatch.context() as mp:
+        mp.setattr(outs_lab, "VTBF_MIN_PITCHER_BF", 20)
+        # pitcher 999's only start is ON 2024-06-01 -> excluded before it
+        assert outs_lab.pitcher_rate(idx, 999, "outs", "2024-06-01") is None
+        # after that date it counts: 27 outs / 27 bf
+        assert outs_lab.pitcher_rate(idx, 999, "outs", "2024-06-02") == 1.0
+    # below the real 200-BF floor -> None
+    assert outs_lab.pitcher_rate(idx, 999, "outs", "2024-06-02") is None
+
+
+def test_pitcher_arm_prob_slots_rate_into_grid_shape():
+    _seed_two_seasons()
+    import pytest as _pt
+    with _pt.MonkeyPatch.context() as mp:
+        mp.setattr(outs_lab, "VTBF_GRID_MIN_STARTS", 10)
+        g = outs_lab.VtbfGrid([2021])
+        base = g.p("outs", 14.5, 20.5)
+        better = outs_lab._pitcher_arm_prob(g, "outs", 14.5, 20.5, base, 0.99)
+        worse = outs_lab._pitcher_arm_prob(g, "outs", 14.5, 20.5, base, 0.60)
+        assert better > base > worse
+        assert outs_lab._pitcher_arm_prob(g, "outs", 14.5, 20.5, base, None) == base
+        assert 0.005 <= worse and better <= 0.995
+
+
+def test_vtbf_end_to_end(monkeypatch):
+    _seed_two_seasons()
+    calls = []
+    odds_map = {
+        ("ev1", "pitcher_outs"): _payload(
+            "pitcher_outs", "Kyle Test", 14.5, over_price=-250, under_price=180),
+        ("ev1", "pitcher_hits_allowed"): _payload(
+            "pitcher_hits_allowed", "Kyle Test", 4.5, over_price=150, under_price=-250),
+        ("ev1", "pitcher_walks"): _payload(
+            "pitcher_walks", "Kyle Test", 1.5, over_price=-110, under_price=-110),
+        # ev2 has NO outs market (returns None below)
+    }
+    _vtbf_env(monkeypatch, odds_map, calls)
+    rep = outs_lab.run_vtbf_season(2024)
+    assert not rep.get("error"), rep
+    # gates: 998 skipped (no outs line), ev2 game skipped (no outs market)
+    assert rep["skips"]["no_outs_line"] == 1
+    assert rep["skips"]["no_outs_market"] == 1
+    assert rep["starts_priced"] == 1
+    # ev2's hits/walks were never fetched -- the gate saves the credits
+    assert ("ev2", "pitcher_hits_allowed") not in calls
+    assert ("ev2", "pitcher_outs") in calls
+    # hand math -- implied TBF 14.5+4.5+1.5 = 20.5 * ratio 1.0
+    league = rep["arms"]["league"]
+    # outs: base p=0.75, over @ -250 (dec 1.4) -> EV +5.0, actual 27 > 14.5 -> win +0.4u
+    assert league["outs"]["bets"] == 1 and league["outs"]["record"] == "1-0"
+    assert abs(league["outs"]["units"] - 0.4) < 0.01
+    # hits: p(over)=0.25 -> under 0.75 @ -250 -> EV +5.0, actual 0 hits -> win
+    assert league["hits"]["bets"] == 1 and league["hits"]["record"] == "1-0"
+    # walks: p(over)=0 -> under prob 1.0 @ -110 -> EV 90.9% = suspect, no bet
+    assert league["walks"]["bets"] == 0
+    assert rep["suspect_excluded"] >= 1
+    assert league["total"]["bets"] == 2 and abs(league["total"]["units"] - 0.8) < 0.01
+    # pitcher 999 has no PRIOR starts -> rate missing, pitcher arm == league
+    assert rep["pitcher_rate_missing"] >= 1
+    assert rep["arms"]["pitcher"]["total"]["bets"] == 2
+    # receipts + grid provenance
+    assert rep["odds_fetches"]["odds_api"] == len(calls)
+    assert rep["grid_seasons"] == [2021] and rep["tbf_ratio"] == 1.0
+    # persisted: run + bets + csv
+    runs = outs_lab.vtbf_history()
+    assert runs and runs[0]["season"] == 2024
+    csv = outs_lab.vtbf_bets_csv()
+    assert "Kyle Test" in csv and csv.count("\n") >= 4  # header + 4 arm-bets
+
+
+def test_vtbf_errors(monkeypatch):
+    _seed_two_seasons()
+    _vtbf_env(monkeypatch, {}, [])
+    assert "not in the dataset" in outs_lab.run_vtbf_season(2030)["error"]
+    # earliest stored season has nothing before it -> grid refusal
+    assert "before" in outs_lab.run_vtbf_season(2021)["error"]
+
+
+def test_vtbf_routes(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    _seed_two_seasons()
+    monkeypatch.setenv("LAB_TOKEN", "tk")
+    app = FastAPI()
+    outs_lab.register(app)
+    cl = TestClient(app)
+    r = cl.get("/api/outs-lab/vtbf").json()
+    assert "state" in r and "runs" in r
+    r = cl.post("/api/outs-lab/vtbf/run", json={"token": "wrong",
+                                                "seasons": [2024]}).json()
+    assert r["error"] == "bad token"
+    r = cl.get("/api/outs-lab/vtbf.csv")
+    assert r.status_code == 200 and r.text.startswith("run_ts,")
+
+
+def test_page_and_report_have_vtbf():
+    assert "/api/outs-lab/vtbf/run" in outs_lab.PAGE
+    assert "Vegas-TBF market backtest" in outs_lab.PAGE
