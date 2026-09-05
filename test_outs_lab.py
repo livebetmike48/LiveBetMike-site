@@ -78,7 +78,7 @@ assert c.post("/api/outs-lab/run",json={"token":"nope","season":2025}).json()=={
 print("routes OK")
 
 # async run path with mocked network -> DB write + state transitions
-import time, json
+import time
 L.final_games = lambda s,e: [{"gamePk":k,"date":"2025-06-01"} for k in range(12)]
 L.fetch_plays = lambda pk: plays
 r = L.start_async(season=2025); assert r["started"]
@@ -90,3 +90,12 @@ st = L.state(); assert not st["running"] and st["progress"]=="done" and not st["
 h = L.history(); assert h and h[0]["report"]["starts"]==24 and h[0]["report"]["meta"]["games"]==12
 assert h[0]["report"]["unknown_events"]=={"weird_new_code":12}
 print("async+db OK")
+
+# grid: every line at every n, empirical vs binomial, on the synthetic population
+g = rep["grid"]; assert g and rep["grid_lines"]==[12.5,14.5,15.5,17.5,18.5,20.5]
+row = next(x for x in g if x["n"]==24)
+assert row["14.5"]==next(x for x in rep["ladder"] if x["n"]==24)["empirical"]   # same count, same answer
+assert row["12.5"]>=row["14.5"]>=row["15.5"]>=row["17.5"]>=row["18.5"]>=row["20.5"]  # monotone in the line
+assert abs(row["17.5"]-row["binom_17.5"])<0.10
+assert row["20.5"]<=0.06 and abs(row["binom_20.5"]-0.027)<0.01   # 21 outs on 24 BF at p=.68 ~2.7%
+print("grid OK")
