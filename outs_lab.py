@@ -36,6 +36,8 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+import odds_api          # prop-price parsing + event matching (repo module)
+
 log = logging.getLogger("outs_lab")
 
 DB_PATH = os.getenv("DB_PATH", "matchups.db")
@@ -114,6 +116,13 @@ def _conn():
         game_pk INTEGER PRIMARY KEY, season INTEGER, date TEXT, starts INTEGER)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS outs_lab_runs (
         ts REAL PRIMARY KEY, label TEXT, report TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS vtbf_runs (
+        ts REAL PRIMARY KEY, season INTEGER, report TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS vtbf_bets (
+        run_ts REAL, season INTEGER, date TEXT, game_pk INTEGER,
+        pitcher TEXT, arm TEXT, market TEXT, side TEXT, line REAL,
+        price INTEGER, book TEXT, ev REAL, prob REAL, market_prob REAL,
+        implied_tbf REAL, hit INTEGER)""")
     return conn
 
 
@@ -711,6 +720,500 @@ def start_async(seasons: list[int]) -> dict:
     return {"started": True, "seasons": seasons}
 
 
+# ============== Vegas-implied-TBF market backtest (Test 2) ==============
+# Mike's idea, built exactly as asked: the BOOK's own workload number --
+# implied TBF = outs line + hits line + walks line, scaled by the real
+# TBF/(O+H+BB) ratio measured from this dataset -- run through the
+# empirical conversion grid. No lineups, no log5, no calibration curve.
+# Pitch counts, piggybacks, September management: all already priced
+# into the outs line, so workload guessing disappears.
+#
+# THE GATE (Mike's rule): no posted outs line -> that start is SKIPPED,
+# logged by cause, never priced. The book posting a workload market IS
+# the population filter. Missing hits or walks line also skips (round 1
+# is strict -- imputing would smuggle a model into the model-free test).
+#
+# Honesty notes carried in every report: the outs market is partially
+# circular (its own line feeds the TBF that prices it) -- what the units
+# measure is whether books price outs CONSISTENTLY with their own
+# implied workload under the true empirical conversion. Hits and walks
+# are cleaner. The grid is built from PRIOR seasons only.
+
+VTBF_MARKETS = {"outs": "pitcher_outs", "hits": "pitcher_hits_allowed",
+                "walks": "pitcher_walks"}
+VTBF_EV_MIN = float(os.getenv("VTBF_EV_MIN", "2"))
+VTBF_EV_MAX = float(os.getenv("VTBF_EV_MAX", "20"))
+VTBF_MIN_PITCHER_BF = int(os.getenv("VTBF_MIN_PITCHER_BF", "200"))
+VTBF_GRID_MIN_STARTS = 100
+PROPS_HISTORY_START = "2023-05-03"   # The Odds API has no props before this
+VTBF_EVENTS_SNAPSHOT = "16:00:00"    # noon-ET events list; odds at commence
+
+
+class VtbfGrid:
+    """P(over line | first n batters) from PRIOR seasons' stored starts.
+    Values per (stat, n) kept sorted so any line is a bisect away."""
+
+    def __init__(self, seasons: list[int]):
+        starts = cached_starts(seasons)
+        if not starts:
+            raise ValueError(f"no stored starts for prior seasons {seasons}")
+        self.seasons = sorted(set(seasons))
+        self.n_starts = len(starts)
+        tbf_tot = sum(s["tbf"] for s in starts)
+        self.rates: dict = {}
+        self.vals: dict = {}
+        for st, key in CUM_KEY.items():
+            tot = sum(s[key][-1] for s in starts if s.get(key))
+            self.rates[st] = tot / tbf_tot if tbf_tot else 0.0
+            per_n = {}
+            for n in N_RANGE:
+                vs = sorted(s[key][n - 1] for s in starts
+                            if s["tbf"] >= n and s.get(key))
+                if len(vs) >= VTBF_GRID_MIN_STARTS:
+                    per_n[n] = vs
+            self.vals[st] = per_n
+        # outs uses the recorded total (incl. runner outs after the last
+        # PA) -- the same number the boxscore and the outs prop settle on.
+        ohw = sum(s["outs"] + s["cum_hits"][-1] + s["cum_walks"][-1]
+                  for s in starts if s.get("cum_hits") and s.get("cum_walks"))
+        self.tbf_ratio = round(tbf_tot / ohw, 4) if ohw else 1.0
+
+    def _p_at(self, stat: str, k: int, n: int) -> float | None:
+        vs = self.vals.get(stat, {}).get(n)
+        if vs is None:
+            return None
+        lo, hi = 0, len(vs)
+        while lo < hi:                      # bisect_left(vs, k)
+            mid = (lo + hi) // 2
+            if vs[mid] < k:
+                lo = mid + 1
+            else:
+                hi = mid
+        return (len(vs) - lo) / len(vs)
+
+    def p(self, stat: str, line: float, n_tbf: float) -> float | None:
+        """Empirical clear prob at a fractional implied TBF -- linear
+        interpolation between the two integer checkpoints."""
+        k = _over_threshold(line)
+        lo = int(math.floor(n_tbf))
+        w = n_tbf - lo
+        p_lo = self._p_at(stat, k, lo)
+        if w == 0:
+            return p_lo
+        p_hi = self._p_at(stat, k, lo + 1)
+        if p_lo is None or p_hi is None:
+            return None
+        return (1 - w) * p_lo + w * p_hi
+
+    def binom(self, stat: str, line: float, n_tbf: float,
+              rate: float) -> float:
+        k = _over_threshold(line)
+        lo = int(math.floor(n_tbf))
+        w = n_tbf - lo
+        b_lo = binom_tail(lo, k, rate)
+        if w == 0:
+            return b_lo
+        return (1 - w) * b_lo + w * binom_tail(lo + 1, k, rate)
+
+
+def pitcher_history(seasons: list[int]) -> dict:
+    """pitcher_id -> date-sorted (date, tbf, outs, hits, walks) per start,
+    from stored data. Rates are always taken strictly BEFORE a date, so
+    the index is point-in-time safe by construction."""
+    idx: dict = {}
+    for s in load_starts(seasons):
+        if not (s.get("cum_hits") and s.get("cum_walks")):
+            continue
+        idx.setdefault(s["pitcher_id"], []).append(
+            (s["date"], s["tbf"], s["outs"],
+             s["cum_hits"][-1], s["cum_walks"][-1]))
+    for rows in idx.values():
+        rows.sort()
+    return idx
+
+
+_STAT_COL = {"outs": 2, "hits": 3, "walks": 4}
+
+
+def pitcher_rate(idx: dict, pid: int, stat: str,
+                 before: str) -> float | None:
+    """Trailing per-BF rate from starts strictly before `before`.
+    None below the BF floor -- the pitcher arm then honestly reads the
+    league grid instead of a thin-sample number."""
+    bf = tot = 0
+    col = _STAT_COL[stat]
+    for r in idx.get(pid, ()):
+        if r[0] >= before:
+            break
+        bf += r[1]
+        tot += r[col]
+    if bf < VTBF_MIN_PITCHER_BF:
+        return None
+    return tot / bf
+
+
+def _pitcher_arm_prob(grid: VtbfGrid, stat: str, line: float,
+                      n_tbf: float, base: float,
+                      rate: float | None) -> float:
+    """Slot the pitcher's own rate into the grid shape: empirical base
+    shifted by the binomial sensitivity between his rate and league's.
+    No rate -> base unchanged (counted in the report)."""
+    if rate is None:
+        return base
+    adj = grid.binom(stat, line, n_tbf, rate) - \
+        grid.binom(stat, line, n_tbf, grid.rates[stat])
+    return min(0.995, max(0.005, base + adj))
+
+
+def _devig_market(odds_data: dict, market: str, name: str,
+                  book: str) -> float | None:
+    """Fair over-prob at one book (over+under normalized). Generic
+    version of kbacktest._devig_prob, which hardcodes the K market."""
+    try:
+        over = odds_api.player_prop_prices(odds_data, market, name, side="over")
+        under = odds_api.player_prop_prices(odds_data, market, name, side="under")
+        po = (over or {}).get("prices", {}).get(book)
+        pu = (under or {}).get("prices", {}).get(book)
+        if po is None or pu is None:
+            return None
+        io = 1.0 / odds_api.american_to_decimal(po)
+        iu = 1.0 / odds_api.american_to_decimal(pu)
+        return io / (io + iu) if io + iu > 0 else None
+    except Exception:
+        return None
+
+
+def _day_games(date: str) -> dict:
+    """gamePk -> home/away team names for one day (free StatsAPI)."""
+    r = _session.get(f"{MLB_BASE}/schedule", params={
+        "sportId": 1, "startDate": date, "endDate": date,
+        "gameType": "R"}, timeout=30)
+    r.raise_for_status()
+    out = {}
+    for day in r.json().get("dates") or []:
+        for g in day.get("games") or []:
+            t = g.get("teams") or {}
+            out[g["gamePk"]] = {
+                "home": ((t.get("home") or {}).get("team") or {}).get("name"),
+                "away": ((t.get("away") or {}).get("team") or {}).get("name")}
+    return out
+
+
+_names: dict = {}
+
+
+def _pitcher_names(ids: list[int]) -> dict:
+    """id -> fullName, batched + cached (free StatsAPI)."""
+    need = [i for i in set(ids) if i and i not in _names]
+    for i in range(0, len(need), 80):
+        chunk = need[i:i + 80]
+        try:
+            r = _session.get(f"{MLB_BASE}/people", params={
+                "personIds": ",".join(str(x) for x in chunk)}, timeout=30)
+            r.raise_for_status()
+            for p in r.json().get("people") or []:
+                _names[p["id"]] = p.get("fullName")
+        except Exception as e:
+            log.warning("vtbf: name lookup failed: %s", e)
+    return _names
+
+
+def _bet_units(price: int, hit: int) -> float:
+    return round(odds_api.american_to_decimal(price) - 1, 4) if hit else -1.0
+
+
+def run_vtbf_season(season: int, progress=None) -> dict:
+    """One season, closing lines, archive-first. Grid from PRIOR stored
+    seasons only; pitcher trailing rates strictly before each date."""
+    import kbacktest                     # lazy: archive helpers + book policy
+    progress = progress or _progress
+    stored = [c["season"] for c in coverage()]
+    prior = [y for y in stored if y < season]
+    if season not in stored:
+        return {"error": f"season {season} not in the dataset -- fetch first"}
+    if not prior:
+        return {"error": f"no stored seasons before {season} to build the "
+                         "grid from -- the grid must be point-in-time"}
+    grid = VtbfGrid(prior)
+    pit_idx = pitcher_history(stored)
+    season_starts = load_starts([season])
+    by_date: dict = {}
+    for s in season_starts:
+        if s["date"] >= PROPS_HISTORY_START and s.get("cum_hits") \
+                and s.get("cum_walks"):
+            by_date.setdefault(s["date"], {}).setdefault(
+                s["game_pk"], []).append(s)
+    dates = sorted(by_date)
+    if not dates:
+        return {"error": f"no stored {season} starts on/after "
+                         f"{PROPS_HISTORY_START} (props history floor)"}
+    fs0 = dict(kbacktest._fetch_stats)
+    skips: dict = {}
+
+    def skip(cause, n=1):
+        skips[cause] = skips.get(cause, 0) + n
+
+    _pitcher_names([s["pitcher_id"] for s in season_starts])
+    bets: list = []
+    starts_priced = 0
+    suspect = 0
+    pitcher_rate_missing = 0
+    t0 = time.time()
+    for di, date in enumerate(dates):
+        try:
+            teams_by_pk = _day_games(date)
+        except Exception as e:
+            log.warning("vtbf: schedule failed %s: %s", date, e)
+            skip("schedule_failed", sum(len(v) for v in by_date[date].values()))
+            continue
+        hist_events = kbacktest._hist_events(f"{date}T{VTBF_EVENTS_SNAPSHOT}Z")
+        if not hist_events:
+            skip("no_events_snapshot", sum(len(v) for v in by_date[date].values()))
+            continue
+        for game_pk, sts in by_date[date].items():
+            teams = teams_by_pk.get(game_pk)
+            if not teams or not teams["home"] or not teams["away"]:
+                skip("no_schedule_names", len(sts))
+                continue
+            ev = odds_api.find_event(hist_events, teams["home"], teams["away"])
+            if not ev:
+                skip("no_event_match", len(sts))
+                continue
+            close_at = ev.get("commence_time") or f"{date}T23:00:00Z"
+            outs_data = kbacktest._hist_odds(ev.get("id"), close_at,
+                                             VTBF_MARKETS["outs"])
+            if not outs_data:
+                skip("no_outs_market", len(sts))
+                continue                 # hits/walks never fetched: no credits
+            hits_data = walks_data = None
+            for s in sts:
+                name = _names.get(s["pitcher_id"])
+                if not name:
+                    skip("no_pitcher_name")
+                    continue
+                over = {}
+                over["outs"] = odds_api.player_prop_prices(
+                    outs_data, VTBF_MARKETS["outs"], name, side="over")
+                if not over["outs"] or over["outs"].get("point") is None:
+                    skip("no_outs_line")   # THE GATE -- Mike's rule
+                    continue
+                if hits_data is None:      # outs line exists: now worth paying
+                    hits_data = kbacktest._hist_odds(
+                        ev.get("id"), close_at, VTBF_MARKETS["hits"])
+                    walks_data = kbacktest._hist_odds(
+                        ev.get("id"), close_at, VTBF_MARKETS["walks"])
+                over["hits"] = odds_api.player_prop_prices(
+                    hits_data, VTBF_MARKETS["hits"], name, side="over")
+                over["walks"] = odds_api.player_prop_prices(
+                    walks_data, VTBF_MARKETS["walks"], name, side="over")
+                if any(not over[m] or over[m].get("point") is None
+                       for m in ("hits", "walks")):
+                    skip("missing_hits_or_walks_line")
+                    continue
+                raw_tbf = sum(over[m]["point"] for m in VTBF_MARKETS)
+                n_tbf = round(raw_tbf * grid.tbf_ratio, 2)
+                if not (min(N_RANGE) <= n_tbf <= max(N_RANGE)):
+                    skip("implied_tbf_out_of_range")
+                    continue
+                starts_priced += 1
+                actual = {"outs": s["outs"], "hits": s["cum_hits"][-1],
+                          "walks": s["cum_walks"][-1]}
+                data_for = {"outs": outs_data, "hits": hits_data,
+                            "walks": walks_data}
+                for stat, mk in VTBF_MARKETS.items():
+                    line = over[stat]["point"]
+                    if line != int(line) + 0.5:
+                        skip("whole_number_line")
+                        continue           # pushes -- flat-bet sim stays honest
+                    base = grid.p(stat, line, n_tbf)
+                    if base is None:
+                        skip("thin_grid_cell")
+                        continue
+                    rate = pitcher_rate(pit_idx, s["pitcher_id"], stat,
+                                        s["date"])
+                    if rate is None:
+                        pitcher_rate_missing += 1
+                    p_adj = _pitcher_arm_prob(grid, stat, line, n_tbf,
+                                              base, rate)
+                    for side in ("over", "under"):
+                        priced = over[stat] if side == "over" else \
+                            odds_api.player_prop_prices(
+                                data_for[stat], mk, name, side="under")
+                        if not priced or priced.get("point") != line:
+                            continue       # both sides must share the point
+                        book_prices = priced["prices"]
+                        if kbacktest.K_MARKET_BOOKS:
+                            book_prices = {
+                                b: p for b, p in book_prices.items()
+                                if b.strip().lower() in kbacktest.K_MARKET_BOOKS}
+                        bp = odds_api.best_price(book_prices)
+                        if not bp:
+                            continue
+                        mkt_prob = _devig_market(data_for[stat], mk, name, bp[0])
+                        if mkt_prob is not None and side == "under":
+                            mkt_prob = 1 - mkt_prob
+                        hit = 1 if actual[stat] > line else 0
+                        won = hit if side == "over" else 1 - hit
+                        for arm, p_over in (("league", base),
+                                            ("pitcher", p_adj)):
+                            prob = p_over if side == "over" else 1 - p_over
+                            ev_pct = (prob * odds_api.american_to_decimal(bp[1])
+                                      - 1) * 100
+                            if ev_pct > VTBF_EV_MAX:
+                                suspect += 1
+                                continue   # >20% vs closing = error, not value
+                            if ev_pct < VTBF_EV_MIN:
+                                continue
+                            bets.append({
+                                "season": season, "date": date,
+                                "game_pk": game_pk, "pitcher": name,
+                                "arm": arm, "market": stat, "side": side,
+                                "line": line, "price": bp[1], "book": bp[0],
+                                "ev": round(ev_pct, 1),
+                                "prob": round(prob, 4),
+                                "market_prob": (round(mkt_prob, 4)
+                                                if mkt_prob is not None else None),
+                                "implied_tbf": n_tbf, "hit": won})
+        el = time.time() - t0
+        eta = (len(dates) - di - 1) * el / (di + 1)
+        progress(f"vtbf {season}: day {di + 1}/{len(dates)} — "
+                 f"{starts_priced} starts priced, {len(bets)} bets, "
+                 f"~{int(eta)}s left")
+    receipts = {k: kbacktest._fetch_stats[k] - fs0.get(k, 0)
+                for k in kbacktest._fetch_stats}
+    report = _vtbf_report(season, grid, bets, skips, receipts,
+                          starts_priced, suspect, pitcher_rate_missing,
+                          len(dates))
+    ts = time.time()
+    try:
+        with _conn() as c:
+            c.execute("INSERT INTO vtbf_runs VALUES (?,?,?)",
+                      (ts, season, json.dumps(report)))
+            for b in bets:
+                c.execute("INSERT INTO vtbf_bets VALUES "
+                          "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          (ts, b["season"], b["date"], b["game_pk"],
+                           b["pitcher"], b["arm"], b["market"], b["side"],
+                           b["line"], b["price"], b["book"], b["ev"],
+                           b["prob"], b["market_prob"], b["implied_tbf"],
+                           b["hit"]))
+    except Exception as e:
+        log.warning("vtbf: run store failed: %s", e)
+    return report
+
+
+def _vtbf_report(season, grid, bets, skips, receipts, starts_priced,
+                 suspect, rate_missing, days) -> dict:
+    def _stats(sub):
+        n = len(sub)
+        if not n:
+            return {"bets": 0}
+        units = sum(_bet_units(b["price"], b["hit"]) for b in sub)
+        wins = sum(b["hit"] for b in sub)
+        brier = sum((b["prob"] - b["hit"]) ** 2 for b in sub) / n
+        mkt = [b for b in sub if b["market_prob"] is not None]
+        mkt_brier = (sum((b["market_prob"] - b["hit"]) ** 2 for b in mkt)
+                     / len(mkt)) if mkt else None
+        return {"bets": n, "record": f"{wins}-{n - wins}",
+                "units": round(units, 2),
+                "roi_pct": round(100 * units / n, 1),
+                "brier": round(brier, 4),
+                "market_brier": round(mkt_brier, 4) if mkt_brier else None}
+
+    def _bands(sub):
+        cuts = ((2, 5), (5, 10), (10, 20.0001))
+        out = {}
+        for lo, hi in cuts:
+            band = [b for b in sub if lo <= b["ev"] < hi]
+            out[f"{lo}-{int(hi)}"] = _stats(band)
+        return out
+
+    by = {}
+    for arm in ("league", "pitcher"):
+        by[arm] = {"total": _stats([b for b in bets if b["arm"] == arm])}
+        for stat in VTBF_MARKETS:
+            sub = [b for b in bets if b["arm"] == arm and b["market"] == stat]
+            by[arm][stat] = _stats(sub)
+            by[arm][stat]["bands"] = _bands(sub)
+    return {
+        "season": season, "days_walked": days,
+        "grid_seasons": grid.seasons, "grid_starts": grid.n_starts,
+        "tbf_ratio": grid.tbf_ratio,
+        "per_bf_rates": {k: round(v, 4) for k, v in grid.rates.items()},
+        "starts_priced": starts_priced, "arms": by,
+        "skips": dict(sorted(skips.items(), key=lambda x: -x[1])),
+        "suspect_excluded": suspect,
+        "pitcher_rate_missing": rate_missing,
+        "odds_fetches": receipts,
+        "policy": f"closing lines, half-point only, flat 1u, "
+                  f"{VTBF_EV_MIN:g}-{VTBF_EV_MAX:g}% counted band, "
+                  f"main books per K_MARKET_BOOKS",
+        "note": ("outs market partially circular (its own line feeds the "
+                 "implied TBF); hits/walks are the cleaner referee"),
+    }
+
+
+def vtbf_history(limit: int = 12) -> list[dict]:
+    try:
+        with _conn() as c:
+            rows = c.execute("SELECT ts, season, report FROM vtbf_runs "
+                             "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+        return [{"ts": r[0], "season": r[1], "report": json.loads(r[2])}
+                for r in rows]
+    except Exception as e:
+        log.warning("vtbf history failed: %s", e)
+        return []
+
+
+def vtbf_bets_csv(run_ts: float | None = None) -> str:
+    cols = ("run_ts", "season", "date", "game_pk", "pitcher", "arm",
+            "market", "side", "line", "price", "book", "ev", "prob",
+            "market_prob", "implied_tbf", "hit")
+    q = "SELECT * FROM vtbf_bets"
+    args: tuple = ()
+    if run_ts:
+        q += " WHERE run_ts=?"
+        args = (run_ts,)
+    with _conn() as c:
+        rows = c.execute(q + " ORDER BY date", args).fetchall()
+    lines = [",".join(cols)]
+    for r in rows:
+        lines.append(",".join("" if v is None else str(v) for v in r))
+    return "\n".join(lines)
+
+
+def start_vtbf_async(seasons: list[int]) -> dict:
+    """One background job at a time -- shares the fetch runner's guard so
+    a season fetch and a market walk can't fight over the DB."""
+    seasons = sorted({int(x) for x in seasons if x})
+    if not seasons:
+        return {"started": False, "reason": "no seasons given"}
+    with _lock:
+        if _state["running"]:
+            return {"started": False, "reason": "already running",
+                    "progress": _state["progress"]}
+        _state.update({"running": True, "progress": "vtbf starting…",
+                       "started": time.time(), "error": ""})
+
+    def _work():
+        try:
+            for yr in seasons:
+                rep = run_vtbf_season(yr)
+                if rep.get("error"):
+                    with _lock:
+                        _state["error"] = f"{yr}: {rep['error']}"
+        except Exception as e:
+            log.exception("vtbf run failed")
+            with _lock:
+                _state["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            with _lock:
+                _state["running"] = False
+                _state["progress"] = "done"
+    threading.Thread(target=_work, daemon=True).start()
+    return {"started": True, "seasons": seasons}
+
+
 # ------------------------------------------------------------------ routes
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -754,6 +1257,11 @@ tr.focus td{background:#161a24}
 <h2>Full grids — every posted line at every BF</h2>
 <div class="row" id="stats"></div>
 <div id="out"></div>
+<h2>3. Vegas-TBF market backtest (uses Odds API credits)</h2>
+<div class="sub">implied TBF = outs + hits + walks lines × real TBF ratio → empirical grid → flat 1u vs closing prices. No outs line = start skipped (the gate). Grid from prior seasons only.</div>
+<div class="row"><input id="vyrs" style="width:200px" value="2023,2024,2025,2026"> <button onclick="runVtbf()">Run</button>
+<span class="sub">archive-first — a season re-run costs ~0 credits</span></div>
+<div id="vout"></div>
 <script>
 const $=s=>document.querySelector(s);
 const tok=new URLSearchParams(location.search).get('token')||'';
@@ -769,7 +1277,7 @@ async function refresh(){
  $('#fill').style.width=m?Math.round(100*m[1]/m[2])+'%':(s.state.running?'2%':'0%');
  const wasRunning=!!poll; if(!s.state.running&&poll){clearInterval(poll);poll=null;}
  cov=s.coverage||[]; renderCov(); renderYrs();
- if(!report||(wasRunning&&!s.state.running)){query();ask();}
+ if(!report||(wasRunning&&!s.state.running)){query();ask();loadVtbf();}
 }
 function renderCov(){
  if(!cov.length){$('#cov').innerHTML='<p class="sub">dataset empty — fetch a season</p>';return;}
@@ -800,6 +1308,41 @@ async function ask(){
  let h=`<h2>Over ${l.line} ${l.label.toLowerCase()} at every batters-faced checkpoint</h2><div class="scroll"><table><tr><th>n BF</th><th>starts</th><th>empirical</th><th>95% CI</th><th>fair</th><th>binomial</th></tr>`;
  for(const x of l.rows)h+=`<tr class="${x.n==+$('#qbf').value?'focus':''}"><td>${x.n}</td><td>${x.starts}</td><td><b>${pct(x.empirical)}</b></td><td>${pct(x.ci95[0])}–${pct(x.ci95[1])}</td><td>${x.fair}</td><td>${pct(x.binomial)}</td></tr>`;
  $('#ladder').innerHTML=h+'</table></div>';
+}
+async function runVtbf(){
+ const yrs=$('#vyrs').value.split(',').map(x=>+x.trim()).filter(Boolean);
+ const r=await fetch('/api/outs-lab/vtbf/run',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:tok,seasons:yrs})});
+ const j=await r.json(); if(j.error||j.reason)$('#prog').textContent=j.error||j.reason;
+ tick();
+}
+async function loadVtbf(){
+ const v=await (await fetch('/api/outs-lab/vtbf')).json();
+ renderVtbf(v.runs||[]);
+}
+function vrow(name,s){
+ if(!s||!s.bets)return `<tr><td>${name}</td><td colspan="5" class="sub">no bets</td></tr>`;
+ return `<tr><td>${name}</td><td>${s.bets}</td><td>${s.record}</td><td><b>${s.units>0?'+':''}${s.units}u</b></td><td>${s.roi_pct}%</td><td>${s.brier}${s.market_brier?' <span class="sub">mkt '+s.market_brier+'</span>':''}</td></tr>`;
+}
+function renderVtbf(runs){
+ if(!runs.length){$('#vout').innerHTML='<p class="sub">no runs yet</p>';return;}
+ let h='';
+ const seen=new Set();
+ for(const run of runs){
+  if(seen.has(run.season))continue; seen.add(run.season);
+  const r=run.report;
+  h+=`<h2>${r.season} — ${r.starts_priced} starts priced over ${r.days_walked} days · grid ${(r.grid_seasons||[]).join('/')} (${r.grid_starts} starts) · TBF ratio ${r.tbf_ratio}</h2>`;
+  for(const arm of ['league','pitcher']){
+   h+=`<div class="sub" style="margin-top:6px"><b>${arm} arm</b>${arm==='pitcher'?' (own trailing rate slotted in)':''}</div>`;
+   h+=`<div class="scroll"><table><tr><th>market</th><th>bets</th><th>W-L</th><th>units</th><th>ROI</th><th>Brier</th></tr>`;
+   const a=r.arms[arm];
+   h+=vrow('outs ⚠️ circular',a.outs)+vrow('hits',a.hits)+vrow('walks',a.walks)+vrow('TOTAL',a.total);
+   h+=`</table></div>`;
+  }
+  h+=`<div class="sub">skips: ${Object.entries(r.skips||{}).map(([k,v])=>k+' ×'+v).join(' · ')||'none'}</div>`;
+  h+=`<div class="sub">suspect >20% excluded: ${r.suspect_excluded} · pitcher-rate missing: ${r.pitcher_rate_missing} · credits: api ${r.odds_fetches?(r.odds_fetches.odds_api||0):0} / archive ${r.odds_fetches?(r.odds_fetches.odds_hit||0):0}</div>`;
+  h+=`<div class="sub">${r.policy} · ${r.note}</div>`;
+ }
+ $('#vout').innerHTML=h;
 }
 async function query(){
  const yrs=yrsPicked();
@@ -835,7 +1378,7 @@ function render(){
  html+=`</table>`;}
  $('#out').innerHTML=html;
 }
-refresh();
+refresh();loadVtbf();
 </script></body></html>"""
 
 
@@ -887,6 +1430,28 @@ def register(app):
             return line_ladder(stat, line, yrs)
         except Exception as e:
             return {"error": str(e)}
+
+    @app.get("/api/outs-lab/vtbf")
+    def outs_lab_vtbf():
+        return {"state": state(), "runs": vtbf_history()}
+
+    @app.post("/api/outs-lab/vtbf/run")
+    def outs_lab_vtbf_run(payload: dict):
+        if not lab_token or payload.get("token") != lab_token:
+            return {"error": "bad token"}
+        try:
+            yrs = payload.get("seasons") or [payload.get("season")]
+            return start_vtbf_async([int(x) for x in yrs if x])
+        except Exception as e:
+            return {"error": str(e)}
+
+    @app.get("/api/outs-lab/vtbf.csv")
+    def outs_lab_vtbf_csv(run_ts: float | None = None):
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(
+            vtbf_bets_csv(run_ts), media_type="text/csv",
+            headers={"Content-Disposition":
+                     "attachment; filename=vtbf_bets.csv"})
 
     @app.post("/api/outs-lab/run")
     def outs_lab_run(payload: dict):
