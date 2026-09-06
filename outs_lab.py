@@ -723,8 +723,8 @@ def start_async(seasons: list[int]) -> dict:
 # ============== Vegas-implied-TBF market backtest (Test 2) ==============
 # Mike's idea, built exactly as asked: the BOOK's own workload number --
 # implied TBF = outs line + hits line + walks line, scaled by the real
-# TBF/(O+H+BB) ratio measured from this dataset -- run through the
-# empirical conversion grid. No lineups, no log5, no calibration curve.
+# TBF/(O+H+BB) ratio measured from this dataset -- run through an
+# empirical conversion table. No lineups, no log5, no calibration curve.
 # Pitch counts, piggybacks, September management: all already priced
 # into the outs line, so workload guessing disappears.
 #
@@ -733,11 +733,20 @@ def start_async(seasons: list[int]) -> dict:
 # the population filter. Missing hits or walks line also skips (round 1
 # is strict -- imputing would smuggle a model into the model-free test).
 #
+# WHICH TABLE (the Sept 6 fix): a prop settles on the FINAL number, and
+# the book's implied TBF is a projection of the FINAL workload. So the
+# conversion must be P(final stat > line | final TBF = n) -- NOT the
+# "first n batters among starts that faced >= n" grid the lab shows for
+# the closed-form argument. That grid conditions on survivors (a pitcher
+# who reached batter 24 was cruising), so it read outs overs 8-10 points
+# too high, tripped the >20% suspect filter on half the slate, and lost
+# on the rest. Round-1 result (2023, -11%) was that bias, not the market.
+#
 # Honesty notes carried in every report: the outs market is partially
 # circular (its own line feeds the TBF that prices it) -- what the units
 # measure is whether books price outs CONSISTENTLY with their own
 # implied workload under the true empirical conversion. Hits and walks
-# are cleaner. The grid is built from PRIOR seasons only.
+# are cleaner. The table is built from PRIOR seasons only.
 
 VTBF_MARKETS = {"outs": "pitcher_outs", "hits": "pitcher_hits_allowed",
                 "walks": "pitcher_walks"}
@@ -747,36 +756,182 @@ VTBF_MIN_PITCHER_BF = int(os.getenv("VTBF_MIN_PITCHER_BF", "200"))
 VTBF_GRID_MIN_STARTS = 100
 PROPS_HISTORY_START = "2023-05-03"   # The Odds API has no props before this
 VTBF_EVENTS_SNAPSHOT = "16:00:00"    # noon-ET events list; odds at commence
+# The Odds API rate-limits bursts. The K walker never hit it because the
+# model work between calls paced it for free; this walker has no model
+# work, so it must pace itself. Minimum gap between API calls + backoff
+# on 429. Archive hits are not paced (no call is made).
+VTBF_MIN_GAP = float(os.getenv("VTBF_MIN_GAP", "0.6"))
+VTBF_RETRIES = 5
+
+_last_api_call = 0.0
+_http: dict = {}                     # status code -> count, per run
+
+
+def _paced_get(url: str, params: dict):
+    """One Odds API GET with a minimum gap and 429/5xx backoff. Returns
+    (status, json) -- status is what the report needs to see; the old
+    path swallowed non-200s into an empty list and the run read them as
+    'no events', which is how a whole season vanished silently."""
+    global _last_api_call
+    delay = 1.0
+    for attempt in range(VTBF_RETRIES):
+        wait = VTBF_MIN_GAP - (time.time() - _last_api_call)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = requests.get(url, params=params, timeout=25)
+        except Exception as e:
+            log.warning("vtbf: request failed: %s", e)
+            _last_api_call = time.time()
+            _http["exc"] = _http.get("exc", 0) + 1
+            time.sleep(delay)
+            delay = min(delay * 2, 16)
+            continue
+        _last_api_call = time.time()
+        st = resp.status_code
+        _http[str(st)] = _http.get(str(st), 0) + 1
+        if st == 200:
+            try:
+                return 200, resp.json()
+            except Exception:
+                return 200, None
+        if st == 429 or st >= 500:
+            ra = resp.headers.get("Retry-After")
+            try:
+                sleep_for = max(delay, float(ra)) if ra else delay
+            except ValueError:
+                sleep_for = delay
+            log.warning("vtbf: %s from odds api (attempt %d) -- sleeping %.1fs",
+                        st, attempt + 1, sleep_for)
+            time.sleep(sleep_for)
+            delay = min(delay * 2, 16)
+            continue
+        log.warning("vtbf: odds api %s: %s", st, resp.text[:150])
+        return st, None
+    return 429, None
+
+
+def _hist_events_paced(snapshot: str) -> tuple[list, str | None]:
+    """Archive-first events list (same k_events_archive table as the K
+    walker, so both share one credit pool). Returns (events, failure)
+    where failure names the HTTP status when the API refused."""
+    import kbacktest
+    try:
+        with kbacktest._archive_conn() as c:
+            row = c.execute("SELECT payload FROM k_events_archive WHERE snapshot=?",
+                            (snapshot,)).fetchone()
+        if row:
+            kbacktest._fetch_stats["events_hit"] += 1
+            return json.loads(row[0]), None
+    except Exception as e:
+        log.warning("vtbf: events archive read failed: %s", e)
+    if not odds_api.API_KEY:
+        return [], "no_api_key"
+    st, body = _paced_get(f"{odds_api.HIST_BASE}/events",
+                          {"apiKey": odds_api.API_KEY, "date": snapshot})
+    kbacktest._fetch_stats["events_api"] += 1
+    if st != 200:
+        return [], f"http_{st}"
+    events = (body or {}).get("data") or []
+    if events:
+        try:
+            with kbacktest._archive_conn() as c:
+                c.execute("INSERT OR IGNORE INTO k_events_archive VALUES (?,?)",
+                          (snapshot, json.dumps(events)))
+        except Exception as e:
+            log.warning("vtbf: events archive write failed: %s", e)
+    return events, None
+
+
+def _hist_odds_paced(event_id: str, snapshot: str,
+                     market: str) -> tuple[dict | None, str | None]:
+    """Archive-first event odds for ONE market (same k_odds_archive table,
+    market in the key -- the credit is spent once per event/snapshot/
+    market for the life of the DB). Returns (data, failure)."""
+    import kbacktest
+    try:
+        with kbacktest._archive_conn() as c:
+            row = c.execute(
+                "SELECT payload FROM k_odds_archive WHERE event_id=? AND snapshot=? AND market=?",
+                (event_id, snapshot, market)).fetchone()
+        if row:
+            kbacktest._fetch_stats["odds_hit"] += 1
+            return json.loads(row[0]), None
+    except Exception as e:
+        log.warning("vtbf: odds archive read failed: %s", e)
+    if not odds_api.API_KEY or not event_id:
+        return None, "no_api_key"
+    st, body = _paced_get(
+        f"{odds_api.HIST_BASE}/events/{event_id}/odds",
+        {"apiKey": odds_api.API_KEY, "regions": odds_api.REGIONS,
+         "markets": market, "oddsFormat": "american", "date": snapshot})
+    kbacktest._fetch_stats["odds_api"] += 1
+    if st != 200:
+        return None, f"http_{st}"
+    data = (body or {}).get("data")
+    if data:
+        try:
+            with kbacktest._archive_conn() as c:
+                c.execute("INSERT OR IGNORE INTO k_odds_archive VALUES (?,?,?,?)",
+                          (event_id, snapshot, market, json.dumps(data)))
+        except Exception as e:
+            log.warning("vtbf: odds archive write failed: %s", e)
+    return data, None
 
 
 class VtbfGrid:
-    """P(over line | first n batters) from PRIOR seasons' stored starts.
-    Values per (stat, n) kept sorted so any line is a bisect away."""
+    """P(final stat > line | final TBF = n), from PRIOR seasons' stored
+    starts. Exact-n cells when they have >= VTBF_GRID_MIN_STARTS starts,
+    else the n-1..n+1 window, else None (reported as thin_grid_cell).
+    Final values per (stat, n) kept sorted so any line is a bisect away.
 
-    def __init__(self, seasons: list[int]):
+    `mode` is stamped into every report so a run can never be misread:
+      final    -- the settlement conditioning (default, correct for props)
+      survivor -- the lab's first-n-batters grid (kept only for A/B)."""
+
+    FINAL_KEY = {"outs": "outs", "hits": "cum_hits", "walks": "cum_walks",
+                 "ks": "cum_ks"}
+
+    def __init__(self, seasons: list[int], mode: str = "final"):
         starts = cached_starts(seasons)
         if not starts:
             raise ValueError(f"no stored starts for prior seasons {seasons}")
+        self.mode = mode
         self.seasons = sorted(set(seasons))
         self.n_starts = len(starts)
         tbf_tot = sum(s["tbf"] for s in starts)
         self.rates: dict = {}
         self.vals: dict = {}
+        self.cell_n: dict = {}           # (stat, n) -> starts behind the cell
         for st, key in CUM_KEY.items():
             tot = sum(s[key][-1] for s in starts if s.get(key))
             self.rates[st] = tot / tbf_tot if tbf_tot else 0.0
             per_n = {}
+            fk = self.FINAL_KEY[st]
             for n in N_RANGE:
-                vs = sorted(s[key][n - 1] for s in starts
-                            if s["tbf"] >= n and s.get(key))
+                if mode == "survivor":
+                    vs = [s[key][n - 1] for s in starts
+                          if s["tbf"] >= n and s.get(key)]
+                else:
+                    vs = [self._final(s, fk) for s in starts
+                          if s["tbf"] == n and s.get(key)]
+                    if len(vs) < VTBF_GRID_MIN_STARTS:
+                        vs = [self._final(s, fk) for s in starts
+                              if abs(s["tbf"] - n) <= 1 and s.get(key)]
                 if len(vs) >= VTBF_GRID_MIN_STARTS:
-                    per_n[n] = vs
+                    per_n[n] = sorted(vs)
+                    self.cell_n[(st, n)] = len(vs)
             self.vals[st] = per_n
         # outs uses the recorded total (incl. runner outs after the last
         # PA) -- the same number the boxscore and the outs prop settle on.
         ohw = sum(s["outs"] + s["cum_hits"][-1] + s["cum_walks"][-1]
                   for s in starts if s.get("cum_hits") and s.get("cum_walks"))
         self.tbf_ratio = round(tbf_tot / ohw, 4) if ohw else 1.0
+
+    @staticmethod
+    def _final(s: dict, fk: str) -> int:
+        v = s[fk]
+        return v if isinstance(v, int) else v[-1]
 
     def _p_at(self, stat: str, k: int, n: int) -> float | None:
         vs = self.vals.get(stat, {}).get(n)
@@ -922,7 +1077,8 @@ def _bet_units(price: int, hit: int) -> float:
     return round(odds_api.american_to_decimal(price) - 1, 4) if hit else -1.0
 
 
-def run_vtbf_season(season: int, progress=None) -> dict:
+def run_vtbf_season(season: int, progress=None,
+                    grid_mode: str = "final") -> dict:
     """One season, closing lines, archive-first. Grid from PRIOR stored
     seasons only; pitcher trailing rates strictly before each date."""
     import kbacktest                     # lazy: archive helpers + book policy
@@ -934,7 +1090,7 @@ def run_vtbf_season(season: int, progress=None) -> dict:
     if not prior:
         return {"error": f"no stored seasons before {season} to build the "
                          "grid from -- the grid must be point-in-time"}
-    grid = VtbfGrid(prior)
+    grid = VtbfGrid(prior, mode=grid_mode)
     pit_idx = pitcher_history(stored)
     season_starts = load_starts([season])
     by_date: dict = {}
@@ -948,6 +1104,7 @@ def run_vtbf_season(season: int, progress=None) -> dict:
         return {"error": f"no stored {season} starts on/after "
                          f"{PROPS_HISTORY_START} (props history floor)"}
     fs0 = dict(kbacktest._fetch_stats)
+    _http.clear()
     skips: dict = {}
 
     def skip(cause, n=1):
@@ -957,7 +1114,9 @@ def run_vtbf_season(season: int, progress=None) -> dict:
     bets: list = []
     starts_priced = 0
     suspect = 0
+    suspect_by: dict = {}
     pitcher_rate_missing = 0
+    tbf_resid: list = []                 # actual TBF - implied TBF, per priced start
     t0 = time.time()
     for di, date in enumerate(dates):
         try:
@@ -966,7 +1125,10 @@ def run_vtbf_season(season: int, progress=None) -> dict:
             log.warning("vtbf: schedule failed %s: %s", date, e)
             skip("schedule_failed", sum(len(v) for v in by_date[date].values()))
             continue
-        hist_events = kbacktest._hist_events(f"{date}T{VTBF_EVENTS_SNAPSHOT}Z")
+        hist_events, fail = _hist_events_paced(f"{date}T{VTBF_EVENTS_SNAPSHOT}Z")
+        if fail:
+            skip(f"events_{fail}", sum(len(v) for v in by_date[date].values()))
+            continue
         if not hist_events:
             skip("no_events_snapshot", sum(len(v) for v in by_date[date].values()))
             continue
@@ -980,9 +1142,12 @@ def run_vtbf_season(season: int, progress=None) -> dict:
                 skip("no_event_match", len(sts))
                 continue
             close_at = ev.get("commence_time") or f"{date}T23:00:00Z"
-            outs_data = kbacktest._hist_odds(ev.get("id"), close_at,
-                                             VTBF_MARKETS["outs"])
-            if not outs_data:
+            outs_data, fail = _hist_odds_paced(ev.get("id"), close_at,
+                                               VTBF_MARKETS["outs"])
+            if fail:
+                skip(f"outs_{fail}", len(sts))
+                continue
+            if not outs_data or not outs_data.get("bookmakers"):
                 skip("no_outs_market", len(sts))
                 continue                 # hits/walks never fetched: no credits
             hits_data = walks_data = None
@@ -998,10 +1163,14 @@ def run_vtbf_season(season: int, progress=None) -> dict:
                     skip("no_outs_line")   # THE GATE -- Mike's rule
                     continue
                 if hits_data is None:      # outs line exists: now worth paying
-                    hits_data = kbacktest._hist_odds(
+                    hits_data, f1 = _hist_odds_paced(
                         ev.get("id"), close_at, VTBF_MARKETS["hits"])
-                    walks_data = kbacktest._hist_odds(
+                    walks_data, f2 = _hist_odds_paced(
                         ev.get("id"), close_at, VTBF_MARKETS["walks"])
+                    if f1 or f2:
+                        skip(f"hits_walks_{f1 or f2}")
+                        hits_data = hits_data or {}
+                        walks_data = walks_data or {}
                 over["hits"] = odds_api.player_prop_prices(
                     hits_data, VTBF_MARKETS["hits"], name, side="over")
                 over["walks"] = odds_api.player_prop_prices(
@@ -1016,6 +1185,7 @@ def run_vtbf_season(season: int, progress=None) -> dict:
                     skip("implied_tbf_out_of_range")
                     continue
                 starts_priced += 1
+                tbf_resid.append(s["tbf"] - n_tbf)
                 actual = {"outs": s["outs"], "hits": s["cum_hits"][-1],
                           "walks": s["cum_walks"][-1]}
                 data_for = {"outs": outs_data, "hits": hits_data,
@@ -1061,6 +1231,8 @@ def run_vtbf_season(season: int, progress=None) -> dict:
                                       - 1) * 100
                             if ev_pct > VTBF_EV_MAX:
                                 suspect += 1
+                                sk = f"{stat}_{side}"
+                                suspect_by[sk] = suspect_by.get(sk, 0) + 1
                                 continue   # >20% vs closing = error, not value
                             if ev_pct < VTBF_EV_MIN:
                                 continue
@@ -1078,12 +1250,14 @@ def run_vtbf_season(season: int, progress=None) -> dict:
         eta = (len(dates) - di - 1) * el / (di + 1)
         progress(f"vtbf {season}: day {di + 1}/{len(dates)} — "
                  f"{starts_priced} starts priced, {len(bets)} bets, "
+                 f"api {kbacktest._fetch_stats['odds_api'] - fs0['odds_api']} "
+                 f"/ archive {kbacktest._fetch_stats['odds_hit'] - fs0['odds_hit']}, "
                  f"~{int(eta)}s left")
     receipts = {k: kbacktest._fetch_stats[k] - fs0.get(k, 0)
                 for k in kbacktest._fetch_stats}
     report = _vtbf_report(season, grid, bets, skips, receipts,
                           starts_priced, suspect, pitcher_rate_missing,
-                          len(dates))
+                          len(dates), tbf_resid, suspect_by, dict(_http))
     ts = time.time()
     try:
         with _conn() as c:
@@ -1103,7 +1277,8 @@ def run_vtbf_season(season: int, progress=None) -> dict:
 
 
 def _vtbf_report(season, grid, bets, skips, receipts, starts_priced,
-                 suspect, rate_missing, days) -> dict:
+                 suspect, rate_missing, days, tbf_resid=None,
+                 suspect_by=None, http=None) -> dict:
     def _stats(sub):
         n = len(sub)
         if not n:
@@ -1135,9 +1310,31 @@ def _vtbf_report(season, grid, bets, skips, receipts, starts_priced,
             sub = [b for b in bets if b["arm"] == arm and b["market"] == stat]
             by[arm][stat] = _stats(sub)
             by[arm][stat]["bands"] = _bands(sub)
+
+    resid = None
+    if tbf_resid:
+        m = sum(tbf_resid) / len(tbf_resid)
+        sd = (sum((x - m) ** 2 for x in tbf_resid) / max(1, len(tbf_resid) - 1)) ** .5
+        within2 = sum(1 for x in tbf_resid if abs(x) <= 2) / len(tbf_resid)
+        resid = {"n": len(tbf_resid), "mean": round(m, 2), "sd": round(sd, 2),
+                 "within_2": round(within2, 3)}
+
+    # Surface the receipts through fields the tab already renders, so the
+    # UI needs no change to show them: HTTP statuses ride in `skips`,
+    # the grid mode + TBF residuals ride in `policy`/`note`.
+    skips = dict(skips)
+    for st, n in (http or {}).items():
+        if st != "200":
+            skips[f"odds_api_http_{st}"] = skips.get(f"odds_api_http_{st}", 0) + n
+    for k, n in (suspect_by or {}).items():
+        skips[f"suspect_{k}"] = n
+    resid_txt = (f" · TBF residual (actual − implied): mean {resid['mean']:+}, "
+                 f"sd {resid['sd']}, {int(resid['within_2'] * 100)}% within ±2"
+                 if resid else "")
     return {
         "season": season, "days_walked": days,
         "grid_seasons": grid.seasons, "grid_starts": grid.n_starts,
+        "grid_mode": grid.mode,
         "tbf_ratio": grid.tbf_ratio,
         "per_bf_rates": {k: round(v, 4) for k, v in grid.rates.items()},
         "starts_priced": starts_priced, "arms": by,
@@ -1145,11 +1342,17 @@ def _vtbf_report(season, grid, bets, skips, receipts, starts_priced,
         "suspect_excluded": suspect,
         "pitcher_rate_missing": rate_missing,
         "odds_fetches": receipts,
-        "policy": f"closing lines, half-point only, flat 1u, "
+        "http": http or {},
+        "tbf_residual": resid,
+        "policy": f"grid = P(final stat > line | final TBF) from prior seasons "
+                  f"[{grid.mode}] · closing lines, half-point only, flat 1u, "
                   f"{VTBF_EV_MIN:g}-{VTBF_EV_MAX:g}% counted band, "
-                  f"main books per K_MARKET_BOOKS",
+                  f"main books per K_MARKET_BOOKS · api calls (not credits): "
+                  f"events {receipts.get('events_api', 0)} / odds "
+                  f"{receipts.get('odds_api', 0)}, archive hits events "
+                  f"{receipts.get('events_hit', 0)} / odds {receipts.get('odds_hit', 0)}",
         "note": ("outs market partially circular (its own line feeds the "
-                 "implied TBF); hits/walks are the cleaner referee"),
+                 "implied TBF); hits/walks are the cleaner referee" + resid_txt),
     }
 
 
@@ -1182,12 +1385,53 @@ def vtbf_bets_csv(run_ts: float | None = None) -> str:
     return "\n".join(lines)
 
 
-def start_vtbf_async(seasons: list[int]) -> dict:
+def vtbf_probe(date: str, market: str = "pitcher_outs") -> dict:
+    """One day, one game, one market -- the raw shape of what the Odds
+    API returns, so 'no outs market' can never be a mystery again.
+    Costs ~1 credit for the events list + ~10 for the odds (archive-first,
+    so a repeat is free). Read-only otherwise."""
+    _http.clear()
+    events, fail = _hist_events_paced(f"{date}T{VTBF_EVENTS_SNAPSHOT}Z")
+    out = {"date": date, "market": market, "events_failure": fail,
+           "events": len(events), "http": dict(_http)}
+    if not events:
+        return out
+    ev = events[0]
+    out["event"] = {"id": ev.get("id"), "home": ev.get("home_team"),
+                    "away": ev.get("away_team"),
+                    "commence": ev.get("commence_time")}
+    close_at = ev.get("commence_time") or f"{date}T23:00:00Z"
+    data, fail = _hist_odds_paced(ev.get("id"), close_at, market)
+    out["odds_failure"] = fail
+    out["http"] = dict(_http)
+    if not data:
+        out["odds"] = None
+        return out
+    books = []
+    for b in data.get("bookmakers") or []:
+        mkts = {m.get("key"): len(m.get("outcomes") or [])
+                for m in b.get("markets") or []}
+        books.append({"book": b.get("title"), "markets": mkts})
+    sample = None
+    for b in data.get("bookmakers") or []:
+        for m in b.get("markets") or []:
+            if m.get("key") == market and m.get("outcomes"):
+                sample = m["outcomes"][:4]
+                break
+        if sample:
+            break
+    out["odds"] = {"books": books, "sample_outcomes": sample}
+    return out
+
+
+def start_vtbf_async(seasons: list[int], grid_mode: str = "final") -> dict:
     """One background job at a time -- shares the fetch runner's guard so
     a season fetch and a market walk can't fight over the DB."""
     seasons = sorted({int(x) for x in seasons if x})
     if not seasons:
         return {"started": False, "reason": "no seasons given"}
+    if grid_mode not in ("final", "survivor"):
+        return {"started": False, "reason": "grid_mode must be final|survivor"}
     with _lock:
         if _state["running"]:
             return {"started": False, "reason": "already running",
@@ -1198,7 +1442,7 @@ def start_vtbf_async(seasons: list[int]) -> dict:
     def _work():
         try:
             for yr in seasons:
-                rep = run_vtbf_season(yr)
+                rep = run_vtbf_season(yr, grid_mode=grid_mode)
                 if rep.get("error"):
                     with _lock:
                         _state["error"] = f"{yr}: {rep['error']}"
@@ -1211,7 +1455,7 @@ def start_vtbf_async(seasons: list[int]) -> dict:
                 _state["running"] = False
                 _state["progress"] = "done"
     threading.Thread(target=_work, daemon=True).start()
-    return {"started": True, "seasons": seasons}
+    return {"started": True, "seasons": seasons, "grid_mode": grid_mode}
 
 
 # ------------------------------------------------------------------ routes
@@ -1236,6 +1480,7 @@ tr.focus td{background:#161a24}
 .hl b{font-size:22px}.warn{color:#f0b26b}.err{color:#f28b82}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
 .scroll{overflow-x:auto}label{margin-right:8px;white-space:nowrap}
+pre{background:#161a24;padding:8px;border-radius:6px;font-size:11px;overflow-x:auto}
 </style></head><body>
 <h1>Outs Lab</h1>
 <div class="sub">MLB play-by-play only — free, no lines, no model. Every number is a count of real starts.</div>
@@ -1258,9 +1503,13 @@ tr.focus td{background:#161a24}
 <div class="row" id="stats"></div>
 <div id="out"></div>
 <h2>3. Vegas-TBF market backtest (uses Odds API credits)</h2>
-<div class="sub">implied TBF = outs + hits + walks lines × real TBF ratio → empirical grid → flat 1u vs closing prices. No outs line = start skipped (the gate). Grid from prior seasons only.</div>
+<div class="sub">implied TBF = outs + hits + walks lines × real TBF ratio → P(final stat &gt; line | final TBF) from prior seasons → flat 1u vs closing prices. No outs line = start skipped (the gate).</div>
 <div class="row"><input id="vyrs" style="width:200px" value="2023,2024,2025,2026"> <button onclick="runVtbf()">Run</button>
 <span class="sub">archive-first — a season re-run costs ~0 credits</span></div>
+<div class="row"><label>probe one day <input id="pdate" style="width:110px" value="2025-06-15"></label>
+<select id="pmkt"><option>pitcher_outs</option><option>pitcher_hits_allowed</option><option>pitcher_walks</option><option>pitcher_strikeouts</option></select>
+<button onclick="probe()">Probe</button><span class="sub">~11 credits first time, then free — shows the raw Odds API shape</span></div>
+<pre id="probe" style="display:none"></pre>
 <div id="vout"></div>
 <script>
 const $=s=>document.querySelector(s);
@@ -1273,7 +1522,7 @@ function tick(){if(poll)clearInterval(poll);poll=setInterval(refresh,1500);refre
 async function refresh(){
  const s=await (await fetch('/api/outs-lab')).json();
  $('#prog').textContent=(s.state.running?'running: ':'')+(s.state.progress||'idle')+(s.state.error?' — '+s.state.error:'');
- const m=/game (\\d+)\\/(\\d+)/.exec(s.state.progress||'');
+ const m=/(?:game|day) (\\d+)\\/(\\d+)/.exec(s.state.progress||'');
  $('#fill').style.width=m?Math.round(100*m[1]/m[2])+'%':(s.state.running?'2%':'0%');
  const wasRunning=!!poll; if(!s.state.running&&poll){clearInterval(poll);poll=null;}
  cov=s.coverage||[]; renderCov(); renderYrs();
@@ -1315,6 +1564,11 @@ async function runVtbf(){
  const j=await r.json(); if(j.error||j.reason)$('#prog').textContent=j.error||j.reason;
  tick();
 }
+async function probe(){
+ const el=$('#probe'); el.style.display='block'; el.textContent='probing…';
+ const r=await fetch('/api/outs-lab/vtbf/probe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:tok,date:$('#pdate').value,market:$('#pmkt').value})});
+ el.textContent=JSON.stringify(await r.json(),null,1);
+}
 async function loadVtbf(){
  const v=await (await fetch('/api/outs-lab/vtbf')).json();
  renderVtbf(v.runs||[]);
@@ -1330,7 +1584,7 @@ function renderVtbf(runs){
  for(const run of runs){
   if(seen.has(run.season))continue; seen.add(run.season);
   const r=run.report;
-  h+=`<h2>${r.season} — ${r.starts_priced} starts priced over ${r.days_walked} days · grid ${(r.grid_seasons||[]).join('/')} (${r.grid_starts} starts) · TBF ratio ${r.tbf_ratio}</h2>`;
+  h+=`<h2>${r.season} — ${r.starts_priced} starts priced over ${r.days_walked} days · grid ${(r.grid_seasons||[]).join('/')} (${r.grid_starts} starts, ${r.grid_mode||'survivor'}) · TBF ratio ${r.tbf_ratio}</h2>`;
   for(const arm of ['league','pitcher']){
    h+=`<div class="sub" style="margin-top:6px"><b>${arm} arm</b>${arm==='pitcher'?' (own trailing rate slotted in)':''}</div>`;
    h+=`<div class="scroll"><table><tr><th>market</th><th>bets</th><th>W-L</th><th>units</th><th>ROI</th><th>Brier</th></tr>`;
@@ -1339,7 +1593,7 @@ function renderVtbf(runs){
    h+=`</table></div>`;
   }
   h+=`<div class="sub">skips: ${Object.entries(r.skips||{}).map(([k,v])=>k+' ×'+v).join(' · ')||'none'}</div>`;
-  h+=`<div class="sub">suspect >20% excluded: ${r.suspect_excluded} · pitcher-rate missing: ${r.pitcher_rate_missing} · credits: api ${r.odds_fetches?(r.odds_fetches.odds_api||0):0} / archive ${r.odds_fetches?(r.odds_fetches.odds_hit||0):0}</div>`;
+  h+=`<div class="sub">suspect >20% excluded: ${r.suspect_excluded} · pitcher-rate missing: ${r.pitcher_rate_missing}</div>`;
   h+=`<div class="sub">${r.policy} · ${r.note}</div>`;
  }
  $('#vout').innerHTML=h;
@@ -1441,9 +1695,21 @@ def register(app):
             return {"error": "bad token"}
         try:
             yrs = payload.get("seasons") or [payload.get("season")]
-            return start_vtbf_async([int(x) for x in yrs if x])
+            return start_vtbf_async([int(x) for x in yrs if x],
+                                    grid_mode=payload.get("grid_mode") or "final")
         except Exception as e:
             return {"error": str(e)}
+
+    @app.post("/api/outs-lab/vtbf/probe")
+    def outs_lab_vtbf_probe(payload: dict):
+        """Raw Odds API shape for one day/market -- ends the guessing."""
+        if not lab_token or payload.get("token") != lab_token:
+            return {"error": "bad token"}
+        try:
+            return vtbf_probe(str(payload.get("date") or ""),
+                              str(payload.get("market") or "pitcher_outs"))
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
 
     @app.get("/api/outs-lab/vtbf.csv")
     def outs_lab_vtbf_csv(run_ts: float | None = None):
