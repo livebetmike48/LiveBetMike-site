@@ -392,7 +392,13 @@ def run_pp_market_backtest(days: int, market: str, progress=None,
                 data = kbacktest._hist_odds(eid, commence, odds_key)
             except Exception:
                 continue
-            books = ((data or {}).get("data") or {}).get("bookmakers") or []
+            # _hist_odds already unwraps the API's "data" envelope and returns
+            # the event object (bookmakers at top level) -- the K market test
+            # reads it that way. Unwrapping twice found zero books every time.
+            d = data or {}
+            if "bookmakers" not in d and isinstance(d.get("data"), dict):
+                d = d["data"]
+            books = d.get("bookmakers") or []
             quotes: dict = {}
             for bk in books:
                 for m0 in bk.get("markets") or []:
