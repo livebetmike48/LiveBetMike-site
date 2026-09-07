@@ -827,143 +827,17 @@ async function renderLab() {
     main.appendChild(warn);
   }
 
-  // Run controls + status
+  // Lab token only -- the hitter model's run controls, knobs, priors,
+  // market test, history and roadmap were RETIRED from this tab (Sept
+  // 2026, Mike's call). The K model below and the pitcher props / Outs
+  // Lab tabs are the live research surfaces. Backend routes untouched.
   const ctl = document.createElement("div");
   ctl.className = "winrow";
   ctl.innerHTML = `
-    <select id="lab-days"><option>3</option><option>5</option><option selected>7</option><option>10</option><option>14</option><option>21</option><option>30</option><option>45</option><option>60</option><option>90</option><option>120</option></select>
-    <button class="winbtn" onclick="labRun()">Run backtest</button>
     <input id="lab-token" type="password" placeholder="lab token" style="background:var(--panel-2);color:var(--white);border:1.5px solid var(--line);border-radius:6px;padding:6px 10px;font-family:'IBM Plex Mono',monospace;font-size:12px;width:130px">
-    <span class="meta" id="lab-status">${j.run.status === "running" ? "⏳ " + j.run.progress : (j.run.progress || "idle")}</span>
-    <a class="winbtn" href="/api/lab/export.csv" style="text-decoration:none">Export CSV → Sheets</a>`;
+    <span class="meta">used by every runner on this tab · pitcher props live in <b>Pitcher Props</b> and <b>Outs Lab</b></span>`;
   main.appendChild(ctl);
-  if (j.run.status === "running") setTimeout(renderLab, 6000);
-
-  // Knobs
-  const cfgHdr = document.createElement("div");
-  cfgHdr.className = "gamehdr";
-  cfgHdr.textContent = "Model knobs (recorded with every run)";
-  main.appendChild(cfgHdr);
-  const cfgBox = document.createElement("div");
-  cfgBox.className = "board";
-  let cfgHtml = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Knob</th><th>Value</th><th style='text-align:left'>Note</th></tr></thead><tbody>";
-  for (const [key, k] of Object.entries(j.config)) {
-    cfgHtml += `<tr><td class="name" style="cursor:default">${k.label}</td>
-      <td><input data-key="${key}" value="${k.value}" style="width:70px;background:transparent;color:var(--blue);border:1px solid var(--line);border-radius:4px;text-align:right;font-family:'IBM Plex Mono',monospace"></td>
-      <td style="text-align:left;color:#7a8694;font-family:Inter">${k.note}</td></tr>`;
-  }
-  cfgHtml += "</tbody></table>";
-  cfgBox.innerHTML = cfgHtml;
-  main.appendChild(cfgBox);
-  const saveRow = document.createElement("div");
-  saveRow.className = "winrow";
-  saveRow.innerHTML = `<button class="winbtn" onclick="labSaveConfig()">Save knobs</button><span class="meta">changes apply to the NEXT run — compare Brier across runs to judge them</span>`;
-  main.appendChild(saveRow);
-
-  // Player priors upload (e.g. preseason Steamer export from FanGraphs)
-  const priHdr = document.createElement("div");
-  priHdr.className = "gamehdr";
-  priHdr.textContent = `Player priors (${j.priors_loaded || 0} loaded)`;
-  main.appendChild(priHdr);
-  const pri = document.createElement("div");
-  pri.className = "winrow";
-  pri.innerHTML = `
-    <input type="file" id="priors-file" accept=".csv" style="color:var(--gray);font-family:'IBM Plex Mono',monospace;font-size:11px;max-width:230px">
-    <button class="winbtn" onclick="labUploadPriors()">Upload priors CSV</button>
-    <span class="meta">projections export with Name/PA/H (use PRE-SEASON projections for backtests — rest-of-season leaks future data). Set the prior weight knob above to use them.</span>`;
-  main.appendChild(pri);
-
-  // Market test: model vs real closing lines
-  const mHdr = document.createElement("div");
-  mHdr.className = "gamehdr";
-  mHdr.textContent = "Market test — model vs closing lines (units won/lost)";
-  main.appendChild(mHdr);
-  const mCtl = document.createElement("div");
-  mCtl.className = "winrow";
-  mCtl.innerHTML = `
-    <select id="market-days"><option>7</option><option selected>14</option><option>30</option><option>60</option><option>120</option></select>
-    <button class="winbtn" onclick="marketRun()">Run market test</button>
-    <span class="meta" id="market-status">${j.market && j.market.status === "running" ? "⏳ " + j.market.progress : (j.market && j.market.progress || "uses historical odds, all US books both tiers (~20 credits/game): 14d ≈ 3K, 30d ≈ 6K, season ≈ 28K")}</span>`;
-  main.appendChild(mCtl);
-  if (j.market && j.market.status === "running") setTimeout(renderLab, 8000);
-  for (const run of (j.market_history || [])) {
-    const rep = run.report;
-    const box = document.createElement("div");
-    box.className = "board";
-    box.style.marginBottom = "14px";
-    const when = new Date(run.ts * 1000).toLocaleString();
-    let h = `<div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">`;
-    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.games_priced} games priced (~${rep.credits_estimate} credits)${rep.vs_open ? " — <span style='color:#e0a12f'>vs OPENING lines</span>" : ""}</div>`;
-    if (rep.clv) {
-      const c = rep.clv;
-      const col = c.agree_pct > 52 ? "#4caf7d" : (c.agree_pct < 48 ? "#d7483a" : "#7a8694");
-      h += `<div style="margin-top:4px">CLV: close moved <b style="color:${col}">toward the model ${c.agree_pct != null ? c.agree_pct + "%" : "–"}</b> of decided moves (${c.toward} toward / ${c.against} against / ${c.flat} flat, n=${c.n}) — the market voting on the model all season</div>`;
-    }
-    h += `<table style="margin-top:8px"><thead><tr><th style='text-align:left'>EV ≥</th><th>Bets</th><th>W</th><th>Units</th><th>ROI</th><th>Overs u</th><th>Unders u</th></tr></thead><tbody>`;
-    for (const thr of ["2", "5", "10"]) {
-      const t = (rep.by_threshold || {})[thr];
-      if (!t) continue;
-      const col = t.units > 0 ? "#4caf7d" : (t.units < 0 ? "#d7483a" : "#7a8694");
-      h += `<tr><td style="text-align:left">+${thr}%</td><td>${t.bets}</td><td>${t.wins}</td>
-        <td style="color:${col};font-weight:600">${t.units > 0 ? "+" : ""}${t.units}u</td>
-        <td>${t.roi_pct != null ? t.roi_pct + "%" : "–"}</td>
-        <td>${t.over_units > 0 ? "+" : ""}${t.over_units}u (${t.over_bets})</td>
-        <td>${t.under_units > 0 ? "+" : ""}${t.under_units}u (${t.under_bets})</td></tr>`;
-    }
-    h += "</tbody></table>";
-    if (rep.sample_bets && rep.sample_bets.length) {
-      h += `<div style="margin-top:8px;color:#7a8694">Biggest edges: ` +
-        rep.sample_bets.slice(0, 6).map(b => `${b.name} ${b.side} ${b.price > 0 ? "+" : ""}${b.price} (EV +${b.ev}%) ${b.side === "over" ? (b.hit ? "✅" : "❌") : (b.hit ? "❌" : "✅")}`).join(" · ") + `</div>`;
-    }
-    h += "</div>";
-    box.innerHTML = h;
-    main.appendChild(box);
-  }
-
-  // Latest run + history
-  const hist = j.history || [];
-  const runHdr = document.createElement("div");
-  runHdr.className = "gamehdr";
-  runHdr.textContent = hist.length ? "Backtest history" : "No runs yet — fire the first one";
-  main.appendChild(runHdr);
-  for (const run of hist) {
-    const rep = run.report;
-    const box = document.createElement("div");
-    box.className = "board";
-    box.style.marginBottom = "14px";
-    const when = new Date(run.ts * 1000).toLocaleString();
-    let h = `<div style="padding:12px 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px">`;
-    h += `<div style="color:var(--blue);font-weight:600">${when} — ${run.days} days — ${rep.n} predictions</div>`;
-    h += `<div style="margin:6px 0">Brier: model <b style="color:var(--white)">${rep.brier_model}</b> vs constant ${rep.brier_constant}${rep.brier_naive != null ? " vs naive " + rep.brier_naive : ""} (lower wins)`;
-    const beats = rep.brier_model < rep.brier_constant && (rep.brier_naive == null || rep.brier_model < rep.brier_naive);
-    h += beats ? ` <span style="color:#4caf7d">✅ beats baselines</span>` : ` <span style="color:#e0a12f">⚠️ not clearly better — don't ship</span>`;
-    h += `</div><div style="color:#7a8694">knobs: ${Object.entries(run.config).map(([k,v]) => k+"="+v).join(", ")}</div>`;
-    h += `<table style="margin-top:8px"><thead><tr><th style='text-align:left'>Bucket</th><th>n</th><th>Predicted</th><th>Actual</th><th style='text-align:left'>Gap</th></tr></thead><tbody>`;
-    for (const c of (rep.calibration || [])) {
-      const gap = (c.actual - c.predicted).toFixed(1);
-      const col = Math.abs(gap) < 3 ? "#4caf7d" : (Math.abs(gap) < 6 ? "#e0a12f" : "#d7483a");
-      h += `<tr><td style="text-align:left">${c.bucket}</td><td>${c.n}</td><td>${c.predicted}%</td><td>${c.actual}%</td><td style="text-align:left;color:${col}">${gap > 0 ? "+" : ""}${gap}</td></tr>`;
-    }
-    h += "</tbody></table></div>";
-    box.innerHTML = h;
-    main.appendChild(box);
-  }
-
-  // Prop roadmap
-  const rmHdr = document.createElement("div");
-  rmHdr.className = "gamehdr";
-  rmHdr.textContent = "Prop model roadmap";
-  main.appendChild(rmHdr);
-  const rm = document.createElement("div");
-  rm.className = "board";
-  let rh = "<table><thead><tr><th style='text-align:left;padding-left:14px'>Prop</th><th style='text-align:left'>Status</th><th style='text-align:left'>Note</th></tr></thead><tbody>";
-  for (const p of j.roadmap) {
-    const col = p.status === "backtesting" ? "var(--blue)" : (p.status === "planned" ? "#e0a12f" : "#7a8694");
-    rh += `<tr><td class="name" style="cursor:default">${p.prop}</td><td style="text-align:left;color:${col}">${p.status}</td><td style="text-align:left;color:#7a8694;font-family:Inter">${p.note}</td></tr>`;
-  }
-  rh += "</tbody></table>";
-  rm.innerHTML = rh;
-  main.appendChild(rm);
+  if (LAB_TOKEN_MEM) { const t = ctl.querySelector("#lab-token"); if (t) t.value = LAB_TOKEN_MEM; }
 
   // ---------- K MODEL — its own section, own knobs, own gauntlet ----------
   renderKLab(main, j.kmodel || {});
