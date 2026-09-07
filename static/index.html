@@ -1437,7 +1437,34 @@ load();
       +(r.market.odds_fetches?' · credits api/archive '+r.market.odds_fetches.api+'/'+r.market.odds_fetches.archive:'');}
     if(r.oos&&r.oos.calibration){h+='<br><span style="opacity:.7">buckets: '+r.oos.calibration.map(function(b){return b.bucket+' '+b.predicted+'→'+b.actual+' (n'+b.n+')';}).join(' · ')+'</span>';}
     box.innerHTML=h;}
+  var PPMODE=false;   // true while the PROPS-only suite (/api/pplab/season) is the run we're watching
+  function renderProps(r,box){
+    if(!r){box.innerHTML='';return;}
+    if(r.error){box.innerHTML='<span style="color:#d7483a">'+r.error+'</span>';return;}
+    var mkts=['hits','walks'];
+    var h='<b>'+r.season+' — props only (hits + walks), OOS calibrated</b>'
+      +'<table style="margin-top:6px;font-size:12px;border-collapse:collapse">'
+      +'<tr><th style="text-align:left;padding:2px 10px 2px 0">Market</th><th style="padding:2px 10px">OOS Brier</th><th style="padding:2px 10px">vs constant</th><th style="padding:2px 10px">preds</th>'
+      +'<th style="padding:2px 10px">Bets</th><th style="padding:2px 10px">W</th><th style="padding:2px 10px">Units</th><th style="padding:2px 10px">ROI</th></tr>';
+    for(var i=0;i<mkts.length;i++){var m=mkts[i],o=(r.oos||{})[m]||{},mk=(r.market||{})[m]||{};
+      var mErr=mk.error?'<span style="color:#d7483a" title="'+mk.error+'">error</span>':null;
+      h+='<tr><td style="padding:2px 10px 2px 0">'+m+'</td><td style="text-align:center">'+fmt(o.brier)+'</td><td style="text-align:center">'+fmt(o.brier_constant!=null?o.brier_constant:o.brier_const)+'</td><td style="text-align:center">'+fmt(o.n)+'</td>'
+        +'<td style="text-align:center">'+(mErr||fmt(mk.bets))+'</td><td style="text-align:center">'+fmt(mk.wins)+'</td><td style="text-align:center">'+(mk.units!=null?(mk.units>0?'+':'')+mk.units+'u':'—')+'</td><td style="text-align:center">'+(mk.roi!=null?mk.roi+'%':'—')+'</td></tr>';
+      if(mk.bands&&mk.bands.length){h+='<tr><td></td><td colspan="7" style="opacity:.7;padding:0 0 4px 0">bands: '+mk.bands.map(function(b){return b.band+' '+b.bets+' bets '+b.wins+'W '+(b.units>0?'+':'')+b.units+'u';}).join(' · ')+'</td></tr>';}}
+    h+='</table><div class="meta" style="margin-top:4px">lower Brier than "vs constant" = skill vs a per-line empirical constant · Units/ROI = flat 1u vs REAL closing lines, 2–20% band (only when "+ market" was checked)'
+      +(r.market&&r.market.hits&&r.market.hits.odds_fetches?' · odds calls api/archive '+r.market.hits.odds_fetches.api+'/'+r.market.hits.odds_fetches.archive:'')+'</div>';
+    box.innerHTML=h;}
+  function pollProps(){
+    fetch('/api/ppseasons').then(function(x){return x.json();}).then(function(d){
+      var st=document.getElementById('ks-status'),out=document.getElementById('ks-out');
+      if(!st)return;
+      if(d.run&&d.run.status==='running'){st.textContent='⏳ props '+(d.run.progress||'running…');}
+      else{st.textContent=(d.run&&d.run.progress)||'idle';
+        if(POLL&&d.run&&d.run.status!=='running'){clearInterval(POLL);POLL=null;}
+        if(out&&d.last_result)renderProps(d.last_result,out);}
+    }).catch(function(){});}
   function poll(){
+    if(PPMODE){pollProps();return;}
     fetch('/api/kseasons').then(function(x){return x.json();}).then(function(d){
       var st=document.getElementById('ks-status'),out=document.getElementById('ks-out'),hist=document.getElementById('ks-hist');
       if(!st)return;
@@ -1455,7 +1482,7 @@ load();
       +'<div class="meta" style="margin:0 0 6px">Burn-in (season start → May 15) fits that <b>year\u2019s own</b> calibration curve; May 21 → Sep 28 grades <b>out-of-sample</b> on it. Accuracy runs are free (Savant season cache, first run per year is the slow one). \u201c+ market\u201d prices the OOS span vs real closing lines (~20cr/game first time, archived free after — 2023 props exist from 5/3). Uses the lab token above.</div>'
       +'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
       +'<select id="ks-year"><option>2025</option><option>2024</option><option>2023</option></select>'
-      +'<select id="ks-arm"><option value="all">ALL MODELS (K + hits + walks)</option><option value="v2">K: v2 (live)</option><option value="matchup">K: + matchup</option><option value="cswdelta">K: + CSW delta</option></select>'
+      +'<select id="ks-arm"><option value="all">ALL MODELS (K + hits + walks)</option><option value="props">PROPS only (hits + walks) — direct</option><option value="v2">K: v2 (live)</option><option value="matchup">K: + matchup</option><option value="cswdelta">K: + CSW delta</option></select>'
       +'<label class="meta" style="cursor:pointer"><input type="checkbox" id="ks-mkt" style="vertical-align:middle"> + market test (credits)</label>'
       +'<button class="btn" id="ks-run">Run season suite</button>'
       +'<span class="meta" id="ks-status">idle</span></div>'
@@ -1465,9 +1492,11 @@ load();
     box.querySelector('#ks-run').onclick=function(){
       var y=+box.querySelector('#ks-year').value, m=box.querySelector('#ks-mkt').checked;
       var tok=(document.getElementById('lab-token')||{}).value||'';
+      var arm=box.querySelector('#ks-arm').value;
+      PPMODE=(arm==='props');
       document.getElementById('ks-status').textContent='starting…';
-      fetch('/api/klab/season',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({season:y,market:m,arm:box.querySelector('#ks-arm').value,token:tok})})
+      fetch(PPMODE?'/api/pplab/season':'/api/klab/season',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({season:y,market:m,arm:arm,token:tok})})
         .then(function(x){return x.json();}).then(function(r){
           if(r.error){document.getElementById('ks-status').textContent=r.error;return;}
           if(!POLL)POLL=setInterval(poll,4000);poll();})
